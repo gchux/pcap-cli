@@ -9,7 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/gchux/cloud-run-tcpdump/pcap-writer/pkg/transformer"
+	"github.com/gchux/pcap-cli/pkg/transformer"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/dumpcommand"
 	gpcap "github.com/google/gopacket/pcap"

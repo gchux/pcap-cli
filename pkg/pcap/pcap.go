@@ -5,7 +5,7 @@ import (
 	"regexp"
 	"sync/atomic"
 
-	"github.com/gchux/cloud-run-tcpdump/pcap-writer/pkg/transformer"
+	"github.com/gchux/pcap-cli/pkg/transformer"
 	gpcap "github.com/google/gopacket/pcap"
 )
 

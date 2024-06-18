@@ -1,6 +1,6 @@
-module github.com/gchux/cloud-run-tcpdump/pcap-writer
+module github.com/gchux/pcap-cli/v1.0.0-dev
 
-go 1.21
+go 1.22
 
 toolchain go1.22.4
 

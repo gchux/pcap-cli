@@ -12,7 +12,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/gchux/cloud-run-tcpdump/pcap-writer/pkg/pcap"
+	"github.com/gchux/pcap-cli"
 	"github.com/google/uuid"
 )
 
