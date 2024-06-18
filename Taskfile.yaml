@@ -8,9 +8,10 @@ tasks:
     cmds:
       - find . -type f -name '*_string.go' -print0 | xargs -0 rm -vf 
 
-  go-gmt:
+  go-fmt:
     cmds:
-      - gofumpt -l -w .
+      - cmd: gofumpt -l -w .
+        ignore_error: true
 
   go-gen:
     cmds:
@@ -33,3 +34,11 @@ tasks:
       - task: build
         vars:
           VERBOSE: true
+
+  docker-build:
+    cmds:
+      - task: clean
+      - task: go-fmt
+      - >-
+        docker buildx build --no-cache --file=Dockerfile
+        --output={{.USER_WORKING_DIR}}/bin --target=releaser {{.USER_WORKING_DIR}}

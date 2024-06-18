@@ -1,9 +1,14 @@
 # How to build
 
+## Dependencies
+
+- `libpcap-dev`
+
 ## Using `go`
 
 ```sh
-go generate ./... && go build -o bin/pcap cmd/pcap.go
+go generate ./...
+go build -o bin/pcap cmd/pcap.go
 ```
 
 > **NOTE**: apply [`gofumpt`](https://github.com/mvdan/gofumpt) before commit; i/e: `gofumpt -l -w .`
@@ -20,6 +25,12 @@ task -v build
 
 ```sh
 task -v dist
+```
+
+### Docker build
+
+```sh
+task -v docker-build
 ```
 
 # How to use
