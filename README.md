@@ -2,7 +2,8 @@
 
 ## Dependencies
 
-- `libpcap-dev`
+- [`libpcap-dev`](https://github.com/the-tcpdump-group/libpcap): install from distro repos
+- [`stringer`](https://pkg.go.dev/golang.org/x/tools/cmd/stringer): `go install golang.org/x/tools/cmd/stringer@latest`
 
 ## Using `go`
 
