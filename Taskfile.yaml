@@ -4,22 +4,27 @@ dotenv: ['.env']
 
 tasks:
 
-  format:
+  clean:
+    cmds:
+      - find . -type f -name '*_string.go' -print0 | xargs -0 rm -vf 
+
+  go-gmt:
     cmds:
       - gofumpt -l -w .
 
-  assets:
+  go-gen:
     cmds:
       - go generate ./...
 
   build:
     dotenv: ['.env']
     cmds:
-      - task: format
-      - task: assets
+      - task: clean
+      - task: go-fmt
+      - task: go-gen
       - >-
         go build
-        -o $PCAP_BIN_NAME
+        -o bin/$PCAP_BIN_NAME
         {{if .VERBOSE}}-v -a{{end}}
         cmd/pcap.go
 

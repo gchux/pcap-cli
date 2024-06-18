@@ -3,7 +3,7 @@
 ## Using `go`
 
 ```sh
-go generate ./... && go build -o pcap cmd/pcap.go
+go generate ./... && go build -o bin/pcap cmd/pcap.go
 ```
 
 > **NOTE**: apply [`gofumpt`](https://github.com/mvdan/gofumpt) before commit; i/e: `gofumpt -l -w .`
