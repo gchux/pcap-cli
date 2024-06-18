@@ -4,7 +4,7 @@ go 1.22
 
 toolchain go1.22.4
 
-replace github.com/gchux/pcap-cli latest => github.com/gchux/pcap-cli v1.0.0-rc1
+replace github.com/gchux/pcap-cli => github.com/gchux/pcap-cli v1.0.0-rc1
 
 require (
 	dario.cat/mergo v1.0.0
