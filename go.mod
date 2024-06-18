@@ -2,6 +2,8 @@ module github.com/gchux/pcap-cli
 
 go 1.22.4
 
+retract v1.0.0-dev
+
 require (
 	dario.cat/mergo v1.0.0
 	github.com/Jeffail/gabs/v2 v2.7.0
