@@ -9,12 +9,15 @@ import (
 	"github.com/google/gopacket/layers"
 )
 
-// Create a type based on your input to the work function
-type pcapTranslatorWorker struct {
-	serial     *int64
-	packet     *gopacket.Packet
-	translator PcapTranslator
-}
+type (
+	pcapTranslatorWorker struct {
+		serial     *int64
+		packet     *gopacket.Packet
+		translator PcapTranslator
+	}
+
+	packetLayerTranslator func(context.Context) fmt.Stringer
+)
 
 //go:generate stringer -type=PcapTranslatorFmt
 const (
@@ -83,14 +86,13 @@ func (w pcapTranslatorWorker) translateTCPLayer(ctx context.Context) fmt.Stringe
 // The work that needs to be performed
 // The input type should implement the WorkFunction interface
 func (w pcapTranslatorWorker) Run(ctx context.Context) interface{} {
-	buffer := w.translator.next(ctx, w.serial)
+	buffer := w.translator.next(ctx, w.packet, w.serial)
 
-	translators := []packetLayerTranslator{
-		w.translateEthernetLayer,
-		w.translateIPv4Layer,
-		w.translateIPv6Layer,
-		w.translateUDPLayer,
-		w.translateTCPLayer,
+	// alternatives per layer; there can only be one!
+	translators := [][]packetLayerTranslator{
+		{w.translateEthernetLayer},                   // L2
+		{w.translateIPv4Layer, w.translateIPv6Layer}, // L3
+		{w.translateTCPLayer, w.translateUDPLayer},   // L4
 	}
 
 	numLayers := len(translators)
@@ -98,17 +100,23 @@ func (w pcapTranslatorWorker) Run(ctx context.Context) interface{} {
 	var wg sync.WaitGroup
 	wg.Add(numLayers) // number of layers to be translated
 
-	for _, translator := range translators {
-		go func(translator packetLayerTranslator) {
-			translations <- translator(ctx)
-			wg.Done()
-		}(translator)
-	}
-
 	go func() {
 		wg.Wait()
 		close(translations)
 	}()
+
+	for _, translators := range translators {
+		go func(translators []packetLayerTranslator) {
+			for _, translator := range translators {
+				if t := translator(ctx); t != nil {
+					translations <- t
+					// skip next alternatives
+					break
+				}
+			}
+			wg.Done()
+		}(translators)
+	}
 
 	for translation := range translations {
 		// translations are `nil` if layer is not available

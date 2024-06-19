@@ -17,8 +17,7 @@ type (
 	PcapTranslatorFmt int
 
 	PcapTranslator interface {
-		translate(*gopacket.Packet) error
-		next(context.Context, *int64) fmt.Stringer
+		next(context.Context, *gopacket.Packet, *int64) fmt.Stringer
 		translateEthernetLayer(context.Context, *layers.Ethernet) fmt.Stringer
 		translateIPv4Layer(context.Context, *layers.IPv4) fmt.Stringer
 		translateIPv6Layer(context.Context, *layers.IPv6) fmt.Stringer
@@ -38,6 +37,7 @@ type (
 		writeQueues    []chan *fmt.Stringer
 		wg             *sync.WaitGroup
 		preserveOrder  bool
+		apply          func(*pcapTranslatorWorker) error
 	}
 
 	IPcapTransformer interface {
@@ -50,8 +50,6 @@ type (
 		writer      io.Writer
 		translation *fmt.Stringer
 	}
-
-	packetLayerTranslator func(context.Context) fmt.Stringer
 )
 
 func (t *PcapTransformer) writeTranslation(ctx context.Context, task *pcapWriteTask) {
@@ -101,10 +99,8 @@ func (t *PcapTransformer) consumeTranslations(ctx context.Context, index int) {
 }
 
 func (t *PcapTransformer) waitForContextDone(ctx context.Context) {
-	select {
-	case <-ctx.Done():
-		close(t.ich)
-	}
+	<-ctx.Done()
+	close(t.ich)
 }
 
 // returns when all packets have been transformed and written
@@ -123,31 +119,13 @@ func (t *PcapTransformer) WaitDone() {
 func (t *PcapTransformer) Apply(ctx context.Context, packet *gopacket.Packet, serial *int64) error {
 	// It is assumed that packets will be produced faster than translations.
 	// process/translate packets concurrently in order to avoid blocking `gopacket` packets channel.
-
-	task := &pcapTranslatorWorker{
+	worker := &pcapTranslatorWorker{
 		serial:     serial,
 		packet:     packet,
 		translator: t.translator,
 	}
-
 	t.wg.Add(len(t.writers))
-
-	// If ordered output is enabled, enqueue translation workers in packet capture order;
-	// this will introduce some level of contention as the translation Q starts to fill (saturation):
-	// if the next packet to arrive finds a full Q, this method will block until slots are available.
-	// The degree of contention is proportial to the Q capacity times translation latency.
-	// Order should only be used for not network intersive workloads.
-	if t.preserveOrder {
-		t.ich <- task
-		return nil
-	}
-
-	// if ordered output is disabled, translate packets concurrently via translator pool.
-	// Order of gorouting execution is not guaranteed, which means
-	// that packets will be consumed/written in non-deterministic order.
-	// `serial` is aviailable to be used for sorting PCAP files.
-	t.translatorPool.Invoke(task)
-	return nil
+	return t.apply(worker)
 }
 
 func translatePacket(ctx context.Context, transformer *PcapTransformer, worker interface{}) {
@@ -161,7 +139,7 @@ func writeTranslation(ctx context.Context, transformer *PcapTransformer, task in
 func newTranslator(format PcapTranslatorFmt) (PcapTranslator, error) {
 	switch format {
 	case JSON:
-		return newJsonPcapTranslator(), nil
+		return newJSONPcapTranslator(), nil
 	case TEXT:
 		return newTextPcapTranslator(), nil
 	default:
@@ -209,6 +187,32 @@ func provideConcurrentQueue(ctx context.Context, transformer *PcapTransformer, n
 	transformer.och = concurrently.Process(ctx, transformer.ich, ochOpts)
 }
 
+func provideStrategy(transformer *PcapTransformer, preserveOrder bool) {
+	var strategy func(*pcapTranslatorWorker) error
+
+	if preserveOrder {
+		// If ordered output is enabled, enqueue translation workers in packet capture order;
+		// this will introduce some level of contention as the translation Q starts to fill (saturation):
+		// if the next packet to arrive finds a full Q, this method will block until slots are available.
+		// The degree of contention is proportial to the Q capacity times translation latency.
+		// Order should only be used for not network intersive workloads.
+		strategy = func(worker *pcapTranslatorWorker) error {
+			transformer.ich <- worker
+			return nil
+		}
+	} else {
+		// if ordered output is disabled, translate packets concurrently via translator pool.
+		// Order of gorouting execution is not guaranteed, which means
+		// that packets will be consumed/written in non-deterministic order.
+		// `serial` is aviailable to be used for sorting PCAP files.
+		strategy = func(worker *pcapTranslatorWorker) error {
+			return transformer.translatorPool.Invoke(worker)
+		}
+	}
+
+	transformer.apply = strategy
+}
+
 // transformers get instances of `io.Writer` instead of `pcap.PcapWriter` to prevent closing.
 func newTransformer(ctx context.Context, writers []io.Writer, format *string, preserveOrder bool) (IPcapTransformer, error) {
 	pcapFmt := pcapTranslatorFmts[*format]
@@ -224,18 +228,18 @@ func newTransformer(ctx context.Context, writers []io.Writer, format *string, pr
 		writeQueues[i] = make(chan *fmt.Stringer, 10*numWriters)
 	}
 
-	var wg sync.WaitGroup
-
 	// same transformer, multiple strategies
 	// via multiple translator implementations
 	transformer := &PcapTransformer{
-		wg:            &wg,
+		wg:            new(sync.WaitGroup),
 		ctx:           ctx,
 		translator:    translator,
 		writers:       writers,
 		writeQueues:   writeQueues,
 		preserveOrder: preserveOrder,
 	}
+
+	provideStrategy(transformer, preserveOrder)
 
 	// `preserveOrder==true` causes writes to be sequential and blocking per `io.Writer`.
 	// `preserveOrder==true` although blocking at writting, does not cause `transformer.Apply` to block.
