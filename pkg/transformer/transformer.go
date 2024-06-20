@@ -13,6 +13,8 @@ import (
 	concurrently "github.com/tejzpr/ordered-concurrently/v3"
 )
 
+var tcpFlagNames = []string{"SYN", "ACK", "PSH", "FIN", "RST", "URG", "ECE", "CWR"}
+
 type (
 	PcapTranslatorFmt int
 
@@ -24,6 +26,7 @@ type (
 		translateUDPLayer(context.Context, *layers.UDP) fmt.Stringer
 		translateTCPLayer(context.Context, *layers.TCP) fmt.Stringer
 		merge(context.Context, fmt.Stringer, fmt.Stringer) (fmt.Stringer, error)
+		finalize(context.Context, fmt.Stringer) (fmt.Stringer, error)
 	}
 
 	PcapTransformer struct {

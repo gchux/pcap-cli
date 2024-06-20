@@ -111,6 +111,10 @@ func (t *TextPcapTranslator) merge(ctx context.Context, tgt fmt.Stringer, src fm
 	return tgt, nil
 }
 
+func (t *TextPcapTranslator) finalize(ctx context.Context, packet fmt.Stringer) (fmt.Stringer, error) {
+	return packet, nil
+}
+
 func newTextPcapTranslator() *TextPcapTranslator {
 	return &TextPcapTranslator{}
 }

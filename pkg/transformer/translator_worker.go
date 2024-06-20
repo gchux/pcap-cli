@@ -125,7 +125,7 @@ func (w pcapTranslatorWorker) Run(ctx context.Context) interface{} {
 		}
 	}
 
-	// translate more layers
+	buffer, _ = w.translator.finalize(ctx, buffer)
 
 	return &buffer
 }

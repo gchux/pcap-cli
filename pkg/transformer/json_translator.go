@@ -15,7 +15,7 @@ import (
 
 type JSONPcapTranslator struct {
 	// [TODO]: this should be shared by all translators
-	ifaces sync.Map
+	ifaces *sync.Map
 }
 
 func (t *JSONPcapTranslator) translate(packet *gopacket.Packet) error {
@@ -29,9 +29,7 @@ func (t *JSONPcapTranslator) next(ctx context.Context, packet *gopacket.Packet, 
 	json.SetP(ctx.Value("id"), "pcap.ctx")
 	json.SetP(*serial, "pcap.num")
 
-	p := *packet
-
-	metadata := p.Metadata()
+	metadata := (*packet).Metadata()
 	info := metadata.CaptureInfo
 
 	json.SetP(metadata.Truncated, "meta.trunc")
@@ -94,7 +92,8 @@ func (t *JSONPcapTranslator) translateIPv4Layer(ctx context.Context, ip *layers.
 	json.SetP(ip.Checksum, "L3.checksum")
 	json.SetP(ip.Options, "L3.opts")
 
-	json.SetP(ip.Protocol.String(), "L3.proto")
+	json.SetP(ip.Protocol, "L3.proto.num")
+	json.SetP(ip.Protocol.String(), "L3.proto.name")
 
 	// https://github.com/google/gopacket/blob/master/layers/ip4.go#L28-L40
 	json.SetP(strings.Split(ip.Flags.String(), "|"), "L3.flags")
@@ -128,14 +127,14 @@ func (t *JSONPcapTranslator) translateUDPLayer(ctx context.Context, udp *layers.
 	json.SetP(udp.Checksum, "L4.checksum")
 	json.SetP(udp.Length, "L4.len")
 
-	json.SetP(udp.SrcPort, "L4.src.port")
+	json.SetP(udp.SrcPort, "L4.src")
 	if name, ok := layers.UDPPortNames[udp.SrcPort]; ok {
-		json.SetP(name, "L4.src.proto")
+		json.SetP(name, "L4.sproto")
 	}
 
-	json.SetP(udp.DstPort, "L4.dst.port")
+	json.SetP(udp.DstPort, "L4.dst")
 	if name, ok := layers.UDPPortNames[udp.DstPort]; ok {
-		json.SetP(name, "L4.dst.proto")
+		json.SetP(name, "L4.dproto")
 	}
 
 	return json
@@ -169,14 +168,14 @@ func (t *JSONPcapTranslator) translateTCPLayer(ctx context.Context, tcp *layers.
 		}
 	}
 
-	json.SetP(tcp.SrcPort, "L4.src.port")
+	json.SetP(tcp.SrcPort, "L4.src")
 	if name, ok := layers.TCPPortNames[tcp.SrcPort]; ok {
-		json.SetP(name, "L4.src.proto")
+		json.SetP(name, "L4.sproto")
 	}
 
-	json.SetP(tcp.DstPort, "L4.dst.port")
+	json.SetP(tcp.DstPort, "L4.dst")
 	if name, ok := layers.TCPPortNames[tcp.DstPort]; ok {
-		json.SetP(name, "L4.dst.proto")
+		json.SetP(name, "L4.dproto")
 	}
 
 	return json
@@ -186,7 +185,52 @@ func (t *JSONPcapTranslator) merge(ctx context.Context, tgt fmt.Stringer, src fm
 	return tgt, t.asTranslation(tgt).Merge(t.asTranslation(src))
 }
 
+func (t *JSONPcapTranslator) finalize(ctx context.Context, packet fmt.Stringer) (fmt.Stringer, error) {
+	json := t.asTranslation(packet)
+
+	l3Src, _ := json.Path("L3.src").Data().(net.IP)
+	l3Dst, _ := json.Path("L3.dst").Data().(net.IP)
+
+	message := fmt.Sprintf("%%s | %%s/%s:%%d > %%s/%s:%%d", l3Src, l3Dst)
+
+	proto := json.Path("L3.proto.num").Data().(layers.IPProtocol)
+	isTCP := proto == layers.IPProtocolTCP
+	isUDP := proto == layers.IPProtocolUDP
+
+	if !isTCP && !isUDP {
+		json.Set(fmt.Sprintf(message, proto.String(), "", 0, "", 0), "message")
+		return json, nil
+	}
+
+	l4SrcProto, _ := json.Path("L4.sproto").Data().(string)
+	l4DstProto, _ := json.Path("L4.dproto").Data().(string)
+
+	if isUDP {
+		srcPort, _ := json.Path("L4.src").Data().(layers.UDPPort)
+		dstPort, _ := json.Path("L4.dst").Data().(layers.UDPPort)
+		json.Set(fmt.Sprintf(message, "UDP", l4SrcProto, srcPort, l4DstProto, dstPort), "message")
+		return json, nil
+	}
+
+	srcPort, _ := json.Path("L4.src").Data().(layers.TCPPort)
+	dstPort, _ := json.Path("L4.dst").Data().(layers.TCPPort)
+	message = fmt.Sprintf(message, "TCP", l4SrcProto, srcPort, l4DstProto, dstPort)
+
+	flags := make([]string, 0, len(tcpFlagNames))
+	for _, flagName := range tcpFlagNames {
+		if isSet, _ := json.Path(`L4.flags.` + flagName).Data().(bool); isSet {
+			flags = append(flags, flagName)
+		}
+	}
+
+	seq, _ := json.Path("L4.seq").Data().(uint32)
+	ack, _ := json.Path("L4.ack").Data().(uint32)
+
+	json.Set(fmt.Sprintf("%s | [%s] | %d/%d", message, strings.Join(flags, "|"), seq, ack), "message")
+	return json, nil
+}
+
 func newJSONPcapTranslator() *JSONPcapTranslator {
 	var ifaces sync.Map
-	return &JSONPcapTranslator{ifaces}
+	return &JSONPcapTranslator{ifaces: &ifaces}
 }
