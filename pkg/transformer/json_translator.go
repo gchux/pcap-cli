@@ -189,11 +189,12 @@ func (t *JSONPcapTranslator) finalize(ctx context.Context, packet fmt.Stringer) 
 	json := t.asTranslation(packet)
 
 	serial, _ := json.Path("pcap.num").Data().(uint64)
+	iface, _ := json.Path("iface.name").Data().(string)
 
 	l3Src, _ := json.Path("L3.src").Data().(net.IP)
 	l3Dst, _ := json.Path("L3.dst").Data().(net.IP)
 
-	message := fmt.Sprintf("#:%d | %%s | %%s/%s:%%d > %%s/%s:%%d", serial, l3Src, l3Dst)
+	message := fmt.Sprintf("#:%d | @:%s | %%s | %%s/%s:%%d > %%s/%s:%%d", serial, iface, l3Src, l3Dst)
 
 	proto := json.Path("L3.proto.num").Data().(layers.IPProtocol)
 	isTCP := proto == layers.IPProtocolTCP
