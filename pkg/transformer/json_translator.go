@@ -26,6 +26,8 @@ func (t *JSONPcapTranslator) translate(packet *gopacket.Packet) error {
 func (t *JSONPcapTranslator) next(ctx context.Context, packet *gopacket.Packet, serial *uint64) fmt.Stringer {
 	json := gabs.New()
 
+	// [TODO]: add `logName` key with something meaningful
+
 	json.SetP(ctx.Value("id"), "pcap.ctx")
 	json.SetP(*serial, "pcap.num")
 
