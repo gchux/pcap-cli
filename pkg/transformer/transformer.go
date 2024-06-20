@@ -19,7 +19,7 @@ type (
 	PcapTranslatorFmt int
 
 	PcapTranslator interface {
-		next(context.Context, *gopacket.Packet, *int64) fmt.Stringer
+		next(context.Context, *gopacket.Packet, *uint64) fmt.Stringer
 		translateEthernetLayer(context.Context, *layers.Ethernet) fmt.Stringer
 		translateIPv4Layer(context.Context, *layers.IPv4) fmt.Stringer
 		translateIPv6Layer(context.Context, *layers.IPv6) fmt.Stringer
@@ -45,7 +45,7 @@ type (
 
 	IPcapTransformer interface {
 		WaitDone()
-		Apply(context.Context, *gopacket.Packet, *int64) error
+		Apply(context.Context, *gopacket.Packet, *uint64) error
 	}
 
 	pcapWriteTask struct {
@@ -119,7 +119,7 @@ func (t *PcapTransformer) WaitDone() {
 	}
 }
 
-func (t *PcapTransformer) Apply(ctx context.Context, packet *gopacket.Packet, serial *int64) error {
+func (t *PcapTransformer) Apply(ctx context.Context, packet *gopacket.Packet, serial *uint64) error {
 	// It is assumed that packets will be produced faster than translations.
 	// process/translate packets concurrently in order to avoid blocking `gopacket` packets channel.
 	worker := &pcapTranslatorWorker{

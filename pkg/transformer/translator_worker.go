@@ -11,7 +11,7 @@ import (
 
 type (
 	pcapTranslatorWorker struct {
-		serial     *int64
+		serial     *uint64
 		packet     *gopacket.Packet
 		translator PcapTranslator
 	}

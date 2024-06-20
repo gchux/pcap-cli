@@ -124,7 +124,7 @@ func (p *Pcap) Start(ctx context.Context, writers []PcapWriter) error {
 	}
 	p.fn = fn
 
-	var packetsCounter atomic.Int64
+	var packetsCounter atomic.Uint64
 	for {
 		select {
 		case packet := <-source.Packets():

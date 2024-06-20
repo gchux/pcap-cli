@@ -43,7 +43,7 @@ func (tt *textPcapTranslations) String() string {
 	return packetStr.String()
 }
 
-func (t *TextPcapTranslator) next(ctx context.Context, packet *gopacket.Packet, serial *int64) fmt.Stringer {
+func (t *TextPcapTranslator) next(ctx context.Context, packet *gopacket.Packet, serial *uint64) fmt.Stringer {
 	var text strings.Builder
 
 	text.WriteString("[ctx=")

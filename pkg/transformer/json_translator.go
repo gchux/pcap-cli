@@ -23,7 +23,7 @@ func (t *JSONPcapTranslator) translate(packet *gopacket.Packet) error {
 }
 
 // return pointer to `struct` `gabs.Container`
-func (t *JSONPcapTranslator) next(ctx context.Context, packet *gopacket.Packet, serial *int64) fmt.Stringer {
+func (t *JSONPcapTranslator) next(ctx context.Context, packet *gopacket.Packet, serial *uint64) fmt.Stringer {
 	json := gabs.New()
 
 	json.SetP(ctx.Value("id"), "pcap.ctx")
@@ -188,10 +188,12 @@ func (t *JSONPcapTranslator) merge(ctx context.Context, tgt fmt.Stringer, src fm
 func (t *JSONPcapTranslator) finalize(ctx context.Context, packet fmt.Stringer) (fmt.Stringer, error) {
 	json := t.asTranslation(packet)
 
+	serial, _ := json.Path("pcap.num").Data().(uint64)
+
 	l3Src, _ := json.Path("L3.src").Data().(net.IP)
 	l3Dst, _ := json.Path("L3.dst").Data().(net.IP)
 
-	message := fmt.Sprintf("%%s | %%s/%s:%%d > %%s/%s:%%d", l3Src, l3Dst)
+	message := fmt.Sprintf("#:%d | %%s | %%s/%s:%%d > %%s/%s:%%d", serial, l3Src, l3Dst)
 
 	proto := json.Path("L3.proto.num").Data().(layers.IPProtocol)
 	isTCP := proto == layers.IPProtocolTCP
@@ -226,7 +228,7 @@ func (t *JSONPcapTranslator) finalize(ctx context.Context, packet fmt.Stringer) 
 	seq, _ := json.Path("L4.seq").Data().(uint32)
 	ack, _ := json.Path("L4.ack").Data().(uint32)
 
-	json.Set(fmt.Sprintf("%s | [%s] | %d/%d", message, strings.Join(flags, "|"), seq, ack), "message")
+	json.Set(fmt.Sprintf("%s | [%s] | seq:%d | ack:%d", message, strings.Join(flags, "|"), seq, ack), "message")
 	return json, nil
 }
 
