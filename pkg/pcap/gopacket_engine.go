@@ -85,7 +85,7 @@ func (p *Pcap) Start(ctx context.Context, writers []PcapWriter) error {
 	cfg := *p.config
 
 	// set packet capture filter; i/e: `tcp port 443`
-	var filter string = cfg.Filter
+	filter := cfg.Filter
 	if filter != "" {
 		if err = handle.SetBPFFilter(filter); err != nil {
 			return fmt.Errorf("BPF filter error: %s", err)
@@ -93,7 +93,7 @@ func (p *Pcap) Start(ctx context.Context, writers []PcapWriter) error {
 	}
 
 	// if format is `default` output is similar to `tcpdump`
-	var format string = cfg.Format
+	format := cfg.Format
 	if format == "default" {
 		dumpcommand.Run(handle) // `gopacket` default implementation
 		return nil
@@ -113,12 +113,19 @@ func (p *Pcap) Start(ctx context.Context, writers []PcapWriter) error {
 		pcapWriters = append(pcapWriters, writer)
 	}
 
+	device := cfg.Device
+	iface := &transformer.PcapIface{
+		Index: device.netInterface.Index,
+		Name:  device.Name,
+		Addrs: device.Addresses,
+	}
+
 	// create new transformer for the specified output format
 	var fn transformer.IPcapTransformer
 	if cfg.Ordered {
-		fn, err = transformer.NewOrderedTransformer(ctx, ioWriters, &format)
+		fn, err = transformer.NewOrderedTransformer(ctx, iface, ioWriters, &format)
 	} else {
-		fn, err = transformer.NewTransformer(ctx, ioWriters, &format)
+		fn, err = transformer.NewTransformer(ctx, iface, ioWriters, &format)
 	}
 	if err != nil {
 		return fmt.Errorf("invalid format: %s", err)
@@ -155,5 +162,11 @@ func NewPcap(config *PcapConfig) (PcapEngine, error) {
 	var isActive atomic.Bool
 	isActive.Store(false)
 	pcap := Pcap{config: config, isActive: &isActive}
+
+	devices, err := FindDevicesByName(&config.Iface)
+	if err == nil {
+		config.Device = devices[0]
+	}
+
 	return &pcap, nil
 }

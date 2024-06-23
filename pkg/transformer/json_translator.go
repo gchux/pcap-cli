@@ -6,7 +6,6 @@ import (
 	"net"
 	"regexp"
 	"strings"
-	"sync"
 
 	"github.com/Jeffail/gabs/v2"
 	"github.com/google/gopacket"
@@ -14,8 +13,7 @@ import (
 )
 
 type JSONPcapTranslator struct {
-	// [TODO]: this should be shared by all translators
-	ifaces *sync.Map
+	iface *PcapIface
 }
 
 func (t *JSONPcapTranslator) translate(packet *gopacket.Packet) error {
@@ -26,9 +24,9 @@ func (t *JSONPcapTranslator) translate(packet *gopacket.Packet) error {
 func (t *JSONPcapTranslator) next(ctx context.Context, packet *gopacket.Packet, serial *uint64) fmt.Stringer {
 	json := gabs.New()
 
-	// [TODO]: add `logName` key with something meaningful
+	json.SetP(ctx.Value(ContextLogName), "logName")
 
-	json.SetP(ctx.Value("id"), "pcap.ctx")
+	json.SetP(ctx.Value(ContextID), "pcap.ctx")
 	json.SetP(*serial, "pcap.num")
 
 	metadata := (*packet).Metadata()
@@ -41,24 +39,12 @@ func (t *JSONPcapTranslator) next(ctx context.Context, packet *gopacket.Packet, 
 	json.SetP(info.Timestamp, "timestamp.str")
 	json.SetP(info.Timestamp.UnixMicro(), "timestamp.usec")
 
-	ifaceIndex := info.InterfaceIndex
-	var (
-		iface any
-		ok    bool
-		err   error
-	)
-	if iface, ok = t.ifaces.Load(ifaceIndex); !ok {
-		if iface, err = net.InterfaceByIndex(ifaceIndex); err != nil {
-			return json
-		}
+	json.SetP(t.iface.Index, "iface.index")
+	json.SetP(t.iface.Name, "iface.name")
+	json.ArrayP("iface.addrs")
+	for _, addr := range t.iface.Addrs {
+		json.ArrayAppendP(addr.IP.String(), "iface.addrs")
 	}
-
-	iface, _ = t.ifaces.LoadOrStore(ifaceIndex, iface)
-	netIface := iface.(*net.Interface)
-
-	json.SetP(netIface.Index, "iface.index")
-	json.SetP(netIface.Name, "iface.name")
-	json.SetP(netIface.HardwareAddr.String(), "iface.hwadd")
 
 	return json
 }
@@ -92,7 +78,12 @@ func (t *JSONPcapTranslator) translateIPv4Layer(ctx context.Context, ip *layers.
 	json.SetP(ip.Length, "L3.len")
 	json.SetP(ip.FragOffset, "L3.frag_offset")
 	json.SetP(ip.Checksum, "L3.checksum")
-	json.SetP(ip.Options, "L3.opts")
+	for _, opt := range ip.Options {
+		o := gabs.New()
+		o.Set(string(opt.OptionData), "data")
+		o.Set(opt.OptionType, "type")
+		json.ArrayAppendP(0, "opts")
+	}
 
 	json.SetP(ip.Protocol, "L3.proto.num")
 	json.SetP(ip.Protocol.String(), "L3.proto.name")
@@ -183,6 +174,119 @@ func (t *JSONPcapTranslator) translateTCPLayer(ctx context.Context, tcp *layers.
 	return json
 }
 
+func (t *JSONPcapTranslator) translateTLSLayer(ctx context.Context, tls *layers.TLS) fmt.Stringer {
+	json := gabs.New()
+
+	t.decodeTLSRecords(1, tls.Contents, json)
+
+	if len(tls.ChangeCipherSpec) > 0 {
+		t.translateTLSLayer_ChangeCipherSpec(ctx, json, tls)
+	}
+
+	if len(tls.Handshake) > 0 {
+		t.translateTLSLayer_Handshake(ctx, json, tls)
+	}
+
+	if len(tls.AppData) > 0 {
+		t.translateTLSLayer_AppData(ctx, json, tls)
+	}
+
+	return json
+}
+
+func (t *JSONPcapTranslator) translateDNSLayer(ctx context.Context, dns *layers.DNS) fmt.Stringer {
+	json := gabs.New()
+
+	json.SetP(dns.ID, "DNS.id")
+	json.SetP(dns.OpCode.String(), "DNS.op")
+	json.SetP(dns.ResponseCode.String(), "DNS.response_code")
+
+	/*
+		json.SetP(dns.QR, "DNS.QR")
+		json.SetP(dns.AA, "DNS.AA")
+		json.SetP(dns.TC, "DNS.TC")
+		json.SetP(dns.RD, "DNS.RD")
+		json.SetP(dns.RA, "DNS.RA")
+	*/
+
+	json.SetP(dns.QDCount, "DNS.questions_count")
+	json.SetP(dns.ANCount, "DNS.answers_count")
+	/*
+		json.SetP(dns.NSCount, "DNS.authorities_count")
+		json.SetP(dns.ARCount, "DNS.additionals_count")
+	*/
+
+	for _, question := range dns.Questions {
+		q := gabs.New()
+		q.Set(string(question.Name), "name")
+		q.Set(question.Type.String(), "type")
+		q.Set(question.Class.String(), "class")
+		json.ArrayAppendP(q, "DNS.questions")
+	}
+
+	for _, answer := range dns.Answers {
+		a := gabs.New()
+
+		// Header
+		a.Set(string(answer.Name), "name")
+		a.Set(answer.Type.String(), "type")
+		a.Set(answer.Class.String(), "class")
+		a.Set(answer.TTL, "ttl")
+
+		if answer.IP != nil {
+			a.Set(answer.IP.String(), "ip")
+		}
+
+		if answer.NS != nil && len(answer.NS) > 0 {
+			a.Set(string(answer.NS), "ns")
+		}
+
+		if answer.CNAME != nil && len(answer.CNAME) > 0 {
+			a.Set(string(answer.CNAME), "cname")
+		}
+
+		if answer.PTR != nil && len(answer.PTR) > 0 {
+			a.Set(string(answer.PTR), "ptr")
+		}
+
+		for _, txt := range answer.TXTs {
+			a.ArrayAppendP(string(txt), "txt")
+		}
+
+		/*
+			a.SetP(string(answer.SOA.MName), "soa.mname")
+			a.SetP(string(answer.SOA.RName), "soa.rname")
+			a.SetP(answer.SOA.Serial, "soa.serial")
+			a.SetP(answer.SOA.Expire, "soa.expire")
+			a.SetP(answer.SOA.Refresh, "soa.refresh")
+			a.SetP(answer.SOA.Retry, "soa.retry")
+
+			a.SetP(string(answer.SRV.Name), "srv.name")
+			a.SetP(answer.SRV.Port, "srv.port")
+			a.SetP(answer.SRV.Weight, "srv.weight")
+			a.SetP(answer.SRV.Priority, "srv.priority")
+
+			a.SetP(string(answer.MX.Name), "mx.name")
+			a.SetP(answer.MX.Preference, "mx.preference")
+
+			a.SetP(string(answer.URI.Target), "uri.target")
+			a.SetP(answer.URI.Priority, "uri.priority")
+			a.SetP(answer.URI.Weight, "uri.weight")
+		*/
+
+		for _, opt := range answer.OPT {
+			o := gabs.New()
+			o.Set(opt.Code.String(), "code")
+			o.Set(string(opt.Data), "data")
+			a.ArrayAppendP(o, "opts")
+		}
+
+		json.ArrayAppendP(a, "DNS.answers")
+	}
+
+	return json
+}
+
 func (t *JSONPcapTranslator) merge(ctx context.Context, tgt fmt.Stringer, src fmt.Stringer) (fmt.Stringer, error) {
 	return tgt, t.asTranslation(tgt).Merge(t.asTranslation(src))
 }
@@ -235,7 +339,6 @@ func (t *JSONPcapTranslator) finalize(ctx context.Context, packet fmt.Stringer) 
 	return json, nil
 }
 
-func newJSONPcapTranslator() *JSONPcapTranslator {
-	var ifaces sync.Map
-	return &JSONPcapTranslator{ifaces: &ifaces}
+func newJSONPcapTranslator(iface *PcapIface) *JSONPcapTranslator {
+	return &JSONPcapTranslator{iface: iface}
 }

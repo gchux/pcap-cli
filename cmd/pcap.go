@@ -79,7 +79,7 @@ func main() {
 
 	exp, _ := regexp.Compile(fmt.Sprintf("^(?:ipvlan-)?%s.*", *iface))
 	devs, _ := pcap.FindDevicesByRegex(exp)
-	logger.Printf("device: %v\n", devs)
+	logger.Printf("device: %+v\n", devs)
 
 	if *engine == "tcpdump" && *stdout {
 		*writeTo = "stdout"
@@ -94,11 +94,12 @@ func main() {
 		return
 	}
 
-	var ctx context.Context = context.Background()
+	ctx := context.Background()
 	var cancel context.CancelFunc
 
 	id := fmt.Sprintf("cli/%s", uuid.New())
-	ctx = context.WithValue(ctx, "id", id)
+	ctx = context.WithValue(ctx, pcap.PcapContextID, id)
+	ctx = context.WithValue(ctx, pcap.PcapContextLogName, `log/`+id)
 
 	if *timeout > 0 {
 		ctx, cancel = context.WithTimeout(ctx, time.Duration(*timeout)*time.Second)
@@ -111,22 +112,23 @@ func main() {
 	}
 
 	pcapWriters := []pcap.PcapWriter{}
+	var pcapWriter pcap.PcapWriter
 
 	if *engine == "google" && *stdout {
-		pcapWriter, err := pcap.NewStdoutPcapWriter()
+		pcapWriter, err = pcap.NewStdoutPcapWriter()
 		if err == nil {
 			pcapWriters = append(pcapWriters, pcapWriter)
 		}
 	}
 
 	if *engine == "google" && *writeTo != "stdout" {
-		pcapWriter, err := pcap.NewPcapWriter(writeTo, extension, timezone, *interval)
+		pcapWriter, err = pcap.NewPcapWriter(writeTo, extension, timezone, *interval)
 		if err == nil {
 			pcapWriters = append(pcapWriters, pcapWriter)
 		}
 	}
 
-	signals := make(chan os.Signal)
+	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
 	go func() {
 		<-signals

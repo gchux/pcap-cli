@@ -14,6 +14,7 @@ require (
 	github.com/mitchellh/go-ps v1.0.0
 	github.com/panjf2000/ants/v2 v2.10.0
 	github.com/tejzpr/ordered-concurrently/v3 v3.0.1
+	golang.org/x/crypto v0.0.0-20191011191535-87dc89f01550
 )
 
 require (

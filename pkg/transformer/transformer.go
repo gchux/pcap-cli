@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
+	gpcap "github.com/google/gopacket/pcap"
 	"github.com/panjf2000/ants/v2"
 	concurrently "github.com/tejzpr/ordered-concurrently/v3"
 )
@@ -25,12 +26,15 @@ type (
 		translateIPv6Layer(context.Context, *layers.IPv6) fmt.Stringer
 		translateUDPLayer(context.Context, *layers.UDP) fmt.Stringer
 		translateTCPLayer(context.Context, *layers.TCP) fmt.Stringer
+		translateTLSLayer(context.Context, *layers.TLS) fmt.Stringer
+		translateDNSLayer(context.Context, *layers.DNS) fmt.Stringer
 		merge(context.Context, fmt.Stringer, fmt.Stringer) (fmt.Stringer, error)
 		finalize(context.Context, fmt.Stringer) (fmt.Stringer, error)
 	}
 
 	PcapTransformer struct {
 		ctx            context.Context
+		iface          *PcapIface
 		ich            chan concurrently.WorkFunction
 		och            <-chan concurrently.OrderedOutput
 		translator     PcapTranslator
@@ -53,6 +57,19 @@ type (
 		writer      io.Writer
 		translation *fmt.Stringer
 	}
+
+	ContextKey string
+
+	PcapIface struct {
+		Index int
+		Name  string
+		Addrs []gpcap.InterfaceAddress
+	}
+)
+
+const (
+	ContextID      = ContextKey("id")
+	ContextLogName = ContextKey("logName")
 )
 
 func (t *PcapTransformer) writeTranslation(ctx context.Context, task *pcapWriteTask) {
@@ -139,12 +156,12 @@ func writeTranslation(ctx context.Context, transformer *PcapTransformer, task in
 	transformer.writeTranslation(ctx, task.(*pcapWriteTask))
 }
 
-func newTranslator(format PcapTranslatorFmt) (PcapTranslator, error) {
+func newTranslator(iface *PcapIface, format PcapTranslatorFmt) (PcapTranslator, error) {
 	switch format {
 	case JSON:
-		return newJSONPcapTranslator(), nil
+		return newJSONPcapTranslator(iface), nil
 	case TEXT:
-		return newTextPcapTranslator(), nil
+		return newTextPcapTranslator(iface), nil
 	default:
 		/* no-go */
 	}
@@ -217,9 +234,9 @@ func provideStrategy(transformer *PcapTransformer, preserveOrder bool) {
 }
 
 // transformers get instances of `io.Writer` instead of `pcap.PcapWriter` to prevent closing.
-func newTransformer(ctx context.Context, writers []io.Writer, format *string, preserveOrder bool) (IPcapTransformer, error) {
+func newTransformer(ctx context.Context, iface *PcapIface, writers []io.Writer, format *string, preserveOrder bool) (IPcapTransformer, error) {
 	pcapFmt := pcapTranslatorFmts[*format]
-	translator, err := newTranslator(pcapFmt)
+	translator, err := newTranslator(iface, pcapFmt)
 	if err != nil {
 		return nil, err
 	}
@@ -236,6 +253,7 @@ func newTransformer(ctx context.Context, writers []io.Writer, format *string, pr
 	transformer := &PcapTransformer{
 		wg:            new(sync.WaitGroup),
 		ctx:           ctx,
+		iface:         iface,
 		translator:    translator,
 		writers:       writers,
 		writeQueues:   writeQueues,
@@ -263,10 +281,10 @@ func newTransformer(ctx context.Context, writers []io.Writer, format *string, pr
 	return transformer, nil
 }
 
-func NewOrderedTransformer(ctx context.Context, writers []io.Writer, format *string) (IPcapTransformer, error) {
-	return newTransformer(ctx, writers, format, true /* preserveOrder */)
+func NewOrderedTransformer(ctx context.Context, iface *PcapIface, writers []io.Writer, format *string) (IPcapTransformer, error) {
+	return newTransformer(ctx, iface, writers, format, true /* preserveOrder */)
 }
 
-func NewTransformer(ctx context.Context, writers []io.Writer, format *string) (IPcapTransformer, error) {
-	return newTransformer(ctx, writers, format, false /* preserveOrder */)
+func NewTransformer(ctx context.Context, iface *PcapIface, writers []io.Writer, format *string) (IPcapTransformer, error) {
+	return newTransformer(ctx, iface, writers, format, false /* preserveOrder */)
 }

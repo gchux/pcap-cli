@@ -11,7 +11,9 @@ import (
 )
 
 type (
-	TextPcapTranslator struct{}
+	TextPcapTranslator struct {
+		iface *PcapIface
+	}
 
 	textPcapTranslation struct {
 		index   int // allows layers to be sorted on `String()` invocation
@@ -47,7 +49,7 @@ func (t *TextPcapTranslator) next(ctx context.Context, packet *gopacket.Packet, 
 	var text strings.Builder
 
 	text.WriteString("[ctx=")
-	text.WriteString(fmt.Sprintf("%s", ctx.Value("id")))
+	text.WriteString(fmt.Sprintf("%s", ctx.Value(ContextID)))
 	text.WriteString("|num=")
 	text.WriteString(fmt.Sprintf("%d", *serial))
 	text.WriteString("]")
@@ -94,6 +96,16 @@ func (t *TextPcapTranslator) translateTCPLayer(ctx context.Context, packet *laye
 	return &textPcapTranslation{3, new(strings.Builder)}
 }
 
+func (t *TextPcapTranslator) translateTLSLayer(ctx context.Context, tls *layers.TLS) fmt.Stringer {
+	// [TODO]: implement TLS layer translation
+	return &textPcapTranslation{4, new(strings.Builder)}
+}
+
+func (t *TextPcapTranslator) translateDNSLayer(ctx context.Context, dns *layers.DNS) fmt.Stringer {
+	// [TODO]: implement DNS layer translation
+	return &textPcapTranslation{4, new(strings.Builder)}
+}
+
 func (t *TextPcapTranslator) merge(ctx context.Context, tgt fmt.Stringer, src fmt.Stringer) (fmt.Stringer, error) {
 	srcTranslation := t.asTranslation(src)
 	switch typedObj := tgt.(type) {
@@ -115,8 +127,8 @@ func (t *TextPcapTranslator) finalize(ctx context.Context, packet fmt.Stringer) 
 	return packet, nil
 }
 
-func newTextPcapTranslator() *TextPcapTranslator {
-	return &TextPcapTranslator{}
+func newTextPcapTranslator(iface *PcapIface) *TextPcapTranslator {
+	return &TextPcapTranslator{iface: iface}
 }
 
 // [TODO]: remove samples when all layers translations are implemented

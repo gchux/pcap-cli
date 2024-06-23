@@ -30,62 +30,89 @@ var pcapTranslatorFmts = map[string]PcapTranslatorFmt{
 	"text": TEXT,
 }
 
-func (w pcapTranslatorWorker) pkt() gopacket.Packet {
+func (w pcapTranslatorWorker) pkt(ctx context.Context) gopacket.Packet {
 	return *w.packet
 }
 
-func (w pcapTranslatorWorker) asLayer(layer gopacket.LayerType) gopacket.Layer {
-	return w.pkt().Layer(layer)
+func (w *pcapTranslatorWorker) asLayer(ctx context.Context, layer gopacket.LayerType) gopacket.Layer {
+	return w.pkt(ctx).Layer(layer)
+}
+
+func (w *pcapTranslatorWorker) translateLayer(ctx context.Context, layer gopacket.LayerType) fmt.Stringer {
+	l := w.asLayer(ctx, layer)
+	if l == nil {
+		return nil
+	}
+
+	switch lType := l.(type) {
+	default:
+		return nil
+	case *layers.Ethernet:
+		return w.translator.translateEthernetLayer(ctx, lType)
+	case *layers.IPv4:
+		return w.translator.translateIPv4Layer(ctx, lType)
+	case *layers.IPv6:
+		return w.translator.translateIPv6Layer(ctx, lType)
+	case *layers.UDP:
+		return w.translator.translateUDPLayer(ctx, lType)
+	case *layers.TCP:
+		return w.translator.translateTCPLayer(ctx, lType)
+	case *layers.TLS:
+		return w.translator.translateTLSLayer(ctx, lType)
+	case *layers.DNS:
+		return w.translator.translateDNSLayer(ctx, lType)
+	}
 }
 
 func (w pcapTranslatorWorker) translateEthernetLayer(ctx context.Context) fmt.Stringer {
-	ethernetLayer := w.asLayer(layers.LayerTypeEthernet)
-	if ethernetLayer != nil {
-		ethernetPacket, _ := ethernetLayer.(*layers.Ethernet)
-		return w.translator.translateEthernetLayer(ctx, ethernetPacket)
-	}
-	return nil
+	return w.translateLayer(ctx, layers.LayerTypeEthernet)
 }
 
-func (w pcapTranslatorWorker) translateIPv4Layer(ctx context.Context) fmt.Stringer {
-	ipLayer := w.asLayer(layers.LayerTypeIPv4)
-	if ipLayer != nil {
-		ipPacket, _ := ipLayer.(*layers.IPv4)
-		return w.translator.translateIPv4Layer(ctx, ipPacket)
-	}
-	return nil
+func (w *pcapTranslatorWorker) translateIPv4Layer(ctx context.Context) fmt.Stringer {
+	return w.translateLayer(ctx, layers.LayerTypeIPv4)
 }
 
-func (w pcapTranslatorWorker) translateIPv6Layer(ctx context.Context) fmt.Stringer {
-	ipLayer := w.asLayer(layers.LayerTypeIPv6)
-	if ipLayer != nil {
-		ipPacket, _ := ipLayer.(*layers.IPv6)
-		return w.translator.translateIPv6Layer(ctx, ipPacket)
-	}
-	return nil
+func (w *pcapTranslatorWorker) translateIPv6Layer(ctx context.Context) fmt.Stringer {
+	return w.translateLayer(ctx, layers.LayerTypeIPv6)
 }
 
-func (w pcapTranslatorWorker) translateUDPLayer(ctx context.Context) fmt.Stringer {
-	tcpLayer := w.asLayer(layers.LayerTypeUDP)
-	if tcpLayer != nil {
-		tcpPacket, _ := tcpLayer.(*layers.UDP)
-		return w.translator.translateUDPLayer(ctx, tcpPacket)
-	}
-	return nil
+func (w *pcapTranslatorWorker) translateUDPLayer(ctx context.Context) fmt.Stringer {
+	return w.translateLayer(ctx, layers.LayerTypeUDP)
 }
 
-func (w pcapTranslatorWorker) translateTCPLayer(ctx context.Context) fmt.Stringer {
-	tcpLayer := w.asLayer(layers.LayerTypeTCP)
-	if tcpLayer != nil {
-		tcpPacket, _ := tcpLayer.(*layers.TCP)
-		return w.translator.translateTCPLayer(ctx, tcpPacket)
-	}
-	return nil
+func (w *pcapTranslatorWorker) translateTCPLayer(ctx context.Context) fmt.Stringer {
+	return w.translateLayer(ctx, layers.LayerTypeTCP)
+}
+
+func (w *pcapTranslatorWorker) translateDNSLayer(ctx context.Context) fmt.Stringer {
+	return w.translateLayer(ctx, layers.LayerTypeDNS)
+}
+
+func (w *pcapTranslatorWorker) translateTLSLayer(ctx context.Context) fmt.Stringer {
+	/*
+		packet := w.pkt(ctx)
+		if packet.ApplicationLayer() != nil {
+			var tls layers.TLS
+			var decoded []gopacket.LayerType
+			parser := gopacket.NewDecodingLayerParser(layers.LayerTypeTLS, &tls)
+			err := parser.DecodeLayers(packet.ApplicationLayer().LayerContents(), &decoded)
+			if err == nil {
+				for _, layerType := range decoded {
+					switch layerType {
+					case layers.LayerTypeTLS:
+						return w.translator.translateTLSLayer(ctx, &tls)
+					}
+				}
+			}
+		}
+	*/
+
+	return w.translateLayer(ctx, layers.LayerTypeTLS)
 }
 
 // The work that needs to be performed
 // The input type should implement the WorkFunction interface
-func (w pcapTranslatorWorker) Run(ctx context.Context) interface{} {
+func (w *pcapTranslatorWorker) Run(ctx context.Context) interface{} {
 	buffer := w.translator.next(ctx, w.packet, w.serial)
 
 	// alternatives per layer; there can only be one!
@@ -93,6 +120,7 @@ func (w pcapTranslatorWorker) Run(ctx context.Context) interface{} {
 		{w.translateEthernetLayer},                   // L2
 		{w.translateIPv4Layer, w.translateIPv6Layer}, // L3
 		{w.translateTCPLayer, w.translateUDPLayer},   // L4
+		{w.translateDNSLayer, w.translateTLSLayer},   // L7
 	}
 
 	numLayers := len(translators)
