@@ -58,13 +58,13 @@ type (
 		translation *fmt.Stringer
 	}
 
-	ContextKey string
-
 	PcapIface struct {
 		Index int
 		Name  string
 		Addrs []gpcap.InterfaceAddress
 	}
+
+	ContextKey string
 )
 
 const (

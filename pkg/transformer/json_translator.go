@@ -295,7 +295,7 @@ func (t *JSONPcapTranslator) finalize(ctx context.Context, packet fmt.Stringer) 
 	json := t.asTranslation(packet)
 
 	serial, _ := json.Path("pcap.num").Data().(uint64)
-	iface, _ := json.Path("iface.name").Data().(string)
+	iface := fmt.Sprintf("%d/%s", t.iface.Index, t.iface.Name)
 
 	l3Src, _ := json.Path("L3.src").Data().(net.IP)
 	l3Dst, _ := json.Path("L3.dst").Data().(net.IP)
