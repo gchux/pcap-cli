@@ -32,7 +32,7 @@ type (
 	}
 
 	PcapDevice struct {
-		netInterface *net.Interface
+		NetInterface *net.Interface
 		pcap.Interface
 	}
 
