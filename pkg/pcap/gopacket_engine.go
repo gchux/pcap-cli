@@ -115,7 +115,7 @@ func (p *Pcap) Start(ctx context.Context, writers []PcapWriter) error {
 
 	device := cfg.Device
 	iface := &transformer.PcapIface{
-		Index: device.netInterface.Index,
+		Index: device.NetInterface.Index,
 		Name:  device.Name,
 		Addrs: device.Addresses,
 	}
