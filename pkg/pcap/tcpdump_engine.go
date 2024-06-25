@@ -108,10 +108,12 @@ func (t *Tcpdump) Start(ctx context.Context, _ []PcapWriter) error {
 		tcpdumpLogger.Printf("[pid:%d] - %+v' - error: %+v\n", pid, cmdLine, err)
 		_ = cmd.Process.Kill()
 	} else {
-		defer time.AfterFunc(1*time.Second, func() {
+		defer time.AfterFunc(3*time.Second, func() {
 			_ = cmd.Process.Kill()
 		}).Stop()
 	}
+
+	err := cmd.Wait()
 
 	// make sure previous execution does not survive
 	killedProcs, numProcs, killErr := t.findAndKill(pid)
@@ -119,7 +121,7 @@ func (t *Tcpdump) Start(ctx context.Context, _ []PcapWriter) error {
 
 	t.isActive.Store(false)
 
-	return errors.Join(ctx.Err(), killErr)
+	return errors.Join(ctx.Err(), err, killErr)
 }
 
 func NewTcpdump(config *PcapConfig) (PcapEngine, error) {
