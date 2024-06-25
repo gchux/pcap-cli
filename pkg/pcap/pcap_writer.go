@@ -34,7 +34,21 @@ type (
 		bufioWriterFlush reflect.Value
 		isStdOutOrErr    bool
 	}
+
+	pcapFileNameProvider struct {
+		directory string
+		template  string
+		location  *time.Location
+	}
 )
+
+var defaultLogrotateOptions logrotate.Options = logrotate.Options{
+	Directory:            "/",
+	MaximumFileSize:      0,
+	MaximumLifetime:      0,
+	FlushAfterEveryWrite: false,
+	FileNameFunc:         func() string { return "" },
+}
 
 //go:linkname rotate github.com/easyCZ/logrotate.(*Writer).rotate
 func rotate(w *logrotate.Writer)
@@ -64,12 +78,6 @@ func (w *pcapWriter) rotate() {
 	rotate(w.Writer)
 }
 
-type pcapFileNameProvider struct {
-	directory string
-	template  string
-	location  *time.Location
-}
-
 func (p *pcapFileNameProvider) get() string {
 	fileName := timefmt.Format(time.Now().In(p.location), p.template)
 	pcapWriterLogger.Printf("new file: %s\n", fileName)
@@ -91,14 +99,6 @@ func newPcapWriterFileNameProvider(template, timezone *string) *pcapFileNameProv
 		template:  filepath.Base(fileNameTemplate),
 		location:  getPcapWriterLocationForTimezone(timezone),
 	}
-}
-
-var defaultLogrotateOptions logrotate.Options = logrotate.Options{
-	Directory:            "/",
-	MaximumFileSize:      0,
-	MaximumLifetime:      0,
-	FlushAfterEveryWrite: false,
-	FileNameFunc:         func() string { return "" },
 }
 
 func newPcapWriterForStdout(logger *log.Logger) (*logrotate.Writer, error) {

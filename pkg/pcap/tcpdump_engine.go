@@ -106,6 +106,7 @@ func (t *Tcpdump) Start(ctx context.Context, _ []PcapWriter) error {
 	cmdLine := strings.Join(cmd.Args[:], " ")
 	tcpdumpLogger.Printf("EXEC: %v\n", cmdLine)
 	if err := cmd.Run(); err != nil {
+		tcpdumpLogger.Printf("'%+v' error: %+v\n", cmdLine, err)
 		killedProcs, numProcs, killErr := t.findAndKill()
 		tcpdumpLogger.Printf("STOP[%d/%d]: %v\n", killedProcs, numProcs, cmdLine)
 		t.isActive.Store(false)
