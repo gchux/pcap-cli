@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	ps "github.com/mitchellh/go-ps"
 )
@@ -52,7 +53,7 @@ func (t *Tcpdump) kill(pid int) error {
 	return proc.Signal(syscall.SIGTERM)
 }
 
-func (t *Tcpdump) findAndKill() (int, int, error) {
+func (t *Tcpdump) findAndKill(pid int) (int, int, error) {
 	processes, err := ps.Processes()
 	if err != nil {
 		return 0, 0, err
@@ -63,7 +64,7 @@ func (t *Tcpdump) findAndKill() (int, int, error) {
 	for _, p := range processes {
 		procId := p.Pid()
 		execName := p.Executable()
-		if execName == "tcpdump" {
+		if execName == "tcpdump" && procId == pid {
 			tcpdumpLogger.Printf("killing %s(%d)\n", execName, procId)
 			if err := t.kill(procId); err == nil {
 				killCounter++
@@ -80,15 +81,6 @@ func (t *Tcpdump) Start(ctx context.Context, _ []PcapWriter) error {
 		return fmt.Errorf("already started")
 	}
 
-	// check for orphaned executions before starting a new one
-	// orphaned tcpdump executions should be exceedingly rare
-	killedProcs, numProcs, err := t.findAndKill()
-	if err == nil && killedProcs > 0 {
-		tcpdumpLogger.Printf("killed %d/%d processes\n", killedProcs, numProcs)
-	}
-
-	cfg := t.config
-
 	args := t.buildArgs(ctx)
 
 	cmd := exec.CommandContext(ctx, t.tcpdump, args...)
@@ -98,23 +90,36 @@ func (t *Tcpdump) Start(ctx context.Context, _ []PcapWriter) error {
 		Setpgid: true, Pgid: 0,
 	}
 
-	if cfg.Output == "stdout" {
-		cmd.Stdout = os.Stdout
-	}
+	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
 	cmdLine := strings.Join(cmd.Args[:], " ")
-	tcpdumpLogger.Printf("EXEC: %v\n", cmdLine)
-	if err := cmd.Run(); err != nil {
-		tcpdumpLogger.Printf("'%+v' error: %+v\n", cmdLine, err)
-		killedProcs, numProcs, killErr := t.findAndKill()
-		tcpdumpLogger.Printf("STOP[%d/%d]: %v\n", killedProcs, numProcs, cmdLine)
-		t.isActive.Store(false)
-		return errors.Join(err, killErr)
+	if err := cmd.Start(); err != nil {
+		tcpdumpLogger.Printf("'%+v' - error: %+v\n", cmdLine, err)
+		return err
 	}
 
+	pid := cmd.Process.Pid
+	tcpdumpLogger.Printf("EXEC(%d): %v\n", pid, cmdLine)
+
+	<-ctx.Done()
+
+	if err := cmd.Process.Signal(os.Interrupt); err != nil {
+		tcpdumpLogger.Printf("[pid:%d] - %+v' - error: %+v\n", pid, cmdLine, err)
+		_ = cmd.Process.Kill()
+	} else {
+		defer time.AfterFunc(1*time.Second, func() {
+			_ = cmd.Process.Kill()
+		}).Stop()
+	}
+
+	// make sure previous execution does not survive
+	killedProcs, numProcs, killErr := t.findAndKill(pid)
+	tcpdumpLogger.Printf("STOP [tcpdump(%d)] <%d/%d>: %+v\n", pid, killedProcs, numProcs, cmdLine)
+
 	t.isActive.Store(false)
-	return nil
+
+	return errors.Join(ctx.Err(), killErr)
 }
 
 func NewTcpdump(config *PcapConfig) (PcapEngine, error) {
