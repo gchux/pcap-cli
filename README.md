@@ -1,3 +1,13 @@
+# PCAP CLI
+
+High performance packet capturing translator leveraged by [`gopacket`](https://github.com/google/gopacket).
+
+Currently offering JSON packet translation into files and stdout.
+
+Amazing to be used alongside [`jq`](https://jqlang.github.io/jq/)
+
+---
+
 # How to build
 
 ## Dependencies
@@ -75,3 +85,22 @@ sudo pcap -eng=google -promisc \
   -fmt=json -stdout \
   -timeout=60 -interval=10 -filter='tcp'
 ```
+
+---
+
+# Projects using PCAP CLI
+
+-    **Cloud Run tcpdump sidecar**: (https://github.com/gchux/cloud-run-tcpdump)
+
+---
+
+# Roadmap
+
+## Translators
+
+-    Plain Text
+-    Protocol Buffers: https://protobuf.dev/
+
+## Integrations
+
+-    gRPC packet capture streaming
