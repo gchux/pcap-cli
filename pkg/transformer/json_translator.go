@@ -400,8 +400,7 @@ func (t *JSONPcapTranslator) toJSONBytes(packet *fmt.Stringer) (int, []byte, err
 		return 0, nil, errors.Wrap(err, "JSON translation failed")
 	}
 	lineBreak := []byte("\n")
-	translationBytes := len(translation)
-	b := make([]byte, len(lineBreak)+translationBytes)
+	b := make([]byte, len(lineBreak)+len(translation))
 	return copy(b[copy(b[0:], translation):], lineBreak), b, nil
 }
 
@@ -410,7 +409,7 @@ func (t *JSONPcapTranslator) write(ctx context.Context, writer io.Writer, packet
 	if err != nil {
 		return 0, errors.Wrap(err, "JSON translation failed")
 	}
-	writtenBytes, err := io.Writer.Write(writer, translationBytes)
+	writtenBytes, err := writer.Write(translationBytes)
 	if err != nil {
 		return 0, errors.Wrap(err, "failed to write JSON translation")
 	}
