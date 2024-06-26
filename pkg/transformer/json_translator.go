@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/Jeffail/gabs/v2"
@@ -393,12 +394,30 @@ func (t *JSONPcapTranslator) finalize(ctx context.Context, packet fmt.Stringer) 
 	return json, nil
 }
 
-func (t *JSONPcapTranslator) write(ctx context.Context, writer io.Writer, packet *fmt.Stringer) (int, error) {
+func (t *JSONPcapTranslator) toJSONBytes(packet *fmt.Stringer) (int, []byte, error) {
 	translation, err := t.asTranslation(*packet).MarshalJSON()
+	if err != nil {
+		return 0, nil, errors.Wrap(err, "JSON translation failed")
+	}
+	lineBreak := []byte("\n")
+	translationBytes := len(translation)
+	b := make([]byte, len(lineBreak)+translationBytes)
+	return copy(b[copy(b[0:], translation):], lineBreak), b, nil
+}
+
+func (t *JSONPcapTranslator) write(ctx context.Context, writer io.Writer, packet *fmt.Stringer) (int, error) {
+	bytesCount, translationBytes, err := t.toJSONBytes(packet)
 	if err != nil {
 		return 0, errors.Wrap(err, "JSON translation failed")
 	}
-	return io.Writer.Write(writer, translation)
+	writtenBytes, err := io.Writer.Write(writer, translationBytes)
+	if err != nil {
+		return 0, errors.Wrap(err, "failed to write JSON translation")
+	}
+	if bytesCount != writtenBytes {
+		return writtenBytes, errors.New("translationBytes(" + strconv.Itoa(bytesCount) + ") != writtenBytes(" + strconv.Itoa(writtenBytes) + ")")
+	}
+	return writtenBytes, nil
 }
 
 func newJSONPcapTranslator(iface *PcapIface) *JSONPcapTranslator {
