@@ -30,6 +30,7 @@ type (
 		translateDNSLayer(context.Context, *layers.DNS) fmt.Stringer
 		merge(context.Context, fmt.Stringer, fmt.Stringer) (fmt.Stringer, error)
 		finalize(context.Context, fmt.Stringer) (fmt.Stringer, error)
+		write(context.Context, io.Writer, *fmt.Stringer) (int, error)
 	}
 
 	PcapTransformer struct {
@@ -74,7 +75,8 @@ const (
 
 func (t *PcapTransformer) writeTranslation(ctx context.Context, task *pcapWriteTask) {
 	// consume translations – flush them into writers
-	io.WriteString(task.writer, fmt.Sprintf("%s\n", *task.translation))
+	// io.WriteString(task.writer, (*task.translation).String()+"\n")
+	t.translator.write(ctx, task.writer, task.translation)
 	t.wg.Done()
 }
 

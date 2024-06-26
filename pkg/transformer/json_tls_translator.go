@@ -10,16 +10,17 @@ import (
 	"golang.org/x/crypto/cryptobyte"
 )
 
-func (t *JSONPcapTranslator) translateTLSLayer_decodeClientHello(hs cryptobyte.String, json *gabs.Container) {
-	ch := gabs.New()
-	ch.Set("ClientHello", "type")
+func (t *JSONPcapTranslator) translateTLSLayer_decodeClientHello(hs cryptobyte.String, TLS *gabs.Container) {
+	ch := make(map[string]interface{}, 4)
+
+	ch["type"] = "ClientHello"
 
 	var clientHello cryptobyte.String
 	hs.ReadUint24LengthPrefixed(&clientHello)
 
 	var legacyVersion uint16
 	clientHello.ReadUint16(&legacyVersion)
-	ch.Set(layers.TLSVersion(legacyVersion).String(), "legacy_version")
+	ch["legacy_version"] = layers.TLSVersion(legacyVersion).String()
 
 	// var random []byte
 	// clientHello.ReadBytes(&random, 32)
@@ -33,56 +34,62 @@ func (t *JSONPcapTranslator) translateTLSLayer_decodeClientHello(hs cryptobyte.S
 
 	var ciphersuitesBytes cryptobyte.String
 	clientHello.ReadUint16LengthPrefixed(&ciphersuitesBytes)
+	var ciphers []uint16
 	for !ciphersuitesBytes.Empty() {
 		var ciphersuite uint16
 		ciphersuitesBytes.ReadUint16(&ciphersuite)
-		ch.ArrayAppendP(ciphersuite, "cipherSuites")
+		ciphers = append(ciphers, ciphersuite)
 	}
+	ch["ciphers"] = ciphers
 
 	var legacyCompressionMethods []uint8
 	clientHello.ReadUint8LengthPrefixed((*cryptobyte.String)(&legacyCompressionMethods))
-	ch.Set(legacyCompressionMethods, "legacy_compression_methods")
+	ch["legacy_compression_methods"] = legacyCompressionMethods
 
 	var extensionsBytes cryptobyte.String
 	clientHello.ReadUint16LengthPrefixed(&extensionsBytes)
-	ch.Array("extensions")
+
+	var extensions []map[string]interface{}
 	for !extensionsBytes.Empty() {
 		var extType uint16
 		extensionsBytes.ReadUint16(&extType)
 
-		ext := gabs.New()
-		ext.Set(extType, "type")
+		ext := make(map[string]interface{}, 3)
+		ext["type"] = extType
 
 		var extData cryptobyte.String
 		extensionsBytes.ReadUint16LengthPrefixed(&extData)
 
 		switch extType {
 		default:
-			ext.Set("UNKNOWN", "name")
+			ext["name"] = "UNKNOWN"
 		case 0: // Server Name
-			ext.Set("server_name", "name")
+			ext["name"] = "server_name"
 			extData.Skip(5)
-			ext.Set(string(extData), "data")
+			ext["data"] = string(extData)
 		case 16: // ALPN
-			ext.Set("application_layer_protocol_negotiation", "name")
+			ext["name"] = "application_layer_protocol_negotiation"
 			var alpnData cryptobyte.String
 			extData.ReadUint16LengthPrefixed(&alpnData)
+			var data []string
 			for !alpnData.Empty() {
 				var length uint8
 				alpnData.ReadUint8(&length)
 				var proto []byte
 				alpnData.ReadBytes(&proto, int(length))
-				ext.ArrayAppend(string(proto), "data")
+				data = append(data, string(proto))
 			}
+			ext["data"] = data
 		}
 
-		ch.ArrayAppend(ext, "extensions")
+		extensions = append(extensions, ext)
 	}
+	ch["extensions"] = extensions
 
-	json.ArrayAppendP(ch, "TLS.data")
+	TLS.SetP(ch, "data.client_hello")
 }
 
-func (t *JSONPcapTranslator) decodeTLSRecords(it uint8, data []byte, json *gabs.Container) error {
+func (t *JSONPcapTranslator) decodeTLSRecords(it uint8, data []byte, TLS *gabs.Container) error {
 	if len(data) < 5 {
 		return errors.New("TLS record too short")
 	}
@@ -93,7 +100,7 @@ func (t *JSONPcapTranslator) decodeTLSRecords(it uint8, data []byte, json *gabs.
 	h.Length = binary.BigEndian.Uint16(data[3:5])
 
 	if h.ContentType.String() == "Unknown" {
-		return errors.New("Unknown TLS record type")
+		return errors.New("unknown TLS record type")
 	}
 
 	hl := 5 // header length
@@ -117,7 +124,7 @@ func (t *JSONPcapTranslator) decodeTLSRecords(it uint8, data []byte, json *gabs.
 		// see: https://github.com/google/gopacket/blob/v1.1.19/layers/tls.go#L136-L139
 		// reason: when `gopacket` decodes `TLS`, it repaces content by the last layer parsed
 		if messageType == 1 {
-			t.translateTLSLayer_decodeClientHello(hs, json)
+			t.translateTLSLayer_decodeClientHello(hs, TLS)
 		}
 	case layers.TLSApplicationData:
 	}
@@ -125,7 +132,7 @@ func (t *JSONPcapTranslator) decodeTLSRecords(it uint8, data []byte, json *gabs.
 	if len(data) == tl {
 		return nil
 	}
-	return t.decodeTLSRecords(it+1, data[tl:], json)
+	return t.decodeTLSRecords(it+1, data[tl:], TLS)
 }
 
 func (t *JSONPcapTranslator) translateTLSLayer_RecordHeader(ctx context.Context, json *gabs.Container, recordHeader layers.TLSRecordHeader) {
@@ -134,30 +141,27 @@ func (t *JSONPcapTranslator) translateTLSLayer_RecordHeader(ctx context.Context,
 	json.SetP(recordHeader.Length, "length")
 }
 
-func (t *JSONPcapTranslator) translateTLSLayer_ChangeCipherSpec(ctx context.Context, json *gabs.Container, tls *layers.TLS) {
-	json.ArrayP("TLS.change_cipher_spec")
-	for _, changeCipherSpec := range tls.ChangeCipherSpec {
-		o := gabs.New()
+func (t *JSONPcapTranslator) translateTLSLayer_ChangeCipherSpec(ctx context.Context, TLS *gabs.Container, tls *layers.TLS) {
+	a, _ := TLS.ArrayOfSize(len(tls.ChangeCipherSpec), "change_cipher_spec")
+	for i, changeCipherSpec := range tls.ChangeCipherSpec {
+		o, _ := a.ObjectI(i)
 		t.translateTLSLayer_RecordHeader(ctx, o, changeCipherSpec.TLSRecordHeader)
-		o.SetP(changeCipherSpec.Message.String(), "message")
-		json.ArrayAppendP(o, "TLS.change_cipher_spec")
+		o.Set(changeCipherSpec.Message.String(), "message")
 	}
 }
 
-func (t *JSONPcapTranslator) translateTLSLayer_Handshake(ctx context.Context, json *gabs.Container, tls *layers.TLS) {
-	json.ArrayP("TLS.handshake")
-	for _, handshake := range tls.Handshake {
-		o := gabs.New()
+func (t *JSONPcapTranslator) translateTLSLayer_Handshake(ctx context.Context, TLS *gabs.Container, tls *layers.TLS) {
+	a, _ := TLS.ArrayOfSize(len(tls.Handshake), "handshake")
+	for i, handshake := range tls.Handshake {
+		o, _ := a.ObjectI(i)
 		t.translateTLSLayer_RecordHeader(ctx, o, handshake.TLSRecordHeader)
-		json.ArrayAppendP(o, "TLS.handshake")
 	}
 }
 
-func (t *JSONPcapTranslator) translateTLSLayer_AppData(ctx context.Context, json *gabs.Container, tls *layers.TLS) {
-	json.ArrayP("TLS.app_data")
-	for _, appData := range tls.AppData {
-		o := gabs.New()
+func (t *JSONPcapTranslator) translateTLSLayer_AppData(ctx context.Context, TLS *gabs.Container, tls *layers.TLS) {
+	a, _ := TLS.ArrayOfSize(len(tls.Handshake), "app_data")
+	for i, appData := range tls.AppData {
+		o, _ := a.ObjectI(i)
 		t.translateTLSLayer_RecordHeader(ctx, o, appData.TLSRecordHeader)
-		json.ArrayAppendP(o, "TLS.app_data")
 	}
 }

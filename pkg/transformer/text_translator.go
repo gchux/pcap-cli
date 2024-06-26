@@ -3,11 +3,13 @@ package transformer
 import (
 	"context"
 	"fmt"
+	"io"
 	"sort"
 	"strings"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
+	"github.com/pkg/errors"
 )
 
 type (
@@ -125,6 +127,15 @@ func (t *TextPcapTranslator) merge(ctx context.Context, tgt fmt.Stringer, src fm
 
 func (t *TextPcapTranslator) finalize(ctx context.Context, packet fmt.Stringer) (fmt.Stringer, error) {
 	return packet, nil
+}
+
+func (t *TextPcapTranslator) write(ctx context.Context, writer io.Writer, packet *fmt.Stringer) (int, error) {
+	translation := t.asTranslation(*packet)
+	_, err := translation.builder.WriteString("\n")
+	if err != nil {
+		return 0, errors.Wrap(err, "TEXT translation failed")
+	}
+	return fmt.Fprint(writer, translation.String())
 }
 
 func newTextPcapTranslator(iface *PcapIface) *TextPcapTranslator {
