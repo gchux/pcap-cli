@@ -11,8 +11,7 @@ import (
 
 	"github.com/gchux/pcap-cli/pkg/transformer"
 	"github.com/google/gopacket"
-	"github.com/google/gopacket/dumpcommand"
-	gpcap "github.com/google/gopacket/pcap"
+	"github.com/google/gopacket/pcap"
 )
 
 var gopacketLogger = log.New(os.Stderr, "[gopacket] - ", log.LstdFlags)
@@ -21,12 +20,12 @@ func (p *Pcap) IsActive() bool {
 	return p.isActive.Load()
 }
 
-func (p *Pcap) newPcap(ctx context.Context) (*gpcap.InactiveHandle, error) {
+func (p *Pcap) newPcap(ctx context.Context) (*pcap.InactiveHandle, error) {
 	cfg := *p.config
 
 	var err error
 
-	inactiveHandle, err := gpcap.NewInactiveHandle(cfg.Iface)
+	inactiveHandle, err := pcap.NewInactiveHandle(cfg.Iface)
 	if err != nil {
 		gopacketLogger.Fatalf("could not create: %v\n", err)
 	}
@@ -48,7 +47,7 @@ func (p *Pcap) newPcap(ctx context.Context) (*gpcap.InactiveHandle, error) {
 	}
 
 	if cfg.TsType != "" {
-		if t, err := gpcap.TimestampSourceFromString(cfg.TsType); err != nil {
+		if t, err := pcap.TimestampSourceFromString(cfg.TsType); err != nil {
 			gopacketLogger.Fatalf("Supported timestamp types: %v\n", inactiveHandle.SupportedTimestamps())
 			return nil, err
 		} else if err := inactiveHandle.SetTimestampSource(t); err != nil {
@@ -69,7 +68,7 @@ func (p *Pcap) Start(ctx context.Context, writers []PcapWriter) error {
 	}
 
 	var err error
-	var handle *gpcap.Handle
+	var handle *pcap.Handle
 
 	inactiveHandle, err := p.newPcap(ctx)
 	if err != nil {
@@ -92,13 +91,6 @@ func (p *Pcap) Start(ctx context.Context, writers []PcapWriter) error {
 		}
 	}
 
-	// if format is `default` output is similar to `tcpdump`
-	format := cfg.Format
-	if format == "default" {
-		dumpcommand.Run(handle) // `gopacket` default implementation
-		return nil
-	}
-
 	source := gopacket.NewPacketSource(handle, handle.LinkType())
 	source.Lazy = false
 	source.NoCopy = true
@@ -119,6 +111,8 @@ func (p *Pcap) Start(ctx context.Context, writers []PcapWriter) error {
 		Name:  device.Name,
 		Addrs: device.Addresses,
 	}
+
+	format := cfg.Format
 
 	// create new transformer for the specified output format
 	var fn transformer.IPcapTransformer

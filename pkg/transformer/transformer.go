@@ -9,7 +9,7 @@ import (
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
-	gpcap "github.com/google/gopacket/pcap"
+	"github.com/google/gopacket/pcap"
 	"github.com/panjf2000/ants/v2"
 	concurrently "github.com/tejzpr/ordered-concurrently/v3"
 )
@@ -62,7 +62,7 @@ type (
 	PcapIface struct {
 		Index int
 		Name  string
-		Addrs []gpcap.InterfaceAddress
+		Addrs []pcap.InterfaceAddress
 	}
 
 	ContextKey string

@@ -8,7 +8,6 @@ import (
 
 	"github.com/gchux/pcap-cli/pkg/transformer"
 	"github.com/google/gopacket/pcap"
-	gpcap "github.com/google/gopacket/pcap"
 )
 
 type (
@@ -39,8 +38,8 @@ type (
 	Pcap struct {
 		config         *PcapConfig
 		isActive       *atomic.Bool
-		activeHandle   *gpcap.Handle
-		inactiveHandle *gpcap.InactiveHandle
+		activeHandle   *pcap.Handle
+		inactiveHandle *pcap.InactiveHandle
 		fn             transformer.IPcapTransformer
 	}
 
@@ -57,7 +56,7 @@ const (
 )
 
 func findAllDevs(compare func(*string) bool) ([]*PcapDevice, error) {
-	devices, err := gpcap.FindAllDevs()
+	devices, err := pcap.FindAllDevs()
 	if err != nil {
 		return nil, err
 	}

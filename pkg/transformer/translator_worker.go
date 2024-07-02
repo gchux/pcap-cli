@@ -3,7 +3,6 @@ package transformer
 import (
 	"context"
 	"fmt"
-	"sync"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
@@ -152,36 +151,16 @@ func (w *pcapTranslatorWorker) translateTLSLayer(ctx context.Context) fmt.String
 func (w *pcapTranslatorWorker) Run(ctx context.Context) interface{} {
 	buffer := w.translator.next(ctx, w.packet, w.serial)
 
-	translations := make(chan fmt.Stringer, packetLayerTranslatorsSize)
-	var wg sync.WaitGroup
-	wg.Add(packetLayerTranslatorsSize) // number of layers to be translated
-
-	go func() {
-		wg.Wait()
-		close(translations)
-	}()
-
 	for _, translators := range packetLayerTranslators {
-		go func(translators []packetLayerTranslator) {
-			for _, translator := range translators {
-				if t := translator(ctx, w); t != nil {
-					translations <- t
-					break // skip next alternatives
-				}
+		for _, translator := range translators {
+			if t := translator(ctx, w); t != nil {
+				buffer, _ = w.translator.merge(ctx, buffer, t)
+				break // skip next alternatives
 			}
-			wg.Done()
-		}(translators)
-	}
-
-	for translation := range translations {
-		// translations are `nil` if layer is not available
-		if translation != nil {
-			buffer, _ = w.translator.merge(ctx, buffer, translation)
 		}
 	}
 
 	buffer, _ = w.translator.finalize(ctx, buffer)
-
 	return &buffer
 }
 
