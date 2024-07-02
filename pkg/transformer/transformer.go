@@ -141,11 +141,7 @@ func (t *PcapTransformer) WaitDone() {
 func (t *PcapTransformer) Apply(ctx context.Context, packet *gopacket.Packet, serial *uint64) error {
 	// It is assumed that packets will be produced faster than translations.
 	// process/translate packets concurrently in order to avoid blocking `gopacket` packets channel.
-	worker := &pcapTranslatorWorker{
-		serial:     serial,
-		packet:     packet,
-		translator: t.translator,
-	}
+	worker := newPcapTranslatorWorker(serial, packet, t.translator)
 	t.wg.Add(len(t.writers))
 	return t.apply(worker)
 }
@@ -182,7 +178,7 @@ func provideWorkerPools(ctx context.Context, transformer *PcapTransformer, numWr
 	}
 	poolOpt := ants.WithOptions(poolOpts)
 
-	poolSize := 5 * numWriters
+	poolSize := 10 * numWriters
 
 	translatorPoolFn := func(i interface{}) {
 		transformer.translatePacketFn(ctx, i)

@@ -16,7 +16,7 @@ type (
 		translator PcapTranslator
 	}
 
-	packetLayerTranslator func(context.Context) fmt.Stringer
+	packetLayerTranslator func(context.Context, *pcapTranslatorWorker) fmt.Stringer
 )
 
 //go:generate stringer -type=PcapTranslatorFmt
@@ -29,6 +29,43 @@ var pcapTranslatorFmts = map[string]PcapTranslatorFmt{
 	"json": JSON,
 	"text": TEXT,
 }
+
+var (
+	// alternatives per layer; there can only be one!
+	packetLayerTranslators = [][]packetLayerTranslator{
+		{ // L2
+			func(ctx context.Context, w *pcapTranslatorWorker) fmt.Stringer {
+				return w.translateEthernetLayer(ctx)
+			},
+		},
+		{ // L3
+			func(ctx context.Context, w *pcapTranslatorWorker) fmt.Stringer {
+				return w.translateIPv4Layer(ctx)
+			},
+			func(ctx context.Context, w *pcapTranslatorWorker) fmt.Stringer {
+				return w.translateIPv6Layer(ctx)
+			},
+		},
+		{ // L4
+			func(ctx context.Context, w *pcapTranslatorWorker) fmt.Stringer {
+				return w.translateTCPLayer(ctx)
+			},
+			func(ctx context.Context, w *pcapTranslatorWorker) fmt.Stringer {
+				return w.translateUDPLayer(ctx)
+			},
+		},
+		{ // L7
+			func(ctx context.Context, w *pcapTranslatorWorker) fmt.Stringer {
+				return w.translateDNSLayer(ctx)
+			},
+			func(ctx context.Context, w *pcapTranslatorWorker) fmt.Stringer {
+				return w.translateTLSLayer(ctx)
+			},
+		},
+	}
+
+	packetLayerTranslatorsSize = len(packetLayerTranslators)
+)
 
 func (w pcapTranslatorWorker) pkt(ctx context.Context) gopacket.Packet {
 	return *w.packet
@@ -115,31 +152,21 @@ func (w *pcapTranslatorWorker) translateTLSLayer(ctx context.Context) fmt.String
 func (w *pcapTranslatorWorker) Run(ctx context.Context) interface{} {
 	buffer := w.translator.next(ctx, w.packet, w.serial)
 
-	// alternatives per layer; there can only be one!
-	translators := [][]packetLayerTranslator{
-		{w.translateEthernetLayer},                   // L2
-		{w.translateIPv4Layer, w.translateIPv6Layer}, // L3
-		{w.translateTCPLayer, w.translateUDPLayer},   // L4
-		{w.translateDNSLayer, w.translateTLSLayer},   // L7
-	}
-
-	numLayers := len(translators)
-	translations := make(chan fmt.Stringer, numLayers)
+	translations := make(chan fmt.Stringer, packetLayerTranslatorsSize)
 	var wg sync.WaitGroup
-	wg.Add(numLayers) // number of layers to be translated
+	wg.Add(packetLayerTranslatorsSize) // number of layers to be translated
 
 	go func() {
 		wg.Wait()
 		close(translations)
 	}()
 
-	for _, translators := range translators {
+	for _, translators := range packetLayerTranslators {
 		go func(translators []packetLayerTranslator) {
 			for _, translator := range translators {
-				if t := translator(ctx); t != nil {
+				if t := translator(ctx, w); t != nil {
 					translations <- t
-					// skip next alternatives
-					break
+					break // skip next alternatives
 				}
 			}
 			wg.Done()
@@ -156,4 +183,16 @@ func (w *pcapTranslatorWorker) Run(ctx context.Context) interface{} {
 	buffer, _ = w.translator.finalize(ctx, buffer)
 
 	return &buffer
+}
+
+func newPcapTranslatorWorker(
+	serial *uint64, packet *gopacket.Packet,
+	translator PcapTranslator,
+) *pcapTranslatorWorker {
+	worker := &pcapTranslatorWorker{
+		serial:     serial,
+		packet:     packet,
+		translator: translator,
+	}
+	return worker
 }

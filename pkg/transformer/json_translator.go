@@ -329,7 +329,7 @@ func (t *JSONPcapTranslator) merge(ctx context.Context, tgt fmt.Stringer, src fm
 func (t *JSONPcapTranslator) finalize(ctx context.Context, packet fmt.Stringer) (fmt.Stringer, error) {
 	json := t.asTranslation(packet)
 
-	data := make(map[string]any, 13)
+	data := make(map[string]any, 15)
 
 	data["ifaceIndex"] = t.iface.Index
 	data["ifaceName"] = t.iface.Name
