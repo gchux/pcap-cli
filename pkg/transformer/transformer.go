@@ -174,11 +174,11 @@ func provideWorkerPools(ctx context.Context, transformer *PcapTransformer, numWr
 	poolOpts := ants.Options{
 		PreAlloc:       true,
 		Nonblocking:    false,
-		ExpiryDuration: 5 * time.Second,
+		ExpiryDuration: 10 * time.Second,
 	}
 	poolOpt := ants.WithOptions(poolOpts)
 
-	poolSize := 10 * numWriters
+	poolSize := 20 * numWriters
 
 	translatorPoolFn := func(i interface{}) {
 		transformer.translatePacketFn(ctx, i)
@@ -194,7 +194,7 @@ func provideWorkerPools(ctx context.Context, transformer *PcapTransformer, numWr
 }
 
 func provideConcurrentQueue(ctx context.Context, transformer *PcapTransformer, numWriters int) {
-	queueSize := 10 * numWriters
+	queueSize := 25 * numWriters
 
 	ochOpts := &concurrently.Options{
 		PoolSize:         queueSize,
