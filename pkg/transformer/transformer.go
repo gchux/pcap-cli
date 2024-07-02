@@ -55,7 +55,7 @@ type (
 
 	pcapWriteTask struct {
 		ctx         context.Context
-		writer      io.Writer
+		writer      *uint8
 		translation *fmt.Stringer
 	}
 
@@ -76,7 +76,7 @@ const (
 func (t *PcapTransformer) writeTranslation(ctx context.Context, task *pcapWriteTask) {
 	// consume translations – flush them into writers
 	// io.WriteString(task.writer, (*task.translation).String()+"\n")
-	t.translator.write(ctx, task.writer, task.translation)
+	t.translator.write(ctx, t.writers[*task.writer], task.translation)
 	t.wg.Done()
 }
 
@@ -102,11 +102,11 @@ func (t *PcapTransformer) produceTranslations(ctx context.Context) {
 	}
 }
 
-func (t *PcapTransformer) consumeTranslations(ctx context.Context, index int) {
-	for translation := range t.writeQueues[index] {
+func (t *PcapTransformer) consumeTranslations(ctx context.Context, index *uint8) {
+	for translation := range t.writeQueues[*index] {
 		task := &pcapWriteTask{
 			ctx:         ctx,
-			writer:      t.writers[index],
+			writer:      index,
 			translation: translation,
 		}
 
@@ -150,12 +150,12 @@ func (t *PcapTransformer) Apply(ctx context.Context, packet *gopacket.Packet, se
 	return t.apply(worker)
 }
 
-func translatePacket(ctx context.Context, transformer *PcapTransformer, worker interface{}) {
-	transformer.produceTranslation(ctx, worker.(*pcapTranslatorWorker))
+func (t *PcapTransformer) translatePacketFn(ctx context.Context, worker interface{}) {
+	t.produceTranslation(ctx, worker.(*pcapTranslatorWorker))
 }
 
-func writeTranslation(ctx context.Context, transformer *PcapTransformer, task interface{}) {
-	transformer.writeTranslation(ctx, task.(*pcapWriteTask))
+func (t *PcapTransformer) writeTranslationFn(ctx context.Context, task interface{}) {
+	t.writeTranslation(ctx, task.(*pcapWriteTask))
 }
 
 func newTranslator(iface *PcapIface, format PcapTranslatorFmt) (PcapTranslator, error) {
@@ -182,23 +182,23 @@ func provideWorkerPools(ctx context.Context, transformer *PcapTransformer, numWr
 	}
 	poolOpt := ants.WithOptions(poolOpts)
 
-	poolSize := 10 * numWriters
+	poolSize := 5 * numWriters
 
 	translatorPoolFn := func(i interface{}) {
-		translatePacket(ctx, transformer, i)
+		transformer.translatePacketFn(ctx, i)
 	}
 	translatorPool, _ := ants.NewPoolWithFunc(poolSize, translatorPoolFn, poolOpt)
 	transformer.translatorPool = translatorPool
 
 	writerPoolFn := func(i interface{}) {
-		writeTranslation(ctx, transformer, i)
+		transformer.writeTranslationFn(ctx, i)
 	}
 	writerPool, _ := ants.NewMultiPoolWithFunc(numWriters, poolSize, writerPoolFn, ants.LeastTasks, poolOpt)
 	transformer.writerPool = writerPool
 }
 
 func provideConcurrentQueue(ctx context.Context, transformer *PcapTransformer, numWriters int) {
-	queueSize := 20 * numWriters
+	queueSize := 10 * numWriters
 
 	ochOpts := &concurrently.Options{
 		PoolSize:         queueSize,
@@ -277,7 +277,8 @@ func newTransformer(ctx context.Context, iface *PcapIface, writers []io.Writer, 
 	// spawn consumers for all `io.Writer`s
 	// 1 consumer goroutine per `io.Writer`
 	for i := range writeQueues {
-		go transformer.consumeTranslations(ctx, i)
+		index := uint8(i)
+		go transformer.consumeTranslations(ctx, &index)
 	}
 
 	return transformer, nil
