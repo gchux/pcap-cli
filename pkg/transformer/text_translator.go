@@ -64,36 +64,36 @@ func (t *TextPcapTranslator) asTranslation(buffer fmt.Stringer) *textPcapTransla
 	return buffer.(*textPcapTranslation)
 }
 
-func (t *TextPcapTranslator) translateEthernetLayer(ctx context.Context, packet *layers.Ethernet) fmt.Stringer {
+func (t *TextPcapTranslator) translateEthernetLayer(ctx context.Context, eth *layers.Ethernet) fmt.Stringer {
 	var text strings.Builder
 
 	text.WriteString("[L2|type=")
-	text.WriteString(packet.EthernetType.String())
+	text.WriteString(eth.EthernetType.String())
 	text.WriteString("|")
-	text.WriteString(fmt.Sprintf("src=%s", packet.SrcMAC.String()))
+	text.WriteString(fmt.Sprintf("src=%s", eth.SrcMAC.String()))
 	text.WriteString("|")
-	text.WriteString(fmt.Sprintf("dst=%s", packet.DstMAC.String()))
+	text.WriteString(fmt.Sprintf("dst=%s", eth.DstMAC.String()))
 	text.WriteString("]")
 
 	return &textPcapTranslation{1, &text}
 }
 
-func (t *TextPcapTranslator) translateIPv4Layer(ctx context.Context, packet *layers.IPv4) fmt.Stringer {
+func (t *TextPcapTranslator) translateIPv4Layer(ctx context.Context, ip4 *layers.IPv4) fmt.Stringer {
 	// [TODO]: implement IPv4 layer translation
 	return &textPcapTranslation{2, new(strings.Builder)}
 }
 
-func (t *TextPcapTranslator) translateIPv6Layer(ctx context.Context, packet *layers.IPv6) fmt.Stringer {
+func (t *TextPcapTranslator) translateIPv6Layer(ctx context.Context, ip6 *layers.IPv6) fmt.Stringer {
 	// [TODO]: implement IPv6 layer translation
 	return &textPcapTranslation{2, new(strings.Builder)}
 }
 
-func (t *TextPcapTranslator) translateUDPLayer(ctx context.Context, packet *layers.UDP) fmt.Stringer {
+func (t *TextPcapTranslator) translateUDPLayer(ctx context.Context, udp *layers.UDP) fmt.Stringer {
 	// [TODO]: implement UDP layer translation
 	return &textPcapTranslation{3, new(strings.Builder)}
 }
 
-func (t *TextPcapTranslator) translateTCPLayer(ctx context.Context, packet *layers.TCP) fmt.Stringer {
+func (t *TextPcapTranslator) translateTCPLayer(ctx context.Context, tcp *layers.TCP) fmt.Stringer {
 	// [TODO]: implement TCP layer translation
 	return &textPcapTranslation{3, new(strings.Builder)}
 }

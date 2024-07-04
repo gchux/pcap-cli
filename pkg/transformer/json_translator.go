@@ -41,7 +41,7 @@ func (t *JSONPcapTranslator) next(ctx context.Context, packet *gopacket.Packet, 
 
 	pcap, _ := json.Object("pcap")
 	pcap.Set(ctx.Value(ContextID), "ctx")
-	pcap.Set(*serial, "num")
+	pcap.Set(*serial, "serial")
 
 	metadata := (*packet).Metadata()
 	info := metadata.CaptureInfo

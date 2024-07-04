@@ -7,6 +7,15 @@ tasks:
   clean:
     cmds:
       - find . -type f -name '*_string.go' -print0 | xargs -0 rm -vf 
+      - find $PB_OUTPUT_DIR -type f -name '*.pb.go' -print0 | xargs -0 rm -vf 
+
+  proto-gen:
+    cmds:
+      - >-
+        docker run --user=$USER_ID
+        -v {{.USER_WORKING_DIR}}:/defs
+        namely/protoc-all -d $PB_INPUT_DIR --lint
+        -o $PB_OUTPUT_DIR -l go --go-source-relative
 
   go-fmt:
     cmds:
@@ -21,6 +30,7 @@ tasks:
     dotenv: ['.env']
     cmds:
       - task: clean
+      - task: proto-gen
       - task: go-fmt
       - task: go-gen
       - >-
@@ -40,5 +50,7 @@ tasks:
       - task: clean
       - task: go-fmt
       - >-
-        docker buildx build --no-cache --file=Dockerfile
-        --output={{.USER_WORKING_DIR}}/bin --target=releaser {{.USER_WORKING_DIR}}
+        docker buildx build
+        --no-cache --file=Dockerfile
+        --output={{.USER_WORKING_DIR}}/bin
+        --target=releaser {{.USER_WORKING_DIR}}

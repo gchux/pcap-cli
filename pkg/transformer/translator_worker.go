@@ -19,17 +19,6 @@ type (
 	packetLayerTranslator func(context.Context, *pcapTranslatorWorker) fmt.Stringer
 )
 
-//go:generate stringer -type=PcapTranslatorFmt
-const (
-	TEXT PcapTranslatorFmt = iota
-	JSON
-)
-
-var pcapTranslatorFmts = map[string]PcapTranslatorFmt{
-	"json": JSON,
-	"text": TEXT,
-}
-
 var (
 	// alternatives per layer; there can only be one!
 	packetLayerTranslators = [][]packetLayerTranslator{

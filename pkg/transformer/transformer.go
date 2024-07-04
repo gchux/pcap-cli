@@ -17,7 +17,7 @@ import (
 var tcpFlagNames = []string{"SYN", "ACK", "PSH", "FIN", "RST", "URG", "ECE", "CWR"}
 
 type (
-	PcapTranslatorFmt int
+	PcapTranslatorFmt uint8
 
 	PcapTranslator interface {
 		next(context.Context, *gopacket.Packet, *uint64) fmt.Stringer
@@ -72,6 +72,19 @@ const (
 	ContextID      = ContextKey("id")
 	ContextLogName = ContextKey("logName")
 )
+
+//go:generate stringer -type=PcapTranslatorFmt
+const (
+	TEXT PcapTranslatorFmt = iota
+	JSON
+	PROTO
+)
+
+var pcapTranslatorFmts = map[string]PcapTranslatorFmt{
+	"json":  JSON,
+	"text":  TEXT,
+	"proto": PROTO,
+}
 
 func (t *PcapTransformer) writeTranslation(ctx context.Context, task *pcapWriteTask) {
 	// consume translations – flush them into writers
@@ -160,6 +173,8 @@ func newTranslator(iface *PcapIface, format PcapTranslatorFmt) (PcapTranslator, 
 		return newJSONPcapTranslator(iface), nil
 	case TEXT:
 		return newTextPcapTranslator(iface), nil
+	case PROTO:
+		return newProtoPcapTranslator(iface), nil
 	default:
 		/* no-go */
 	}
