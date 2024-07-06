@@ -4,12 +4,11 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"sort"
 	"strings"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
-	"github.com/pkg/errors"
+	"github.com/pterm/pterm"
 )
 
 type (
@@ -22,7 +21,16 @@ type (
 		builder *strings.Builder
 	}
 
-	textPcapTranslations map[int]*textPcapTranslation
+	textPcapTranslations struct {
+		writer       io.Writer
+		translations map[int]*textPcapTranslation
+	}
+)
+
+var (
+	textPcapSerialStyle = pterm.NewStyle(pterm.FgBlack, pterm.BgRed)
+	textPcapHeaderStyle = pterm.NewStyle(pterm.FgBlack, pterm.BgCyan, pterm.Bold)
+	textPcapDataStyle   = pterm.NewStyle(pterm.FgBlack, pterm.BgWhite, pterm.Bold)
 )
 
 func (tt *textPcapTranslation) String() string {
@@ -30,34 +38,47 @@ func (tt *textPcapTranslation) String() string {
 }
 
 func (tt *textPcapTranslations) String() string {
-	keys := make([]int, 0)
-	for key := range *tt {
-		keys = append(keys, key)
+	translations := (*tt).translations
+
+	printer := pterm.BulletListPrinter{
+		Bullet:      "•",
+		TextStyle:   &pterm.ThemeDefault.BulletListTextStyle,
+		BulletStyle: &pterm.ThemeDefault.BulletListBulletStyle,
+		Items:       make([]pterm.BulletListItem, len(translations)),
 	}
-	// print layers in order
-	sort.Ints(keys)
-	var packetStr strings.Builder
-	for _, key := range keys {
-		builder := (*tt)[key].builder
-		if key > 0 {
-			packetStr.WriteString("\n - ")
+
+	for key, value := range translations {
+		printer.Items[key] = pterm.BulletListItem{
+			Level:       key,                           // Level 0 (top level)
+			Text:        value.builder.String(),        // Text to display
+			TextStyle:   pterm.NewStyle(pterm.FgWhite), // Text color
+			BulletStyle: pterm.NewStyle(pterm.FgRed),   // Bullet color
 		}
-		packetStr.WriteString(builder.String())
 	}
-	return packetStr.String()
+
+	str, err := printer.Srender()
+	if err == nil {
+		return pterm.DefaultBox.Sprintln(str)
+	}
+	return ""
 }
 
 func (t *TextPcapTranslator) next(ctx context.Context, packet *gopacket.Packet, serial *uint64) fmt.Stringer {
-	var text strings.Builder
+	text := new(strings.Builder)
 
-	text.WriteString("[ctx=")
-	text.WriteString(fmt.Sprintf("%s", ctx.Value(ContextID)))
-	text.WriteString("|num=")
-	text.WriteString(fmt.Sprintf("%d", *serial))
+	metadata := (*packet).Metadata()
+	info := metadata.CaptureInfo
+
+	// text.WriteString(ctx.Value(ContextID))
+	text.WriteString(textPcapSerialStyle.Sprint(" ", *serial, " "))
+	text.WriteString(" | [iface: ")
+	text.WriteString(textPcapDataStyle.Sprint(" ", t.iface.Index, "/", t.iface.Name, " "))
+	text.WriteString("] | [timestamp: ")
+	text.WriteString(textPcapDataStyle.Sprint(" ", info.Timestamp.String(), " "))
 	text.WriteString("]")
 
 	// `next` returns the container to be used for merging all layers
-	return &textPcapTranslations{0: &textPcapTranslation{0, &text}}
+	return &textPcapTranslations{translations: map[int]*textPcapTranslation{0: {0, text}}}
 }
 
 func (t *TextPcapTranslator) asTranslation(buffer fmt.Stringer) *textPcapTranslation {
@@ -65,17 +86,18 @@ func (t *TextPcapTranslator) asTranslation(buffer fmt.Stringer) *textPcapTransla
 }
 
 func (t *TextPcapTranslator) translateEthernetLayer(ctx context.Context, eth *layers.Ethernet) fmt.Stringer {
-	var text strings.Builder
+	text := new(strings.Builder)
 
-	text.WriteString("[L2|type=")
-	text.WriteString(eth.EthernetType.String())
-	text.WriteString("|")
-	text.WriteString(fmt.Sprintf("src=%s", eth.SrcMAC.String()))
-	text.WriteString("|")
-	text.WriteString(fmt.Sprintf("dst=%s", eth.DstMAC.String()))
+	text.WriteString(textPcapHeaderStyle.Sprint(" L2 "))
+	text.WriteString(" | [")
+	text.WriteString(textPcapDataStyle.Sprint(" ", eth.EthernetType.String(), " "))
+	text.WriteString("] | [src: ")
+	text.WriteString(textPcapDataStyle.Sprintf(" %s ", eth.SrcMAC.String()))
+	text.WriteString("] | [dst: ")
+	text.WriteString(textPcapDataStyle.Sprintf(" %s ", eth.DstMAC.String()))
 	text.WriteString("]")
 
-	return &textPcapTranslation{1, &text}
+	return &textPcapTranslation{1, text}
 }
 
 func (t *TextPcapTranslator) translateIPv4Layer(ctx context.Context, ip4 *layers.IPv4) fmt.Stringer {
@@ -113,13 +135,14 @@ func (t *TextPcapTranslator) merge(ctx context.Context, tgt fmt.Stringer, src fm
 	switch typedObj := tgt.(type) {
 	case *textPcapTranslations:
 		// add reference to another layer translation
-		(*typedObj)[srcTranslation.index] = srcTranslation
+		(*typedObj).translations[srcTranslation.index] = srcTranslation
 	case *textPcapTranslation:
 		// 1st `merge` invocation might not actually be a map (`textPcapTranslations`)
-		// do not be confused: this is a `map[int]*textPcapTranslation`
 		tgt = &textPcapTranslations{
-			typedObj.index:       typedObj,
-			srcTranslation.index: srcTranslation,
+			translations: map[int]*textPcapTranslation{
+				typedObj.index:       typedObj,
+				srcTranslation.index: srcTranslation,
+			},
 		}
 	}
 	return tgt, nil
@@ -130,12 +153,9 @@ func (t *TextPcapTranslator) finalize(ctx context.Context, packet fmt.Stringer) 
 }
 
 func (t *TextPcapTranslator) write(ctx context.Context, writer io.Writer, packet *fmt.Stringer) (int, error) {
-	translation := t.asTranslation(*packet)
-	_, err := translation.builder.WriteString("\n")
-	if err != nil {
-		return 0, errors.Wrap(err, "TEXT translation failed")
-	}
-	return fmt.Fprint(writer, translation.String())
+	translations := (*packet).(*textPcapTranslations)
+	translations.writer = writer
+	return io.WriteString(writer, translations.String())
 }
 
 func newTextPcapTranslator(iface *PcapIface) *TextPcapTranslator {
