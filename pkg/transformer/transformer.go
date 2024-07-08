@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"regexp"
 	"sync"
 	"time"
 
@@ -13,8 +14,6 @@ import (
 	"github.com/panjf2000/ants/v2"
 	concurrently "github.com/tejzpr/ordered-concurrently/v3"
 )
-
-var tcpFlagNames = []string{"SYN", "ACK", "PSH", "FIN", "RST", "URG", "ECE", "CWR"}
 
 type (
 	PcapTranslatorFmt uint8
@@ -29,7 +28,7 @@ type (
 		translateTLSLayer(context.Context, *layers.TLS) fmt.Stringer
 		translateDNSLayer(context.Context, *layers.DNS) fmt.Stringer
 		merge(context.Context, fmt.Stringer, fmt.Stringer) (fmt.Stringer, error)
-		finalize(context.Context, fmt.Stringer) (fmt.Stringer, error)
+		finalize(context.Context, *gopacket.Packet, fmt.Stringer) (fmt.Stringer, error)
 		write(context.Context, io.Writer, *fmt.Stringer) (int, error)
 	}
 
@@ -85,6 +84,15 @@ var pcapTranslatorFmts = map[string]PcapTranslatorFmt{
 	"text":  TEXT,
 	"proto": PROTO,
 }
+
+var (
+	tcpFlagNames        = []string{"SYN", "ACK", "PSH", "FIN", "RST", "URG", "ECE", "CWR"}
+	tcpOptionRgx        = regexp.MustCompile(`^TCPOption\((?P<opt>.*?)\)$`)
+	httpPayloadRegex    = regexp.MustCompile(`^(?:HTTP|GET|POST|PUT|PATCH|DELETE|OPTIONS|CONNECT).*`)
+	httpBodySeparator   = []byte("\r\n\r\n")
+	httpSeparator       = []byte("\r\n")
+	httpHeaderSeparator = []byte(":")
+)
 
 func (t *PcapTransformer) writeTranslation(ctx context.Context, task *pcapWriteTask) {
 	// consume translations – flush them into writers

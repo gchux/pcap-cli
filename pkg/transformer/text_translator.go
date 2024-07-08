@@ -92,9 +92,9 @@ func (t *TextPcapTranslator) translateEthernetLayer(ctx context.Context, eth *la
 	text.WriteString(" | [")
 	text.WriteString(textPcapDataStyle.Sprint(" ", eth.EthernetType.String(), " "))
 	text.WriteString("] | [src: ")
-	text.WriteString(textPcapDataStyle.Sprintf(" %s ", eth.SrcMAC.String()))
+	text.WriteString(textPcapDataStyle.Sprint(" ", eth.SrcMAC.String(), " "))
 	text.WriteString("] | [dst: ")
-	text.WriteString(textPcapDataStyle.Sprintf(" %s ", eth.DstMAC.String()))
+	text.WriteString(textPcapDataStyle.Sprint(" ", eth.DstMAC.String(), " "))
 	text.WriteString("]")
 
 	return &textPcapTranslation{1, text}
@@ -148,7 +148,7 @@ func (t *TextPcapTranslator) merge(ctx context.Context, tgt fmt.Stringer, src fm
 	return tgt, nil
 }
 
-func (t *TextPcapTranslator) finalize(ctx context.Context, packet fmt.Stringer) (fmt.Stringer, error) {
+func (t *TextPcapTranslator) finalize(ctx context.Context, p *gopacket.Packet, packet fmt.Stringer) (fmt.Stringer, error) {
 	return packet, nil
 }
 

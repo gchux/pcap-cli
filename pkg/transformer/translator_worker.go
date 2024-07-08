@@ -170,7 +170,7 @@ func (w *pcapTranslatorWorker) Run(ctx context.Context) interface{} {
 		}
 	}
 
-	buffer, _ = w.translator.finalize(ctx, buffer)
+	buffer, _ = w.translator.finalize(ctx, w.packet, buffer)
 
 	return &buffer
 }

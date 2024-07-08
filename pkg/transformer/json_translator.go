@@ -1,11 +1,11 @@
 package transformer
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"net"
-	"regexp"
 	"strconv"
 	"strings"
 
@@ -19,8 +19,6 @@ import (
 type JSONPcapTranslator struct {
 	iface *PcapIface
 }
-
-var tcpOptionRgx = regexp.MustCompile(`^TCPOption\((?P<opt>.*?)\)$`)
 
 const (
 	jsonTranslationSummary          = "#:{serial} | @:{ifaceIndex}/{ifaceName} | "
@@ -41,7 +39,7 @@ func (t *JSONPcapTranslator) next(ctx context.Context, packet *gopacket.Packet, 
 
 	pcap, _ := json.Object("pcap")
 	pcap.Set(ctx.Value(ContextID), "ctx")
-	pcap.Set(*serial, "serial")
+	pcap.Set(*serial, "num")
 
 	metadata := (*packet).Metadata()
 	info := metadata.CaptureInfo
@@ -326,7 +324,8 @@ func (t *JSONPcapTranslator) merge(ctx context.Context, tgt fmt.Stringer, src fm
 	return tgt, t.asTranslation(tgt).Merge(t.asTranslation(src))
 }
 
-func (t *JSONPcapTranslator) finalize(ctx context.Context, packet fmt.Stringer) (fmt.Stringer, error) {
+// for JSON translator, this mmethod generates the summary line at {`message`: $summary}
+func (t *JSONPcapTranslator) finalize(ctx context.Context, p *gopacket.Packet, packet fmt.Stringer) (fmt.Stringer, error) {
 	json := t.asTranslation(packet)
 
 	data := make(map[string]any, 15)
@@ -391,6 +390,35 @@ func (t *JSONPcapTranslator) finalize(ctx context.Context, packet fmt.Stringer) 
 	data["tcpAck"] = ack
 
 	json.Set(stringFormatter.FormatComplex(jsonTranslationSummaryTCP, data), "message")
+
+	// simple/naive HTTP decoding
+	appLayer := (*p).ApplicationLayer()
+	if appLayer == nil {
+		return json, nil
+	}
+
+	appLayerData := appLayer.LayerContents()
+
+	// if content is not HTTP in clear text, abort
+	if !httpPayloadRegex.Match(appLayerData[:10]) {
+		return json, nil
+	}
+
+	// making 1 big assumption
+	//   HTTP request/status line and headers fit in 1 packet
+	//     which is not always the case when fragmentation occurs
+	L7, _ := json.Object("L7")
+	L7.Set("HTTP", "proto")
+	// intentionally dropping HTTP request/response payload
+	dataBytes := bytes.SplitN(appLayerData, httpBodySeparator, 2)[0]
+	parts := bytes.Split(dataBytes, httpSeparator)
+	L7.Set(string(parts[0]), "line")
+	headers, _ := L7.Object("headers")
+	for _, header := range parts[1:] {
+		parts := bytes.SplitN(header, httpHeaderSeparator, 2)
+		headers.Set(string(bytes.TrimSpace(parts[1])), string(parts[0]))
+	}
+
 	return json, nil
 }
 
