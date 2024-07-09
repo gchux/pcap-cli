@@ -94,7 +94,7 @@ var (
 	httpSeparator           = []byte("\r\n")
 	httpHeaderSeparator     = []byte(":")
 	cloudTraceContextHeader = []byte("X-Cloud-Trace-Context")
-	traceAndSpanRegex       = regexp.MustCompile(`^(?<trace>.+?)/(?<span>.+?);o=.*`)
+	traceAndSpanRegex       = regexp.MustCompile(`^(?<trace>.+?)/(?<span>.+?)(?:;o=.*)?$`)
 	cloudProjectID          = os.Getenv("PROJECT_ID")
 	cloudTracePrefix        = "projects/" + cloudProjectID + "/traces/"
 )
