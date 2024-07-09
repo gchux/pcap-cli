@@ -37,6 +37,9 @@ func (t *JSONPcapTranslator) next(ctx context.Context, packet *gopacket.Packet, 
 
 	json.Set(ctx.Value(ContextLogName), "logName")
 
+	labels, _ := json.Object("logging.googleapis.com/labels")
+	labels.Set(ctx.Value(ContextLogName), "pcap")
+
 	pcap, _ := json.Object("pcap")
 	pcap.Set(ctx.Value(ContextID), "ctx")
 	pcap.Set(*serial, "num")
@@ -50,10 +53,12 @@ func (t *JSONPcapTranslator) next(ctx context.Context, packet *gopacket.Packet, 
 	meta.Set(info.CaptureLength, "cap_len")
 
 	timestamp, _ := json.Object("timestamp")
-	timestamp.Set(info.Timestamp, "str")
-	timestamp.Set(info.Timestamp.UnixMicro(), "usec")
+	timestamp.Set(info.Timestamp.String(), "str")
+	timestamp.Set(info.Timestamp.Unix(), "seconds")
+	timestamp.Set(info.Timestamp.Nanosecond(), "nanos")
 
 	iface, _ := json.Object("iface")
+	labels.Set(t.iface.Name, "iface")
 	iface.Set(t.iface.Index, "index")
 	iface.Set(t.iface.Name, "name")
 	addrs, _ := iface.ArrayOfSize(len(t.iface.Addrs), "addrs")
@@ -416,7 +421,15 @@ func (t *JSONPcapTranslator) finalize(ctx context.Context, p *gopacket.Packet, p
 	headers, _ := L7.Object("headers")
 	for _, header := range parts[1:] {
 		parts := bytes.SplitN(header, httpHeaderSeparator, 2)
-		headers.Set(string(bytes.TrimSpace(parts[1])), string(parts[0]))
+		value := string(bytes.TrimSpace(parts[1]))
+		// include trace and span id for traceability
+		if bytes.EqualFold(parts[0], cloudTraceContextHeader) {
+			if traceAndSpan := traceAndSpanRegex.FindStringSubmatch(value); traceAndSpan != nil {
+				json.Set("projects/"+cloudProjectID+"/traces/"+traceAndSpan[1], "logging.googleapis.com/trace")
+				json.Set(traceAndSpan[2], "logging.googleapis.com/spanId")
+			}
+		}
+		headers.Set(value, string(parts[0]))
 	}
 
 	return json, nil

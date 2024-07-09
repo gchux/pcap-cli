@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"regexp"
 	"sync"
 	"time"
@@ -86,12 +87,15 @@ var pcapTranslatorFmts = map[string]PcapTranslatorFmt{
 }
 
 var (
-	tcpFlagNames        = []string{"SYN", "ACK", "PSH", "FIN", "RST", "URG", "ECE", "CWR"}
-	tcpOptionRgx        = regexp.MustCompile(`^TCPOption\((?P<opt>.*?)\)$`)
-	httpPayloadRegex    = regexp.MustCompile(`^(?:HTTP|GET|POST|PUT|PATCH|DELETE|OPTIONS|CONNECT).*`)
-	httpBodySeparator   = []byte("\r\n\r\n")
-	httpSeparator       = []byte("\r\n")
-	httpHeaderSeparator = []byte(":")
+	tcpFlagNames            = []string{"SYN", "ACK", "PSH", "FIN", "RST", "URG", "ECE", "CWR"}
+	tcpOptionRgx            = regexp.MustCompile(`^TCPOption\((?P<opt>.*?)\)$`)
+	httpPayloadRegex        = regexp.MustCompile(`^(?:HTTP|GET|POST|PUT|PATCH|DELETE|OPTIONS|CONNECT).*`)
+	httpBodySeparator       = []byte("\r\n\r\n")
+	httpSeparator           = []byte("\r\n")
+	httpHeaderSeparator     = []byte(":")
+	cloudTraceContextHeader = []byte("X-Cloud-Trace-Context")
+	traceAndSpanRegex       = regexp.MustCompile(`^(?<trace>.+?)/(?<span>.+?);o=.*`)
+	cloudProjectID          = os.Getenv("PROJECT_ID")
 )
 
 func (t *PcapTransformer) writeTranslation(ctx context.Context, task *pcapWriteTask) {
