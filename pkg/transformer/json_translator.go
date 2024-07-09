@@ -35,13 +35,19 @@ func (t *JSONPcapTranslator) translate(packet *gopacket.Packet) error {
 func (t *JSONPcapTranslator) next(ctx context.Context, packet *gopacket.Packet, serial *uint64) fmt.Stringer {
 	json := gabs.New()
 
-	json.Set(ctx.Value(ContextLogName), "logName")
+	id := ctx.Value(ContextLogName)
+	logName := ctx.Value(ContextLogName)
 
-	labels, _ := json.Object("logging.googleapis.com/labels")
-	labels.Set(ctx.Value(ContextLogName), "pcap")
+	operation, _ := json.Object("logging.googleapis.com/operation")
+	operation.Set(id, "id")
+	operation.Set(logName, "producer")
+	if *serial == 1 {
+		operation.Set(true, "first")
+	}
 
 	pcap, _ := json.Object("pcap")
-	pcap.Set(ctx.Value(ContextID), "ctx")
+	pcap.Set(id, "id")
+	pcap.Set(logName, "ctx")
 	pcap.Set(*serial, "num")
 
 	metadata := (*packet).Metadata()
@@ -52,19 +58,25 @@ func (t *JSONPcapTranslator) next(ctx context.Context, packet *gopacket.Packet, 
 	meta.Set(info.Length, "len")
 	meta.Set(info.CaptureLength, "cap_len")
 
+	metaTimestamp, _ := meta.Object("timestamp")
+	metaTimestamp.Set(info.Timestamp.String(), "str")
+	metaTimestamp.Set(info.Timestamp.UnixNano())
+
 	timestamp, _ := json.Object("timestamp")
-	timestamp.Set(info.Timestamp.String(), "str")
 	timestamp.Set(info.Timestamp.Unix(), "seconds")
 	timestamp.Set(info.Timestamp.Nanosecond(), "nanos")
 
 	iface, _ := json.Object("iface")
-	labels.Set(t.iface.Name, "iface")
 	iface.Set(t.iface.Index, "index")
 	iface.Set(t.iface.Name, "name")
 	addrs, _ := iface.ArrayOfSize(len(t.iface.Addrs), "addrs")
 	for i, addr := range t.iface.Addrs {
 		addrs.SetIndex(addr.IP.String(), i)
 	}
+
+	labels, _ := json.Object("logging.googleapis.com/labels")
+	labels.Set(id, "pcap_id")
+	labels.Set(t.iface.Name, "pcap_iface")
 
 	return json
 }
@@ -111,7 +123,6 @@ func (t *JSONPcapTranslator) translateIPv4Layer(ctx context.Context, ip *layers.
 	proto, _ := L3.Object("proto")
 	proto.Set(ip.Protocol, "num")
 	proto.Set(ip.Protocol.String(), "name")
-
 	// https://github.com/google/gopacket/blob/master/layers/ip4.go#L28-L40
 	L3.SetP(strings.Split(ip.Flags.String(), "|"), "flags")
 
@@ -422,14 +433,15 @@ func (t *JSONPcapTranslator) finalize(ctx context.Context, p *gopacket.Packet, p
 	for _, header := range parts[1:] {
 		parts := bytes.SplitN(header, httpHeaderSeparator, 2)
 		value := string(bytes.TrimSpace(parts[1]))
+		headers.Set(value, string(parts[0]))
 		// include trace and span id for traceability
 		if bytes.EqualFold(parts[0], cloudTraceContextHeader) {
 			if traceAndSpan := traceAndSpanRegex.FindStringSubmatch(value); traceAndSpan != nil {
-				json.Set("projects/"+cloudProjectID+"/traces/"+traceAndSpan[1], "logging.googleapis.com/trace")
+				json.Set(cloudTracePrefix+traceAndSpan[1], "logging.googleapis.com/trace")
 				json.Set(traceAndSpan[2], "logging.googleapis.com/spanId")
+				json.Set(true, "logging.googleapis.com/trace_sampled")
 			}
 		}
-		headers.Set(value, string(parts[0]))
 	}
 
 	return json, nil

@@ -96,6 +96,7 @@ var (
 	cloudTraceContextHeader = []byte("X-Cloud-Trace-Context")
 	traceAndSpanRegex       = regexp.MustCompile(`^(?<trace>.+?)/(?<span>.+?);o=.*`)
 	cloudProjectID          = os.Getenv("PROJECT_ID")
+	cloudTracePrefix        = "projects/" + cloudProjectID + "/traces/"
 )
 
 func (t *PcapTransformer) writeTranslation(ctx context.Context, task *pcapWriteTask) {
