@@ -427,47 +427,61 @@ func (t *JSONPcapTranslator) finalize(ctx context.Context, p *gopacket.Packet, p
 		return json, nil
 	}
 
-	appLayerData := appLayer.LayerContents()
+	t.setHTTP11(p, &appLayer, json, &message)
+
+	return json, nil
+}
+
+func (t *JSONPcapTranslator) setHTTP11(
+	packet *gopacket.Packet,
+	appLayer *gopacket.ApplicationLayer,
+	json *gabs.Container,
+	message *string,
+) {
+	appLayerData := (*appLayer).LayerContents()
 
 	isHTTP11Request := http11RequestPayloadRegex.Match(appLayerData)
-	isHTTP11Response := http11ResponsePayloadRegex.Match(appLayerData)
+	isHTTP11Response := !isHTTP11Request && http11ResponsePayloadRegex.Match(appLayerData)
 
 	// if content is not HTTP in clear text, abort
 	if !isHTTP11Request && !isHTTP11Response {
-		json.Set(message, "message")
-		return json, nil
+		json.Set(*message, "message")
+		return
 	}
-
-	// making 1 big assumption
+	// making at least 1 big assumption:
 	//   HTTP request/status line and headers fit in 1 packet
 	//     which is not always the case when fragmentation occurs
 	L7, _ := json.Object("L7")
 
 	httpDataReader := bufio.NewReaderSize(bytes.NewReader(appLayerData), len(appLayerData))
+
+	// attempt to parse HTTP/1.1 request
 	if isHTTP11Request {
 		request, err := http.ReadRequest(httpDataReader)
 		if err == nil {
-			url := request.URL.String()
 			L7.Set("request", "kind")
+			url := request.URL.String()
 			L7.Set(url, "url")
 			L7.Set(request.Proto, "proto")
 			L7.Set(request.Method, "method")
 			if traceAndSpan := t.setHTTPHeaders(L7, &request.Header); traceAndSpan != nil {
+				// include trace and span id for traceability
 				t.setTraceAndSpan(json, &traceAndSpan[0], &traceAndSpan[1])
 				fullURL := stringFormatter.Format("{0}{1}", request.Host, url)
 				jsonTranslatorRequest := &JSONTranslatorRequest{
-					timestamp: &(*p).Metadata().Timestamp,
+					timestamp: &(*packet).Metadata().Timestamp,
 					method:    &request.Method,
 					url:       &fullURL,
 				}
 				// if a response is never seen for this trace id, it will cause a memory leak
 				t.requests.SetIfAbsent(traceAndSpan[0], jsonTranslatorRequest)
 			}
-			json.Set(stringFormatter.Format("{0} | {1} {2} {3}", message, request.Proto, request.Method, url), "message")
-			return json, nil
+			json.Set(stringFormatter.Format("{0} | {1} {2} {3}", *message, request.Proto, request.Method, url), "message")
+			return
 		}
 	}
 
+	// attempt to parse HTTP/1.1 response
 	if isHTTP11Response {
 		response, err := http.ReadResponse(httpDataReader, nil)
 		if err == nil {
@@ -476,6 +490,7 @@ func (t *JSONPcapTranslator) finalize(ctx context.Context, p *gopacket.Packet, p
 			L7.Set(response.StatusCode, "code")
 			L7.Set(response.Status, "status")
 			if traceAndSpan := t.setHTTPHeaders(L7, &response.Header); traceAndSpan != nil {
+				// include trace and span id for traceability
 				t.setTraceAndSpan(json, &traceAndSpan[0], &traceAndSpan[1])
 				jsonTranslatorRequest, ok := t.requests.Load(traceAndSpan[0])
 				if ok {
@@ -486,29 +501,28 @@ func (t *JSONPcapTranslator) finalize(ctx context.Context, p *gopacket.Packet, p
 					request.Set(*translatorRequest.method, "method")
 					request.Set(*translatorRequest.url, "url")
 					requestTimestamp := *translatorRequest.timestamp
-					responseTimestamp := (*p).Metadata().Timestamp
+					responseTimestamp := (*packet).Metadata().Timestamp
 					latency := responseTimestamp.Sub(requestTimestamp)
 					request.Set(requestTimestamp.String(), "timestamp")
 					request.Set(latency.Milliseconds(), "latency")
 				}
 			}
-			json.Set(stringFormatter.Format("{0} | {1} {2}", message, response.Proto, response.Status), "message")
-			return json, nil
+			json.Set(stringFormatter.Format("{0} | {1} {2}", *message, response.Proto, response.Status), "message")
+			return
 		}
 	}
 
-	// fallback to a minimal attempt of HTTP/1.1 decoding
+	// fallback to a minimal (naive) attempt to parse HTTP/1.1
 	//   - intentionally dropping HTTP request/response payload
+	// see: https://www.rfc-editor.org/rfc/rfc7540#section-8.1.3
 	dataBytes := bytes.SplitN(appLayerData, http11BodySeparator, 2)[0]
 	parts := bytes.Split(dataBytes, http11Separator)
-	line := string(parts[0])
-	L7.Set(line, "line")
-	json.Set(stringFormatter.Format("{0} | {1}", message, line), "message")
+
 	headers, _ := L7.Object("headers")
 	for _, header := range parts[1:] {
-		parts := bytes.SplitN(header, http11HeaderSeparator, 2)
-		value := string(bytes.TrimSpace(parts[1]))
-		headers.Set(value, string(parts[0]))
+		headerParts := bytes.SplitN(header, http11HeaderSeparator, 2)
+		value := string(bytes.TrimSpace(headerParts[1]))
+		headers.Set(value, string(headerParts[0]))
 		// include trace and span id for traceability
 		if bytes.EqualFold(parts[0], cloudTraceContextHeaderBytes) {
 			if traceAndSpan := t.getTraceAndSpan(&value); traceAndSpan != nil {
@@ -517,7 +531,22 @@ func (t *JSONPcapTranslator) finalize(ctx context.Context, p *gopacket.Packet, p
 		}
 	}
 
-	return json, nil
+	line := string(parts[0])
+	L7.Set(line, "line")
+	if isHTTP11Request {
+		requestParts := http11RequestPayloadRegex.FindStringSubmatch(line)
+		L7.Set(requestParts[1], "method")
+		L7.Set(requestParts[2], "url")
+	} else { // isHTTP11Response
+		responseParts := http11ResponsePayloadRegex.FindStringSubmatch(line)
+		if code, err := strconv.Atoi(responseParts[1]); err == nil {
+			L7.Set(code, "code")
+		} else {
+			L7.Set(responseParts[1], "code")
+		}
+		L7.Set(responseParts[2], "status")
+	}
+	json.Set(stringFormatter.Format("{0} | {1}", *message, line), "message")
 }
 
 func (t *JSONPcapTranslator) setHTTPHeaders(L7 *gabs.Container, headers *http.Header) []string {
