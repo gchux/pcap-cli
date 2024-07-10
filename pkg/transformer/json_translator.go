@@ -432,8 +432,6 @@ func (t *JSONPcapTranslator) finalize(ctx context.Context, p *gopacket.Packet, p
 	isHTTP11Request := http11RequestPayloadRegex.Match(appLayerData)
 	isHTTP11Response := http11ResponsePayloadRegex.Match(appLayerData)
 
-	fmt.Printf("{\"req\":%t,\"res\":%t}\n", isHTTP11Request, isHTTP11Response)
-
 	// if content is not HTTP in clear text, abort
 	if !isHTTP11Request && !isHTTP11Response {
 		json.Set(message, "message")
@@ -456,7 +454,7 @@ func (t *JSONPcapTranslator) finalize(ctx context.Context, p *gopacket.Packet, p
 			L7.Set(request.Method, "method")
 			if traceAndSpan := t.setHTTPHeaders(L7, &request.Header); traceAndSpan != nil {
 				t.setTraceAndSpan(json, &traceAndSpan[0], &traceAndSpan[1])
-				fullURL := stringFormatter.Format("{1}{2}", request.Host, url)
+				fullURL := stringFormatter.Format("{0}{1}", request.Host, url)
 				jsonTranslatorRequest := &JSONTranslatorRequest{
 					timestamp: &(*p).Metadata().Timestamp,
 					method:    &request.Method,
@@ -487,13 +485,10 @@ func (t *JSONPcapTranslator) finalize(ctx context.Context, p *gopacket.Packet, p
 					request, _ := L7.Object("request")
 					request.Set(*translatorRequest.method, "method")
 					request.Set(*translatorRequest.url, "url")
-					timestampJSON, _ := request.Object("timestamp")
 					requestTimestamp := *translatorRequest.timestamp
 					responseTimestamp := (*p).Metadata().Timestamp
 					latency := responseTimestamp.Sub(requestTimestamp)
-					timestampJSON.Set(requestTimestamp.String(), "str")
-					timestampJSON.Set(requestTimestamp.Unix(), "seconds")
-					timestampJSON.Set(requestTimestamp.Nanosecond(), "nanos")
+					request.Set(requestTimestamp.String(), "timestamp")
 					request.Set(latency.Milliseconds(), "latency")
 				}
 			}
