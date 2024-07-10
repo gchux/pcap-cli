@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Jeffail/gabs/v2"
 	"github.com/google/gopacket"
@@ -21,10 +22,16 @@ import (
 	csmap "github.com/mhmtszr/concurrent-swiss-map"
 )
 
-type JSONPcapTranslator struct {
-	iface    *PcapIface
-	requests csmap.CsMap[string, string]
-}
+type (
+	JSONTranslatorRequest struct {
+		timestamp   *time.Time
+		url, method *string
+	}
+	JSONPcapTranslator struct {
+		iface    *PcapIface
+		requests csmap.CsMap[string, *JSONTranslatorRequest]
+	}
+)
 
 const (
 	jsonTranslationSummary          = "#:{serial} | @:{ifaceIndex}/{ifaceName} | "
@@ -449,8 +456,14 @@ func (t *JSONPcapTranslator) finalize(ctx context.Context, p *gopacket.Packet, p
 			L7.Set(request.Method, "method")
 			if traceAndSpan := t.setHTTPHeaders(L7, &request.Header); traceAndSpan != nil {
 				t.setTraceAndSpan(json, &traceAndSpan[0], &traceAndSpan[1])
+				fullURL := stringFormatter.Format("{1}{2}", request.Host, url)
+				jsonTranslatorRequest := &JSONTranslatorRequest{
+					timestamp: &(*p).Metadata().Timestamp,
+					method:    &request.Method,
+					url:       &fullURL,
+				}
 				// if a response is never seen for this trace id, it will cause a memory leak
-				t.requests.SetIfAbsent(traceAndSpan[0], stringFormatter.Format("{0} {1}{2}", request.Method, request.Host, url))
+				t.requests.SetIfAbsent(traceAndSpan[0], jsonTranslatorRequest)
 			}
 			json.Set(stringFormatter.Format("{0} | {1} {2} {3}", message, request.Proto, request.Method, url), "message")
 			return json, nil
@@ -466,10 +479,22 @@ func (t *JSONPcapTranslator) finalize(ctx context.Context, p *gopacket.Packet, p
 			L7.Set(response.Status, "status")
 			if traceAndSpan := t.setHTTPHeaders(L7, &response.Header); traceAndSpan != nil {
 				t.setTraceAndSpan(json, &traceAndSpan[0], &traceAndSpan[1])
-				request, ok := t.requests.Load(traceAndSpan[0])
+				jsonTranslatorRequest, ok := t.requests.Load(traceAndSpan[0])
 				if ok {
-					L7.Set(request, "request")
+					translatorRequest := *jsonTranslatorRequest
 					t.requests.Delete(traceAndSpan[0])
+					// hydrate response with information from request
+					request, _ := L7.Object("request")
+					request.Set(*translatorRequest.method, "method")
+					request.Set(*translatorRequest.url, "url")
+					timestampJSON, _ := request.Object("timestamp")
+					requestTimestamp := *translatorRequest.timestamp
+					responseTimestamp := (*p).Metadata().Timestamp
+					latency := responseTimestamp.Sub(requestTimestamp)
+					timestampJSON.Set(requestTimestamp.String(), "str")
+					timestampJSON.Set(requestTimestamp.Unix(), "seconds")
+					timestampJSON.Set(requestTimestamp.Nanosecond(), "nanos")
+					request.Set(latency.Milliseconds(), "latency")
 				}
 			}
 			json.Set(stringFormatter.Format("{0} | {1} {2}", message, response.Proto, response.Status), "message")
@@ -551,19 +576,19 @@ func (t *JSONPcapTranslator) write(ctx context.Context, writer io.Writer, packet
 }
 
 func newJSONPcapTranslator(iface *PcapIface) *JSONPcapTranslator {
-	requests := csmap.Create[string, string](
+	requests := csmap.Create[string, *JSONTranslatorRequest](
 		// set the number of map shards. the default value is 32.
-		csmap.WithShardCount[string, string](32),
+		csmap.WithShardCount[string, *JSONTranslatorRequest](32),
 
 		// if don't set custom hasher, use the built-in maphash.
-		csmap.WithCustomHasher[string, string](func(key string) uint64 {
+		csmap.WithCustomHasher[string, *JSONTranslatorRequest](func(key string) uint64 {
 			hash := fnv.New64a()
 			hash.Write([]byte(key))
 			return hash.Sum64()
 		}),
 
 		// set the total capacity, every shard map has total capacity/shard count capacity. the default value is 0.
-		csmap.WithSize[string, string](1000),
+		csmap.WithSize[string, *JSONTranslatorRequest](1000),
 	)
 	return &JSONPcapTranslator{iface: iface, requests: *requests}
 }
