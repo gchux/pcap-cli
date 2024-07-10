@@ -467,14 +467,7 @@ func (t *JSONPcapTranslator) setHTTP11(
 			if traceAndSpan := t.setHTTPHeaders(L7, &request.Header); traceAndSpan != nil {
 				// include trace and span id for traceability
 				t.setTraceAndSpan(json, &traceAndSpan[0], &traceAndSpan[1])
-				fullURL := stringFormatter.Format("{0}{1}", request.Host, url)
-				jsonTranslatorRequest := &JSONTranslatorRequest{
-					timestamp: &(*packet).Metadata().Timestamp,
-					method:    &request.Method,
-					url:       &fullURL,
-				}
-				// if a response is never seen for this trace id, it will cause a memory leak
-				t.requests.SetIfAbsent(traceAndSpan[0], jsonTranslatorRequest)
+				t.recordHTTP11Request(packet, &traceAndSpan[0], &request.Method, &request.Host, &url)
 			}
 			json.Set(stringFormatter.Format("{0} | {1} {2} {3}", *message, request.Proto, request.Method, url), "message")
 			return
@@ -492,20 +485,7 @@ func (t *JSONPcapTranslator) setHTTP11(
 			if traceAndSpan := t.setHTTPHeaders(L7, &response.Header); traceAndSpan != nil {
 				// include trace and span id for traceability
 				t.setTraceAndSpan(json, &traceAndSpan[0], &traceAndSpan[1])
-				jsonTranslatorRequest, ok := t.requests.Load(traceAndSpan[0])
-				if ok {
-					translatorRequest := *jsonTranslatorRequest
-					t.requests.Delete(traceAndSpan[0])
-					// hydrate response with information from request
-					request, _ := L7.Object("request")
-					request.Set(*translatorRequest.method, "method")
-					request.Set(*translatorRequest.url, "url")
-					requestTimestamp := *translatorRequest.timestamp
-					responseTimestamp := (*packet).Metadata().Timestamp
-					latency := responseTimestamp.Sub(requestTimestamp)
-					request.Set(requestTimestamp.String(), "timestamp")
-					request.Set(latency.Milliseconds(), "latency")
-				}
+				t.linkHTTP11RequestToRequest(packet, L7, &traceAndSpan[0])
 			}
 			json.Set(stringFormatter.Format("{0} | {1} {2}", *message, response.Proto, response.Status), "message")
 			return
@@ -518,6 +498,8 @@ func (t *JSONPcapTranslator) setHTTP11(
 	dataBytes := bytes.SplitN(appLayerData, http11BodySeparator, 2)[0]
 	parts := bytes.Split(dataBytes, http11Separator)
 
+	var traceAndSpan []string = nil
+
 	headers, _ := L7.Object("headers")
 	for _, header := range parts[1:] {
 		headerParts := bytes.SplitN(header, http11HeaderSeparator, 2)
@@ -525,7 +507,7 @@ func (t *JSONPcapTranslator) setHTTP11(
 		headers.Set(value, string(headerParts[0]))
 		// include trace and span id for traceability
 		if bytes.EqualFold(parts[0], cloudTraceContextHeaderBytes) {
-			if traceAndSpan := t.getTraceAndSpan(&value); traceAndSpan != nil {
+			if traceAndSpan = t.getTraceAndSpan(&value); traceAndSpan != nil {
 				t.setTraceAndSpan(json, &traceAndSpan[0], &traceAndSpan[1])
 			}
 		}
@@ -537,6 +519,10 @@ func (t *JSONPcapTranslator) setHTTP11(
 		requestParts := http11RequestPayloadRegex.FindStringSubmatch(line)
 		L7.Set(requestParts[1], "method")
 		L7.Set(requestParts[2], "url")
+		host := "0"
+		if traceAndSpan != nil {
+			t.recordHTTP11Request(packet, &traceAndSpan[0], &requestParts[1], &host, &requestParts[2])
+		}
 	} else { // isHTTP11Response
 		responseParts := http11ResponsePayloadRegex.FindStringSubmatch(line)
 		if code, err := strconv.Atoi(responseParts[1]); err == nil {
@@ -545,8 +531,43 @@ func (t *JSONPcapTranslator) setHTTP11(
 			L7.Set(responseParts[1], "code")
 		}
 		L7.Set(responseParts[2], "status")
+		if traceAndSpan != nil {
+			t.linkHTTP11RequestToRequest(packet, L7, &traceAndSpan[0])
+		}
 	}
 	json.Set(stringFormatter.Format("{0} | {1}", *message, line), "message")
+}
+
+func (t *JSONPcapTranslator) recordHTTP11Request(packet *gopacket.Packet, traceID, method, host, url *string) {
+	fullURL := stringFormatter.Format("{0}{1}", *host, *url)
+	jsonTranslatorRequest := &JSONTranslatorRequest{
+		timestamp: &(*packet).Metadata().Timestamp,
+		method:    method,
+		url:       &fullURL,
+	}
+	// if a response is never seen for this trace id, it will cause a memory leak
+	t.requests.SetIfAbsent(*traceID, jsonTranslatorRequest)
+}
+
+func (t *JSONPcapTranslator) linkHTTP11RequestToRequest(packet *gopacket.Packet, response *gabs.Container, traceID *string) error {
+	jsonTranslatorRequest, ok := t.requests.Load(*traceID)
+	if !ok {
+		return errors.New(stringFormatter.Format("no request found for trace-id: {0}", *traceID))
+	}
+
+	translatorRequest := *jsonTranslatorRequest
+	t.requests.Delete(*traceID)
+	// hydrate response with information from request
+	request, _ := response.Object("request")
+	request.Set(*translatorRequest.method, "method")
+	request.Set(*translatorRequest.url, "url")
+	requestTimestamp := *translatorRequest.timestamp
+	responseTimestamp := (*packet).Metadata().Timestamp
+	latency := responseTimestamp.Sub(requestTimestamp)
+	request.Set(requestTimestamp.String(), "timestamp")
+	request.Set(latency.Milliseconds(), "latency")
+
+	return nil
 }
 
 func (t *JSONPcapTranslator) setHTTPHeaders(L7 *gabs.Container, headers *http.Header) []string {
