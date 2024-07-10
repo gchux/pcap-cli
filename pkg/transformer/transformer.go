@@ -86,17 +86,28 @@ var pcapTranslatorFmts = map[string]PcapTranslatorFmt{
 	"proto": PROTO,
 }
 
+const (
+	projectIdEnvVarName           = "PROJECT_ID"
+	tcpOptionsRegex               = `^TCPOption\((?P<opt>.*?)\)$`
+	http11RequestPayloadRegexStr  = `^(?P<method>.*?)\s(?P<url>.*?)\sHTTP/1.1\r?\n.*`
+	http11ResponsePayloadRegexStr = `^HTTP/1.1\s(?P<code>\d{3})\s(?P<status>.*?)\r?\n.*`
+	http11LineSeparator           = "\r\n"
+	cloudTraceContextHeader       = "X-Cloud-Trace-Context"
+	traceAndSpanRegexStr          = `^(?P<trace>.+?)/(?P<span>.+?)(?:;o=.*)?$`
+)
+
 var (
-	tcpFlagNames            = []string{"SYN", "ACK", "PSH", "FIN", "RST", "URG", "ECE", "CWR"}
-	tcpOptionRgx            = regexp.MustCompile(`^TCPOption\((?P<opt>.*?)\)$`)
-	httpPayloadRegex        = regexp.MustCompile(`^(?:HTTP|GET|POST|PUT|PATCH|DELETE|OPTIONS|CONNECT).*`)
-	httpBodySeparator       = []byte("\r\n\r\n")
-	httpSeparator           = []byte("\r\n")
-	httpHeaderSeparator     = []byte(":")
-	cloudTraceContextHeader = []byte("X-Cloud-Trace-Context")
-	traceAndSpanRegex       = regexp.MustCompile(`^(?<trace>.+?)/(?<span>.+?)(?:;o=.*)?$`)
-	cloudProjectID          = os.Getenv("PROJECT_ID")
-	cloudTracePrefix        = "projects/" + cloudProjectID + "/traces/"
+	tcpFlagNames                 = []string{"SYN", "ACK", "PSH", "FIN", "RST", "URG", "ECE", "CWR"}
+	tcpOptionRgx                 = regexp.MustCompile(tcpOptionsRegex)
+	http11RequestPayloadRegex    = regexp.MustCompile(http11RequestPayloadRegexStr)
+	http11ResponsePayloadRegex   = regexp.MustCompile(http11ResponsePayloadRegexStr)
+	http11Separator              = []byte(http11LineSeparator)
+	http11BodySeparator          = []byte(http11LineSeparator + http11LineSeparator)
+	http11HeaderSeparator        = []byte(":")
+	cloudTraceContextHeaderBytes = []byte(cloudTraceContextHeader)
+	traceAndSpanRegex            = regexp.MustCompile(traceAndSpanRegexStr)
+	cloudProjectID               = os.Getenv(projectIdEnvVarName)
+	cloudTracePrefix             = "projects/" + cloudProjectID + "/traces/"
 )
 
 func (t *PcapTransformer) writeTranslation(ctx context.Context, task *pcapWriteTask) {

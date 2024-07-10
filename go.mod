@@ -11,6 +11,7 @@ require (
 	github.com/google/gopacket v1.1.19
 	github.com/google/uuid v1.6.0
 	github.com/itchyny/timefmt-go v0.1.6
+	github.com/mhmtszr/concurrent-swiss-map v1.0.8
 	github.com/mitchellh/go-ps v1.0.0
 	github.com/panjf2000/ants/v2 v2.10.0
 	github.com/pkg/errors v0.9.1

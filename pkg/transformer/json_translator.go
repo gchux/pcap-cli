@@ -1,11 +1,14 @@
 package transformer
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net"
+	"net/http"
 	"strconv"
 	"strings"
 
@@ -14,10 +17,13 @@ import (
 	"github.com/google/gopacket/layers"
 	"github.com/pkg/errors"
 	"github.com/wissance/stringFormatter"
+
+	csmap "github.com/mhmtszr/concurrent-swiss-map"
 )
 
 type JSONPcapTranslator struct {
-	iface *PcapIface
+	iface    *PcapIface
+	requests csmap.CsMap[string, string]
 }
 
 const (
@@ -35,7 +41,7 @@ func (t *JSONPcapTranslator) translate(packet *gopacket.Packet) error {
 func (t *JSONPcapTranslator) next(ctx context.Context, packet *gopacket.Packet, serial *uint64) fmt.Stringer {
 	json := gabs.New()
 
-	id := ctx.Value(ContextLogName)
+	id := ctx.Value(ContextID)
 	logName := ctx.Value(ContextLogName)
 
 	operation, _ := json.Object("logging.googleapis.com/operation")
@@ -405,18 +411,25 @@ func (t *JSONPcapTranslator) finalize(ctx context.Context, p *gopacket.Packet, p
 	ack, _ := json.Path("L4.ack").Data().(uint32)
 	data["tcpAck"] = ack
 
-	json.Set(stringFormatter.FormatComplex(jsonTranslationSummaryTCP, data), "message")
+	message := stringFormatter.FormatComplex(jsonTranslationSummaryTCP, data)
 
 	// simple/naive HTTP decoding
 	appLayer := (*p).ApplicationLayer()
 	if appLayer == nil {
+		json.Set(message, "message")
 		return json, nil
 	}
 
 	appLayerData := appLayer.LayerContents()
 
+	isHTTP11Request := http11RequestPayloadRegex.Match(appLayerData)
+	isHTTP11Response := http11ResponsePayloadRegex.Match(appLayerData)
+
+	fmt.Printf("{\"req\":%t,\"res\":%t}\n", isHTTP11Request, isHTTP11Response)
+
 	// if content is not HTTP in clear text, abort
-	if !httpPayloadRegex.Match(appLayerData[:10]) {
+	if !isHTTP11Request && !isHTTP11Response {
+		json.Set(message, "message")
 		return json, nil
 	}
 
@@ -424,27 +437,92 @@ func (t *JSONPcapTranslator) finalize(ctx context.Context, p *gopacket.Packet, p
 	//   HTTP request/status line and headers fit in 1 packet
 	//     which is not always the case when fragmentation occurs
 	L7, _ := json.Object("L7")
-	L7.Set("HTTP", "proto")
-	// intentionally dropping HTTP request/response payload
-	dataBytes := bytes.SplitN(appLayerData, httpBodySeparator, 2)[0]
-	parts := bytes.Split(dataBytes, httpSeparator)
-	L7.Set(string(parts[0]), "line")
+
+	httpDataReader := bufio.NewReaderSize(bytes.NewReader(appLayerData), len(appLayerData))
+	if isHTTP11Request {
+		request, err := http.ReadRequest(httpDataReader)
+		if err == nil {
+			url := request.URL.String()
+			L7.Set("request", "kind")
+			L7.Set(url, "url")
+			L7.Set(request.Proto, "proto")
+			L7.Set(request.Method, "method")
+			if traceAndSpan := t.setHTTPHeaders(L7, &request.Header); traceAndSpan != nil {
+				t.setTraceAndSpan(json, &traceAndSpan[0], &traceAndSpan[1])
+				// if a response is never seen for this trace id, it will cause a memory leak
+				t.requests.SetIfAbsent(traceAndSpan[0], stringFormatter.Format("{0} {1}{2}", request.Method, request.Host, url))
+			}
+			json.Set(stringFormatter.Format("{0} | {1} {2} {3}", message, request.Proto, request.Method, url), "message")
+			return json, nil
+		}
+	}
+
+	if isHTTP11Response {
+		response, err := http.ReadResponse(httpDataReader, nil)
+		if err == nil {
+			L7.Set("response", "kind")
+			L7.Set(response.Proto, "proto")
+			L7.Set(response.StatusCode, "code")
+			L7.Set(response.Status, "status")
+			if traceAndSpan := t.setHTTPHeaders(L7, &response.Header); traceAndSpan != nil {
+				t.setTraceAndSpan(json, &traceAndSpan[0], &traceAndSpan[1])
+				request, ok := t.requests.Load(traceAndSpan[0])
+				if ok {
+					L7.Set(request, "request")
+					t.requests.Delete(traceAndSpan[0])
+				}
+			}
+			json.Set(stringFormatter.Format("{0} | {1} {2}", message, response.Proto, response.Status), "message")
+			return json, nil
+		}
+	}
+
+	// fallback to a minimal attempt of HTTP/1.1 decoding
+	//   - intentionally dropping HTTP request/response payload
+	dataBytes := bytes.SplitN(appLayerData, http11BodySeparator, 2)[0]
+	parts := bytes.Split(dataBytes, http11Separator)
+	line := string(parts[0])
+	L7.Set(line, "line")
+	json.Set(stringFormatter.Format("{0} | {1}", message, line), "message")
 	headers, _ := L7.Object("headers")
 	for _, header := range parts[1:] {
-		parts := bytes.SplitN(header, httpHeaderSeparator, 2)
+		parts := bytes.SplitN(header, http11HeaderSeparator, 2)
 		value := string(bytes.TrimSpace(parts[1]))
 		headers.Set(value, string(parts[0]))
 		// include trace and span id for traceability
-		if bytes.EqualFold(parts[0], cloudTraceContextHeader) {
-			if traceAndSpan := traceAndSpanRegex.FindStringSubmatch(value); traceAndSpan != nil {
-				json.Set(cloudTracePrefix+traceAndSpan[1], "logging.googleapis.com/trace")
-				json.Set(traceAndSpan[2], "logging.googleapis.com/spanId")
-				json.Set(true, "logging.googleapis.com/trace_sampled")
+		if bytes.EqualFold(parts[0], cloudTraceContextHeaderBytes) {
+			if traceAndSpan := t.getTraceAndSpan(&value); traceAndSpan != nil {
+				t.setTraceAndSpan(json, &traceAndSpan[0], &traceAndSpan[1])
 			}
 		}
 	}
 
 	return json, nil
+}
+
+func (t *JSONPcapTranslator) setHTTPHeaders(L7 *gabs.Container, headers *http.Header) []string {
+	jsonHeaders, _ := L7.Object("headers")
+	var traceAndSpan []string = nil
+	for key, value := range *headers {
+		jsonHeaders.Set(value, key)
+		if strings.EqualFold(key, cloudTraceContextHeader) {
+			traceAndSpan = t.getTraceAndSpan(&value[0])
+		}
+	}
+	return traceAndSpan
+}
+
+func (t *JSONPcapTranslator) getTraceAndSpan(rawTraceAndSpan *string) []string {
+	if traceAndSpan := traceAndSpanRegex.FindStringSubmatch(*rawTraceAndSpan); traceAndSpan != nil {
+		return traceAndSpan[1:]
+	}
+	return nil
+}
+
+func (t *JSONPcapTranslator) setTraceAndSpan(json *gabs.Container, trace, span *string) {
+	json.Set(cloudTracePrefix+*trace, "logging.googleapis.com/trace")
+	json.Set(*span, "logging.googleapis.com/spanId")
+	json.Set(true, "logging.googleapis.com/trace_sampled")
 }
 
 func (t *JSONPcapTranslator) toJSONBytes(packet *fmt.Stringer) (int, []byte, error) {
@@ -473,5 +551,19 @@ func (t *JSONPcapTranslator) write(ctx context.Context, writer io.Writer, packet
 }
 
 func newJSONPcapTranslator(iface *PcapIface) *JSONPcapTranslator {
-	return &JSONPcapTranslator{iface: iface}
+	requests := csmap.Create[string, string](
+		// set the number of map shards. the default value is 32.
+		csmap.WithShardCount[string, string](32),
+
+		// if don't set custom hasher, use the built-in maphash.
+		csmap.WithCustomHasher[string, string](func(key string) uint64 {
+			hash := fnv.New64a()
+			hash.Write([]byte(key))
+			return hash.Sum64()
+		}),
+
+		// set the total capacity, every shard map has total capacity/shard count capacity. the default value is 0.
+		csmap.WithSize[string, string](1000),
+	)
+	return &JSONPcapTranslator{iface: iface, requests: *requests}
 }
