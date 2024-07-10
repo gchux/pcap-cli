@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -485,7 +486,9 @@ func (t *JSONPcapTranslator) setHTTP11(
 			if traceAndSpan := t.setHTTPHeaders(L7, &response.Header); traceAndSpan != nil {
 				// include trace and span id for traceability
 				t.setTraceAndSpan(json, &traceAndSpan[0], &traceAndSpan[1])
-				t.linkHTTP11RequestToRequest(packet, L7, &traceAndSpan[0])
+				if err := t.linkHTTP11ResponseToRequest(packet, L7, &traceAndSpan[0]); err != nil {
+					io.WriteString(os.Stderr, err.Error())
+				}
 			}
 			json.Set(stringFormatter.Format("{0} | {1} {2}", *message, response.Proto, response.Status), "message")
 			return
@@ -532,7 +535,9 @@ func (t *JSONPcapTranslator) setHTTP11(
 		}
 		L7.Set(responseParts[2], "status")
 		if traceAndSpan != nil {
-			t.linkHTTP11RequestToRequest(packet, L7, &traceAndSpan[0])
+			if err := t.linkHTTP11ResponseToRequest(packet, L7, &traceAndSpan[0]); err != nil {
+				io.WriteString(os.Stderr, err.Error())
+			}
 		}
 	}
 	json.Set(stringFormatter.Format("{0} | {1}", *message, line), "message")
@@ -549,14 +554,13 @@ func (t *JSONPcapTranslator) recordHTTP11Request(packet *gopacket.Packet, traceI
 	t.requests.SetIfAbsent(*traceID, jsonTranslatorRequest)
 }
 
-func (t *JSONPcapTranslator) linkHTTP11RequestToRequest(packet *gopacket.Packet, response *gabs.Container, traceID *string) error {
+func (t *JSONPcapTranslator) linkHTTP11ResponseToRequest(packet *gopacket.Packet, response *gabs.Container, traceID *string) error {
 	jsonTranslatorRequest, ok := t.requests.Load(*traceID)
 	if !ok {
 		return errors.New(stringFormatter.Format("no request found for trace-id: {0}", *traceID))
 	}
 
 	translatorRequest := *jsonTranslatorRequest
-	t.requests.Delete(*traceID)
 	// hydrate response with information from request
 	request, _ := response.Object("request")
 	request.Set(*translatorRequest.method, "method")
@@ -567,6 +571,9 @@ func (t *JSONPcapTranslator) linkHTTP11RequestToRequest(packet *gopacket.Packet,
 	request.Set(requestTimestamp.String(), "timestamp")
 	request.Set(latency.Milliseconds(), "latency")
 
+	if !t.requests.Delete(*traceID) {
+		return errors.New(stringFormatter.Format("failed to delete request with trace-id: {0}", *traceID))
+	}
 	return nil
 }
 
