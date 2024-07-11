@@ -89,8 +89,8 @@ var pcapTranslatorFmts = map[string]PcapTranslatorFmt{
 const (
 	projectIdEnvVarName           = "PROJECT_ID"
 	tcpOptionsRegex               = `^TCPOption\((?P<opt>.*?)\)$`
-	http11RequestPayloadRegexStr  = `^(?P<method>.*?)\s(?P<url>.*?)\sHTTP/1.1\r?\n.*`
-	http11ResponsePayloadRegexStr = `^HTTP/1.1\s(?P<code>\d{3})\s(?P<status>.*?)\r?\n.*`
+	http11RequestPayloadRegexStr  = `^(?P<method>.*?)\s(?P<url>.*?)\sHTTP/1.1(?:\r?\n)?.*`
+	http11ResponsePayloadRegexStr = `^HTTP/1.1\s(?P<code>\d{3})\s(?P<status>.*?)(?:\r?\n)?.*`
 	http11LineSeparator           = "\r\n"
 	cloudTraceContextHeader       = "X-Cloud-Trace-Context"
 	traceAndSpanRegexStr          = `^(?P<trace>.+?)/(?P<span>.+?)(?:;o=.*)?$`
