@@ -518,6 +518,8 @@ func (t *JSONPcapTranslator) setHTTP11(
 
 	line := string(parts[0])
 	L7.Set(line, "line")
+	json.Set(stringFormatter.Format("{0} | {1}", *message, line), "message")
+
 	if isHTTP11Request {
 		requestParts := http11RequestPayloadRegex.FindStringSubmatch(line)
 		L7.Set(requestParts[1], "method")
@@ -526,21 +528,22 @@ func (t *JSONPcapTranslator) setHTTP11(
 		if traceAndSpan != nil {
 			t.recordHTTP11Request(packet, &traceAndSpan[0], &requestParts[1], &host, &requestParts[2])
 		}
-	} else { // isHTTP11Response
-		responseParts := http11ResponsePayloadRegex.FindStringSubmatch(line)
-		if code, err := strconv.Atoi(responseParts[1]); err == nil {
-			L7.Set(code, "code")
-		} else {
-			L7.Set(responseParts[1], "code")
-		}
-		L7.Set(responseParts[2], "status")
-		if traceAndSpan != nil {
-			if err := t.linkHTTP11ResponseToRequest(packet, L7, &traceAndSpan[0]); err != nil {
-				io.WriteString(os.Stderr, err.Error())
-			}
+		return
+	}
+
+	// isHTTP11Response
+	responseParts := http11ResponsePayloadRegex.FindStringSubmatch(line)
+	if code, err := strconv.Atoi(responseParts[1]); err == nil {
+		L7.Set(code, "code")
+	} else {
+		L7.Set(responseParts[1], "code")
+	}
+	L7.Set(responseParts[2], "status")
+	if traceAndSpan != nil {
+		if err := t.linkHTTP11ResponseToRequest(packet, L7, &traceAndSpan[0]); err != nil {
+			io.WriteString(os.Stderr, err.Error())
 		}
 	}
-	json.Set(stringFormatter.Format("{0} | {1}", *message, line), "message")
 }
 
 func (t *JSONPcapTranslator) recordHTTP11Request(packet *gopacket.Packet, traceID, method, host, url *string) {
