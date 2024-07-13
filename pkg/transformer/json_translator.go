@@ -36,10 +36,10 @@ type (
 )
 
 const (
-	jsonTranslationSummary          = "#:{serial} | @:{ifaceIndex}/{ifaceName} | "
+	jsonTranslationSummary          = "#:{serial} | @:{ifaceIndex}/{ifaceName} | flow:{flowID} | "
 	jsonTranslationSummaryWithoutL4 = jsonTranslationSummary + "{L3Src} > {L3Dst}"
 	jsonTranslationSummaryUDP       = jsonTranslationSummary + "{L4Proto} | {srcProto}/{L3Src}:{L4Src} > {dstProto}/{L3Dst}:{L4Dst}"
-	jsonTranslationSummaryTCP       = jsonTranslationSummaryUDP + " | [{tcpFlags}] | seq:{tcpSeq} | ack:{tcpAck}"
+	jsonTranslationSummaryTCP       = jsonTranslationSummaryUDP + " | [{tcpFlags}] | seq/ack:{tcpSeq}/{tcpAck}"
 	jsonTranslationFlowTemplate     = "{0}/iface/{1}/flow/{2}:{3}"
 )
 
@@ -353,11 +353,13 @@ func (t *JSONPcapTranslator) merge(ctx context.Context, tgt fmt.Stringer, src fm
 	return tgt, t.asTranslation(tgt).Merge(t.asTranslation(src))
 }
 
-// for JSON translator, this mmethod generates the summary line at {`message`: $summary}
+// for JSON translator, this mmethod generates:
+//   - the `flowID` for any 5-tuple conversation ([TODO]: this must be done by all translators)
+//   - the summary line at {`message`: $summary}
 func (t *JSONPcapTranslator) finalize(ctx context.Context, serial *uint64, p *gopacket.Packet, packet fmt.Stringer) (fmt.Stringer, error) {
 	json := t.asTranslation(packet)
 
-	data := make(map[string]any, 15)
+	data := make(map[string]any, 14)
 
 	id := ctx.Value(ContextID)
 	logName := ctx.Value(ContextLogName)
@@ -383,7 +385,7 @@ func (t *JSONPcapTranslator) finalize(ctx context.Context, serial *uint64, p *go
 	isUDP := proto == layers.IPProtocolUDP
 
 	// `flowID` is the unique ID of this conversation:
-	// given by the 5 tuple: protocol+src_ip+src_port+dst_ip+dst_port.
+	// given by the 5-tuple: protocol+src_ip+src_port+dst_ip+dst_port.
 	// Addition is commutative, so after hashing `net.IP` bytes and L4 ports to `uint64`,
 	// the same `uint64`/`flowID` is produced after adding everything up, no matter the order.
 	// Using the same `flowID` will produce grouped logs in Cloud Logging.
@@ -391,6 +393,7 @@ func (t *JSONPcapTranslator) finalize(ctx context.Context, serial *uint64, p *go
 
 	if !isTCP && !isUDP {
 		flowID = fnv1a.AddUint64(flowID, 255) // RESERVED (0xFF)
+		data["flowID"] = flowID
 		json.Set(flowID, "flow")
 		operation.Set(stringFormatter.Format(jsonTranslationFlowTemplate, id, t.iface.Name, "x", flowID), "id")
 		json.Set(stringFormatter.FormatComplex(jsonTranslationSummaryWithoutL4, data), "message")
@@ -405,15 +408,13 @@ func (t *JSONPcapTranslator) finalize(ctx context.Context, serial *uint64, p *go
 
 	if isUDP {
 		data["L4Proto"] = "UDP"
-		flowID = fnv1a.AddUint64(flowID, 17) // UDP (0x11)
-
 		srcPort, _ := json.Path("L4.src").Data().(layers.UDPPort)
 		data["L4Src"] = uint16(srcPort)
 		dstPort, _ := json.Path("L4.dst").Data().(layers.UDPPort)
 		data["L4Dst"] = uint16(dstPort)
 
-		// addition is commutative
-		flowID = fnv1a.AddUint64(flowID, uint64(srcPort)+uint64(dstPort))
+		flowID = fnv1a.AddUint64(flowID, 17+uint64(srcPort)+uint64(dstPort)) // UDP(17) (0x11)
+		data["flowID"] = flowID
 		json.Set(flowID, "flow")
 		operation.Set(stringFormatter.Format(jsonTranslationFlowTemplate, id, t.iface.Name, "udp", flowID), "id")
 
@@ -422,15 +423,13 @@ func (t *JSONPcapTranslator) finalize(ctx context.Context, serial *uint64, p *go
 	}
 
 	data["L4Proto"] = "TCP"
-	flowID = fnv1a.AddUint64(flowID, 6) // TCP (0x06)
-
 	srcPort, _ := json.Path("L4.src").Data().(layers.TCPPort)
-	data["L4Src"] = int(srcPort)
+	data["L4Src"] = uint16(srcPort)
 	dstPort, _ := json.Path("L4.dst").Data().(layers.TCPPort)
-	data["L4Dst"] = int(dstPort)
+	data["L4Dst"] = uint16(dstPort)
 
-	// addition is commutative
-	flowID = fnv1a.AddUint64(flowID, uint64(srcPort)+uint64(dstPort))
+	flowID = fnv1a.AddUint64(flowID, 6+uint64(srcPort)+uint64(dstPort)) // TCP(6) (0x06)
+	data["flowID"] = flowID
 	json.Set(flowID, "flow")
 	operation.Set(stringFormatter.Format(jsonTranslationFlowTemplate, id, t.iface.Name, "tcp", flowID), "id")
 
