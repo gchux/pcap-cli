@@ -209,7 +209,7 @@ func (t *JSONPcapTranslator) translateTCPLayer(ctx context.Context, tcp *layers.
 	flags.Set(tcp.CWR, "CWR")
 	flags.Set(tcp.NS, "NS")
 
-	opts, _ := json.ArrayOfSize(len(tcp.Options), "opts")
+	opts, _ := L4.ArrayOfSize(len(tcp.Options), "opts")
 	for i, opt := range tcp.Options {
 		// Regex'ing TCP options is expensive
 		// [TODO]: find a way to not use `regexp` to extract TCP options
