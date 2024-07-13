@@ -86,6 +86,7 @@ func (t *JSONPcapTranslator) next(ctx context.Context, serial *uint64, packet *g
 	*/
 
 	labels, _ := json.Object("logging.googleapis.com/labels")
+	labels.Set("pcap", "tools.chux.dev/tool")
 	labels.Set(id, "tools.chux.dev/pcap/id")
 	labels.Set(logName, "tools.chux.dev/pcap/name")
 	labels.Set(t.iface.Name, "tools.chux.dev/pcap/iface")
@@ -362,7 +363,7 @@ func (t *JSONPcapTranslator) finalize(ctx context.Context, serial *uint64, p *go
 	logName := ctx.Value(ContextLogName)
 
 	operation, _ := json.Object("logging.googleapis.com/operation")
-	operation.Set(id, "id")
+	operation.Set(logName, "producer")
 	if *serial == 1 {
 		operation.Set(true, "first")
 	}
@@ -391,7 +392,7 @@ func (t *JSONPcapTranslator) finalize(ctx context.Context, serial *uint64, p *go
 	if !isTCP && !isUDP {
 		flowID = fnv1a.AddUint64(flowID, 255) // RESERVED (0xFF)
 		json.Set(flowID, "flow")
-		operation.Set(stringFormatter.Format(jsonTranslationFlowTemplate, logName, t.iface.Name, "x", flowID), "producer")
+		operation.Set(stringFormatter.Format(jsonTranslationFlowTemplate, id, t.iface.Name, "x", flowID), "id")
 		json.Set(stringFormatter.FormatComplex(jsonTranslationSummaryWithoutL4, data), "message")
 		return json, nil
 	}
@@ -414,7 +415,7 @@ func (t *JSONPcapTranslator) finalize(ctx context.Context, serial *uint64, p *go
 		// addition is commutative
 		flowID = fnv1a.AddUint64(flowID, uint64(srcPort)+uint64(dstPort))
 		json.Set(flowID, "flow")
-		operation.Set(stringFormatter.Format(jsonTranslationFlowTemplate, logName, t.iface.Name, "udp", flowID), "producer")
+		operation.Set(stringFormatter.Format(jsonTranslationFlowTemplate, id, t.iface.Name, "udp", flowID), "id")
 
 		json.Set(stringFormatter.FormatComplex(jsonTranslationSummaryUDP, data), "message")
 		return json, nil
@@ -431,7 +432,7 @@ func (t *JSONPcapTranslator) finalize(ctx context.Context, serial *uint64, p *go
 	// addition is commutative
 	flowID = fnv1a.AddUint64(flowID, uint64(srcPort)+uint64(dstPort))
 	json.Set(flowID, "flow")
-	operation.Set(stringFormatter.Format(jsonTranslationFlowTemplate, logName, t.iface.Name, "tcp", flowID), "producer")
+	operation.Set(stringFormatter.Format(jsonTranslationFlowTemplate, id, t.iface.Name, "tcp", flowID), "id")
 
 	flags := make([]string, 0, len(tcpFlagNames))
 	for _, flagName := range tcpFlagNames {
