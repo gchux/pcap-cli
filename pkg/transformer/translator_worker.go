@@ -139,7 +139,7 @@ func (w *pcapTranslatorWorker) translateTLSLayer(ctx context.Context) fmt.String
 // The work that needs to be performed
 // The input type should implement the WorkFunction interface
 func (w *pcapTranslatorWorker) Run(ctx context.Context) interface{} {
-	buffer := w.translator.next(ctx, w.packet, w.serial)
+	buffer := w.translator.next(ctx, w.serial, w.packet)
 
 	translations := make(chan fmt.Stringer, packetLayerTranslatorsSize)
 	var wg sync.WaitGroup
@@ -170,7 +170,7 @@ func (w *pcapTranslatorWorker) Run(ctx context.Context) interface{} {
 		}
 	}
 
-	buffer, _ = w.translator.finalize(ctx, w.packet, buffer)
+	buffer, _ = w.translator.finalize(ctx, w.serial, w.packet, buffer)
 
 	return &buffer
 }

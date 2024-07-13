@@ -18,6 +18,7 @@ import (
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/pkg/errors"
+	"github.com/segmentio/fasthash/fnv1a"
 	"github.com/wissance/stringFormatter"
 
 	csmap "github.com/mhmtszr/concurrent-swiss-map"
@@ -39,6 +40,7 @@ const (
 	jsonTranslationSummaryWithoutL4 = jsonTranslationSummary + "{L3Src} > {L3Dst}"
 	jsonTranslationSummaryUDP       = jsonTranslationSummary + "{L4Proto} | {srcProto}/{L3Src}:{L4Src} > {dstProto}/{L3Dst}:{L4Dst}"
 	jsonTranslationSummaryTCP       = jsonTranslationSummaryUDP + " | [{tcpFlags}] | seq:{tcpSeq} | ack:{tcpAck}"
+	jsonTranslationFlowTemplate     = "{0}/iface/{1}/flow/{2}:{3}"
 )
 
 func (t *JSONPcapTranslator) translate(packet *gopacket.Packet) error {
@@ -46,18 +48,11 @@ func (t *JSONPcapTranslator) translate(packet *gopacket.Packet) error {
 }
 
 // return pointer to `struct` `gabs.Container`
-func (t *JSONPcapTranslator) next(ctx context.Context, packet *gopacket.Packet, serial *uint64) fmt.Stringer {
+func (t *JSONPcapTranslator) next(ctx context.Context, serial *uint64, packet *gopacket.Packet) fmt.Stringer {
 	json := gabs.New()
 
 	id := ctx.Value(ContextID)
 	logName := ctx.Value(ContextLogName)
-
-	operation, _ := json.Object("logging.googleapis.com/operation")
-	operation.Set(id, "id")
-	operation.Set(logName, "producer")
-	if *serial == 1 {
-		operation.Set(true, "first")
-	}
 
 	pcap, _ := json.Object("pcap")
 	pcap.Set(id, "id")
@@ -83,14 +78,17 @@ func (t *JSONPcapTranslator) next(ctx context.Context, packet *gopacket.Packet, 
 	iface, _ := json.Object("iface")
 	iface.Set(t.iface.Index, "index")
 	iface.Set(t.iface.Name, "name")
-	addrs, _ := iface.ArrayOfSize(len(t.iface.Addrs), "addrs")
-	for i, addr := range t.iface.Addrs {
-		addrs.SetIndex(addr.IP.String(), i)
-	}
+	/*
+		addrs, _ := iface.ArrayOfSize(len(t.iface.Addrs), "addrs")
+		for i, addr := range t.iface.Addrs {
+			addrs.SetIndex(addr.IP.String(), i)
+		}
+	*/
 
 	labels, _ := json.Object("logging.googleapis.com/labels")
-	labels.Set(id, "pcap_id")
-	labels.Set(t.iface.Name, "pcap_iface")
+	labels.Set(id, "tools.chux.dev/pcap/id")
+	labels.Set(logName, "tools.chux.dev/pcap/name")
+	labels.Set(t.iface.Name, "tools.chux.dev/pcap/iface")
 
 	return json
 }
@@ -355,16 +353,24 @@ func (t *JSONPcapTranslator) merge(ctx context.Context, tgt fmt.Stringer, src fm
 }
 
 // for JSON translator, this mmethod generates the summary line at {`message`: $summary}
-func (t *JSONPcapTranslator) finalize(ctx context.Context, p *gopacket.Packet, packet fmt.Stringer) (fmt.Stringer, error) {
+func (t *JSONPcapTranslator) finalize(ctx context.Context, serial *uint64, p *gopacket.Packet, packet fmt.Stringer) (fmt.Stringer, error) {
 	json := t.asTranslation(packet)
 
 	data := make(map[string]any, 15)
 
+	id := ctx.Value(ContextID)
+	logName := ctx.Value(ContextLogName)
+
+	operation, _ := json.Object("logging.googleapis.com/operation")
+	operation.Set(id, "id")
+	if *serial == 1 {
+		operation.Set(true, "first")
+	}
+
 	data["ifaceIndex"] = t.iface.Index
 	data["ifaceName"] = t.iface.Name
 
-	serial, _ := json.Path("pcap.num").Data().(uint64)
-	data["serial"] = serial
+	data["serial"] = *serial
 
 	l3Src, _ := json.Path("L3.src").Data().(net.IP)
 	data["L3Src"] = l3Src
@@ -375,7 +381,17 @@ func (t *JSONPcapTranslator) finalize(ctx context.Context, p *gopacket.Packet, p
 	isTCP := proto == layers.IPProtocolTCP
 	isUDP := proto == layers.IPProtocolUDP
 
+	// `flowID` is the unique ID of this conversation:
+	// given by the 5 tuple: protocol+src_ip+src_port+dst_ip+dst_port.
+	// Addition is commutative, so after hashing `net.IP` bytes and L4 ports to `uint64`,
+	// the same `uint64`/`flowID` is produced after adding everything up, no matter the order.
+	// Using the same `flowID` will produce grouped logs in Cloud Logging.
+	flowID := fnv1a.HashUint64(fnv1a.HashBytes64(l3Src.To16()) + fnv1a.HashBytes64(l3Dst.To16()))
+
 	if !isTCP && !isUDP {
+		flowID = fnv1a.AddUint64(flowID, 255) // RESERVED (0xFF)
+		json.Set(flowID, "flow")
+		operation.Set(stringFormatter.Format(jsonTranslationFlowTemplate, logName, t.iface.Name, "x", flowID), "producer")
 		json.Set(stringFormatter.FormatComplex(jsonTranslationSummaryWithoutL4, data), "message")
 		return json, nil
 	}
@@ -388,22 +404,34 @@ func (t *JSONPcapTranslator) finalize(ctx context.Context, p *gopacket.Packet, p
 
 	if isUDP {
 		data["L4Proto"] = "UDP"
+		flowID = fnv1a.AddUint64(flowID, 17) // UDP (0x11)
 
 		srcPort, _ := json.Path("L4.src").Data().(layers.UDPPort)
-		data["L4Src"] = int(srcPort)
+		data["L4Src"] = uint16(srcPort)
 		dstPort, _ := json.Path("L4.dst").Data().(layers.UDPPort)
-		data["L4Dst"] = int(dstPort)
+		data["L4Dst"] = uint16(dstPort)
+
+		// addition is commutative
+		flowID = fnv1a.AddUint64(flowID, uint64(srcPort)+uint64(dstPort))
+		json.Set(flowID, "flow")
+		operation.Set(stringFormatter.Format(jsonTranslationFlowTemplate, logName, t.iface.Name, "udp", flowID), "producer")
 
 		json.Set(stringFormatter.FormatComplex(jsonTranslationSummaryUDP, data), "message")
 		return json, nil
 	}
 
 	data["L4Proto"] = "TCP"
+	flowID = fnv1a.AddUint64(flowID, 6) // TCP (0x06)
 
 	srcPort, _ := json.Path("L4.src").Data().(layers.TCPPort)
 	data["L4Src"] = int(srcPort)
 	dstPort, _ := json.Path("L4.dst").Data().(layers.TCPPort)
 	data["L4Dst"] = int(dstPort)
+
+	// addition is commutative
+	flowID = fnv1a.AddUint64(flowID, uint64(srcPort)+uint64(dstPort))
+	json.Set(flowID, "flow")
+	operation.Set(stringFormatter.Format(jsonTranslationFlowTemplate, logName, t.iface.Name, "tcp", flowID), "producer")
 
 	flags := make([]string, 0, len(tcpFlagNames))
 	for _, flagName := range tcpFlagNames {
@@ -428,17 +456,17 @@ func (t *JSONPcapTranslator) finalize(ctx context.Context, p *gopacket.Packet, p
 		return json, nil
 	}
 
-	t.setHTTP11(p, &appLayer, json, &message)
+	t.trySetHTTP11(p, &appLayer, json, &message)
 
 	return json, nil
 }
 
-func (t *JSONPcapTranslator) setHTTP11(
+func (t *JSONPcapTranslator) trySetHTTP11(
 	packet *gopacket.Packet,
 	appLayer *gopacket.ApplicationLayer,
 	json *gabs.Container,
 	message *string,
-) {
+) bool {
 	appLayerData := (*appLayer).LayerContents()
 
 	isHTTP11Request := http11RequestPayloadRegex.Match(appLayerData)
@@ -447,7 +475,7 @@ func (t *JSONPcapTranslator) setHTTP11(
 	// if content is not HTTP in clear text, abort
 	if !isHTTP11Request && !isHTTP11Response {
 		json.Set(*message, "message")
-		return
+		return false
 	}
 	// making at least 1 big assumption:
 	//   HTTP request/status line and headers fit in 1 packet
@@ -471,7 +499,7 @@ func (t *JSONPcapTranslator) setHTTP11(
 				t.recordHTTP11Request(packet, &traceAndSpan[0], &request.Method, &request.Host, &url)
 			}
 			json.Set(stringFormatter.Format("{0} | {1} {2} {3}", *message, request.Proto, request.Method, url), "message")
-			return
+			return true
 		}
 	}
 
@@ -491,7 +519,7 @@ func (t *JSONPcapTranslator) setHTTP11(
 				}
 			}
 			json.Set(stringFormatter.Format("{0} | {1} {2}", *message, response.Proto, response.Status), "message")
-			return
+			return true
 		}
 	}
 
@@ -528,7 +556,7 @@ func (t *JSONPcapTranslator) setHTTP11(
 		if traceAndSpan != nil {
 			t.recordHTTP11Request(packet, &traceAndSpan[0], &requestParts[1], &host, &requestParts[2])
 		}
-		return
+		return true
 	}
 
 	// isHTTP11Response
@@ -544,6 +572,7 @@ func (t *JSONPcapTranslator) setHTTP11(
 			io.WriteString(os.Stderr, err.Error())
 		}
 	}
+	return true
 }
 
 func (t *JSONPcapTranslator) recordHTTP11Request(packet *gopacket.Packet, traceID, method, host, url *string) {
@@ -634,14 +663,12 @@ func newJSONPcapTranslator(iface *PcapIface) *JSONPcapTranslator {
 	requests := csmap.Create[string, *JSONTranslatorRequest](
 		// set the number of map shards. the default value is 32.
 		csmap.WithShardCount[string, *JSONTranslatorRequest](32),
-
 		// if don't set custom hasher, use the built-in maphash.
 		csmap.WithCustomHasher[string, *JSONTranslatorRequest](func(key string) uint64 {
 			hash := fnv.New64a()
 			hash.Write([]byte(key))
 			return hash.Sum64()
 		}),
-
 		// set the total capacity, every shard map has total capacity/shard count capacity. the default value is 0.
 		csmap.WithSize[string, *JSONTranslatorRequest](1000),
 	)

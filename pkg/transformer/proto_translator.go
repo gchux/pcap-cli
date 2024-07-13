@@ -19,7 +19,7 @@ type (
 	}
 )
 
-func (t *ProtoPcapTranslator) next(ctx context.Context, packet *gopacket.Packet, serial *uint64) fmt.Stringer {
+func (t *ProtoPcapTranslator) next(ctx context.Context, serial *uint64, packet *gopacket.Packet) fmt.Stringer {
 	// `next` returns the container to be used for merging all layers
 	p := &pb.Packet{}
 
@@ -112,7 +112,7 @@ func (t *ProtoPcapTranslator) merge(ctx context.Context, tgt fmt.Stringer, src f
 	return tgt, nil
 }
 
-func (t *ProtoPcapTranslator) finalize(ctx context.Context, p *gopacket.Packet, packet fmt.Stringer) (fmt.Stringer, error) {
+func (t *ProtoPcapTranslator) finalize(ctx context.Context, serial *uint64, p *gopacket.Packet, packet fmt.Stringer) (fmt.Stringer, error) {
 	return packet, nil
 }
 

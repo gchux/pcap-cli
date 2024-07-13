@@ -16,6 +16,7 @@ require (
 	github.com/panjf2000/ants/v2 v2.10.0
 	github.com/pkg/errors v0.9.1
 	github.com/pterm/pterm v0.12.79
+	github.com/segmentio/fasthash v1.0.3
 	github.com/tejzpr/ordered-concurrently/v3 v3.0.1
 	github.com/wissance/stringFormatter v1.2.0
 	golang.org/x/crypto v0.0.0-20210921155107-089bfa567519

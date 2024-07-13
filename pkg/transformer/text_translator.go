@@ -63,7 +63,7 @@ func (tt *textPcapTranslations) String() string {
 	return ""
 }
 
-func (t *TextPcapTranslator) next(ctx context.Context, packet *gopacket.Packet, serial *uint64) fmt.Stringer {
+func (t *TextPcapTranslator) next(ctx context.Context, serial *uint64, packet *gopacket.Packet) fmt.Stringer {
 	text := new(strings.Builder)
 
 	metadata := (*packet).Metadata()
@@ -148,7 +148,7 @@ func (t *TextPcapTranslator) merge(ctx context.Context, tgt fmt.Stringer, src fm
 	return tgt, nil
 }
 
-func (t *TextPcapTranslator) finalize(ctx context.Context, p *gopacket.Packet, packet fmt.Stringer) (fmt.Stringer, error) {
+func (t *TextPcapTranslator) finalize(ctx context.Context, serial *uint64, p *gopacket.Packet, packet fmt.Stringer) (fmt.Stringer, error) {
 	return packet, nil
 }
 
