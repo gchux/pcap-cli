@@ -112,7 +112,7 @@ func (t *ProtoPcapTranslator) merge(ctx context.Context, tgt fmt.Stringer, src f
 	return tgt, nil
 }
 
-func (t *ProtoPcapTranslator) finalize(ctx context.Context, serial *uint64, p *gopacket.Packet, packet fmt.Stringer) (fmt.Stringer, error) {
+func (t *ProtoPcapTranslator) finalize(ctx context.Context, serial *uint64, p *gopacket.Packet, connTrack bool, packet fmt.Stringer) (fmt.Stringer, error) {
 	return packet, nil
 }
 

@@ -22,6 +22,7 @@ type (
 		Interval  int
 		Extension string
 		Ordered   bool
+		ConnTrack bool
 		Device    *PcapDevice
 	}
 

@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"hash/fnv"
 	"io"
 	"net"
 	"net/http"
@@ -21,6 +20,7 @@ import (
 	"github.com/segmentio/fasthash/fnv1a"
 	"github.com/wissance/stringFormatter"
 
+	mapset "github.com/deckarep/golang-set/v2"
 	csmap "github.com/mhmtszr/concurrent-swiss-map"
 )
 
@@ -30,8 +30,14 @@ type (
 		url, method *string
 	}
 	JSONPcapTranslator struct {
-		iface    *PcapIface
-		requests csmap.CsMap[string, *JSONTranslatorRequest]
+		iface             *PcapIface
+		traceToRequestMap *csmap.CsMap[string, *JSONTranslatorRequest]
+		flowToTraceMap    *csmap.CsMap[uint64, *string]
+		flowToSpanMap     *csmap.CsMap[uint64, *string]
+		flowToTimestamp   *csmap.CsMap[uint64, *time.Time]
+		halfOpenFlows     mapset.Set[uint64]
+		establishedFlows  mapset.Set[uint64]
+		halfClosedFlows   mapset.Set[uint64]
 	}
 )
 
@@ -85,6 +91,8 @@ func (t *JSONPcapTranslator) next(ctx context.Context, serial *uint64, packet *g
 		}
 	*/
 
+	json.Set(fnv1a.AddUint64(fnv1a.Init64, uint64(t.iface.Index)), "flow")
+
 	labels, _ := json.Object("logging.googleapis.com/labels")
 	labels.Set("pcap", "tools.chux.dev/tool")
 	labels.Set(id, "tools.chux.dev/pcap/id")
@@ -126,7 +134,7 @@ func (t *JSONPcapTranslator) translateIPv4Layer(ctx context.Context, ip *layers.
 	L3.Set(ip.FragOffset, "frag_offset")
 	L3.Set(ip.Checksum, "checksum")
 
-	opts, _ := json.ArrayOfSize(len(ip.Options), "opts")
+	opts, _ := L3.ArrayOfSize(len(ip.Options), "opts")
 	for i, opt := range ip.Options {
 		o, _ := opts.ObjectI(i)
 		o.Set(string(opt.OptionData), "data")
@@ -138,6 +146,10 @@ func (t *JSONPcapTranslator) translateIPv4Layer(ctx context.Context, ip *layers.
 	proto.Set(ip.Protocol.String(), "name")
 	// https://github.com/google/gopacket/blob/master/layers/ip4.go#L28-L40
 	L3.SetP(strings.Split(ip.Flags.String(), "|"), "flags")
+
+	// hashing bytes yields `uint64`, and addition is commutatie:
+	//   - so hashing the IP byte array representations and then adding then resulting `uint64`s is a commutative operation as well.
+	L3.Set(fnv1a.HashUint64(4+fnv1a.HashBytes64(ip.SrcIP.To4())+fnv1a.HashBytes64(ip.DstIP.To4())), "flow") // IPv4(4) (0x04)
 
 	return json
 }
@@ -156,6 +168,10 @@ func (t *JSONPcapTranslator) translateIPv6Layer(ctx context.Context, ip *layers.
 	L3.Set(ip.FlowLabel, "flow_label")
 	L3.Set(ip.NextHeader.String(), "next_header")
 	L3.Set(ip.HopLimit, "hop_limit")
+
+	// hashing bytes yields `uint64`, and addition is commutatie:
+	//   - so hashing the IP byte array representations and then adding then resulting `uint64`s is a commutative operation as well.
+	L3.Set(fnv1a.HashUint64(41+fnv1a.HashBytes64(ip.SrcIP.To16())+fnv1a.HashBytes64(ip.DstIP.To16())), "flow") // IPv6(41) (0x29)
 
 	// missing `HopByHop`: https://github.com/google/gopacket/blob/master/layers/ip6.go#L40
 	return json
@@ -181,6 +197,9 @@ func (t *JSONPcapTranslator) translateUDPLayer(ctx context.Context, udp *layers.
 		L4.Set(name, "dproto")
 	}
 
+	// `SrcPort` and `DstPort` are `uint8`
+	L4.Set(fnv1a.HashUint64(17+uint64(udp.SrcPort)+uint64(udp.DstPort)), "flow") // UDP(17) (0x11)
+
 	return json
 }
 
@@ -198,16 +217,42 @@ func (t *JSONPcapTranslator) translateTCPLayer(ctx context.Context, tcp *layers.
 	L4.Set(tcp.Checksum, "checksum")
 	L4.Set(tcp.Urgent, "urg")
 
+	var setFlags uint8 = 0
+
 	flags, _ := L4.Object("flags")
-	flags.Set(tcp.SYN, "SYN")
-	flags.Set(tcp.ACK, "ACK")
-	flags.Set(tcp.PSH, "PSH")
-	flags.Set(tcp.FIN, "FIN")
-	flags.Set(tcp.RST, "RST")
-	flags.Set(tcp.URG, "URG")
-	flags.Set(tcp.ECE, "ECE")
-	flags.Set(tcp.CWR, "CWR")
-	flags.Set(tcp.NS, "NS")
+
+	flagsMap, _ := flags.Object("map")
+	flagsMap.Set(tcp.SYN, "SYN")
+	if tcp.SYN {
+		setFlags = setFlags | tcpSyn
+	}
+	flagsMap.Set(tcp.ACK, "ACK")
+	if tcp.ACK {
+		setFlags = setFlags | tcpAck
+	}
+	flagsMap.Set(tcp.PSH, "PSH")
+	if tcp.PSH {
+		setFlags = setFlags | tcpPsh
+	}
+	flagsMap.Set(tcp.FIN, "FIN")
+	if tcp.FIN {
+		setFlags = setFlags | tcpFin
+	}
+	flagsMap.Set(tcp.RST, "RST")
+	if tcp.RST {
+		setFlags = setFlags | tcpRst
+	}
+	flagsMap.Set(tcp.URG, "URG")
+	if tcp.URG {
+		setFlags = setFlags | tcpUrg
+	}
+	flagsMap.Set(tcp.ECE, "ECE")
+	flagsMap.Set(tcp.CWR, "CWR")
+	flagsMap.Set(tcp.NS, "NS")
+
+	flags.Set(setFlags, "dec")
+	flags.Set("0b"+strconv.FormatUint(uint64(setFlags), 2), "bin")
+	flags.Set("0x"+strconv.FormatUint(uint64(setFlags), 16), "hex")
 
 	opts, _ := L4.ArrayOfSize(len(tcp.Options), "opts")
 	for i, opt := range tcp.Options {
@@ -227,6 +272,9 @@ func (t *JSONPcapTranslator) translateTCPLayer(ctx context.Context, tcp *layers.
 	if name, ok := layers.TCPPortNames[tcp.DstPort]; ok {
 		L4.Set(name, "dproto")
 	}
+
+	// `SrcPort` and `DstPort` are `uint8`
+	L4.Set(fnv1a.HashUint64(6+uint64(tcp.SrcPort)+uint64(tcp.DstPort)), "flow") // TCP(6) (0x06)
 
 	return json
 }
@@ -354,9 +402,15 @@ func (t *JSONPcapTranslator) merge(ctx context.Context, tgt fmt.Stringer, src fm
 }
 
 // for JSON translator, this mmethod generates:
-//   - the `flowID` for any 5-tuple conversation ([TODO]: this must be done by all translators)
+//   - the `flowID` for any 6-tuple conversation
 //   - the summary line at {`message`: $summary}
-func (t *JSONPcapTranslator) finalize(ctx context.Context, serial *uint64, p *gopacket.Packet, packet fmt.Stringer) (fmt.Stringer, error) {
+func (t *JSONPcapTranslator) finalize(
+	ctx context.Context,
+	serial *uint64,
+	p *gopacket.Packet,
+	connTrack bool,
+	packet fmt.Stringer,
+) (fmt.Stringer, error) {
 	json := t.asTranslation(packet)
 
 	data := make(map[string]any, 14)
@@ -385,16 +439,24 @@ func (t *JSONPcapTranslator) finalize(ctx context.Context, serial *uint64, p *go
 	isUDP := proto == layers.IPProtocolUDP
 
 	// `flowID` is the unique ID of this conversation:
-	// given by the 5-tuple: protocol+src_ip+src_port+dst_ip+dst_port.
+	// given by the 6-tuple: iface_index+protocol+src_ip+src_port+dst_ip+dst_port.
 	// Addition is commutative, so after hashing `net.IP` bytes and L4 ports to `uint64`,
 	// the same `uint64`/`flowID` is produced after adding everything up, no matter the order.
 	// Using the same `flowID` will produce grouped logs in Cloud Logging.
-	flowID := fnv1a.HashUint64(fnv1a.HashBytes64(l3Src.To16()) + fnv1a.HashBytes64(l3Dst.To16()))
+	flowID, _ := json.Path("flow").Data().(uint64) // this is always available
+	if l3FlowID, l3OK := json.Path("L3.flow").Data().(uint64); l3OK {
+		flowID = fnv1a.AddUint64(flowID, l3FlowID)
+	}
+	if l4FlowID, l4OK := json.Path("L4.flow").Data().(uint64); l4OK {
+		flowID = fnv1a.AddUint64(flowID, l4FlowID)
+	} else {
+		flowID = fnv1a.AddUint64(flowID, 255) // RESERVED (0xFF)
+	}
+
+	data["flowID"] = flowID
+	json.Set(flowID, "flow")
 
 	if !isTCP && !isUDP {
-		flowID = fnv1a.AddUint64(flowID, 255) // RESERVED (0xFF)
-		data["flowID"] = flowID
-		json.Set(flowID, "flow")
 		operation.Set(stringFormatter.Format(jsonTranslationFlowTemplate, id, t.iface.Name, "x", flowID), "id")
 		json.Set(stringFormatter.FormatComplex(jsonTranslationSummaryWithoutL4, data), "message")
 		return json, nil
@@ -412,12 +474,7 @@ func (t *JSONPcapTranslator) finalize(ctx context.Context, serial *uint64, p *go
 		data["L4Src"] = uint16(srcPort)
 		dstPort, _ := json.Path("L4.dst").Data().(layers.UDPPort)
 		data["L4Dst"] = uint16(dstPort)
-
-		flowID = fnv1a.AddUint64(flowID, 17+uint64(srcPort)+uint64(dstPort)) // UDP(17) (0x11)
-		data["flowID"] = flowID
-		json.Set(flowID, "flow")
 		operation.Set(stringFormatter.Format(jsonTranslationFlowTemplate, id, t.iface.Name, "udp", flowID), "id")
-
 		json.Set(stringFormatter.FormatComplex(jsonTranslationSummaryUDP, data), "message")
 		return json, nil
 	}
@@ -428,19 +485,29 @@ func (t *JSONPcapTranslator) finalize(ctx context.Context, serial *uint64, p *go
 	dstPort, _ := json.Path("L4.dst").Data().(layers.TCPPort)
 	data["L4Dst"] = uint16(dstPort)
 
-	flowID = fnv1a.AddUint64(flowID, 6+uint64(srcPort)+uint64(dstPort)) // TCP(6) (0x06)
-	data["flowID"] = flowID
-	json.Set(flowID, "flow")
 	operation.Set(stringFormatter.Format(jsonTranslationFlowTemplate, id, t.iface.Name, "tcp", flowID), "id")
 
-	flags := make([]string, 0, len(tcpFlagNames))
-	for _, flagName := range tcpFlagNames {
-		if isSet, _ := json.Path(`L4.flags.` + flagName).Data().(bool); isSet {
-			flags = append(flags, flagName)
-		}
+	setFlags, _ := json.Path("L4.flags.dec").Data().(uint8)
+
+	if connTrack {
+		t.trackConnection(p, &flowID, &setFlags, json)
+	} else if setFlags == tcpRst || setFlags == tcpFinAck {
+		t.flowToTraceMap.Delete(flowID)
+		t.flowToSpanMap.Delete(flowID)
 	}
 
-	data["tcpFlags"] = strings.Join(flags, "|")
+	if setFlagsStr, ok := tcpFlagsStr[setFlags]; ok {
+		data["tcpFlags"] = setFlagsStr
+	} else {
+		// this scenario is slow, but it should also be exceedingly rare
+		flags := make([]string, 0, len(tcpFlags))
+		for key := range tcpFlags {
+			if isSet, _ := json.Path(`L4.flags.` + key).Data().(bool); isSet {
+				flags = append(flags, key)
+			}
+		}
+		data["tcpFlags"] = strings.Join(flags, "|")
+	}
 
 	seq, _ := json.Path("L4.seq").Data().(uint32)
 	data["tcpSeq"] = seq
@@ -449,21 +516,92 @@ func (t *JSONPcapTranslator) finalize(ctx context.Context, serial *uint64, p *go
 
 	message := stringFormatter.FormatComplex(jsonTranslationSummaryTCP, data)
 
-	// simple/naive HTTP decoding
+	if setFlags != tcpPshAck { // 0x18
+		t.trySetTraceAndSpan(json, &flowID)
+		json.Set(message, "message")
+		return json, nil
+	}
+
 	appLayer := (*p).ApplicationLayer()
 	if appLayer == nil {
 		json.Set(message, "message")
 		return json, nil
 	}
 
-	t.trySetHTTP11(p, &appLayer, json, &message)
+	// if trace-id and span-id are not available:
+	//   - check if this packet is `PSH+ACK` with HTTP Request/Response payload
+	if setFlags == tcpPshAck &&
+		!t.trySetHTTP11(p, &setFlags, &appLayer, &flowID, json, &message) {
+		t.trySetTraceAndSpan(json, &flowID)
+	}
 
 	return json, nil
 }
 
+func (t *JSONPcapTranslator) trackConnection(packet *gopacket.Packet, flowID *uint64, flags *uint8, json *gabs.Container) {
+	fl := *flags
+	fid := *flowID
+
+	shouldRemoveTracking := false
+	if fl == tcpSyn && !t.halfOpenFlows.Contains(fid) {
+		// TCP 3-way-handshake 1st step
+		t.halfOpenFlows.Add(fid)
+		json.Set("new connection", "hint")
+	} else if fl == tcpSyn && t.halfOpenFlows.Contains(fid) {
+		json.Set("duplicate SYN", "hint")
+	} else if fl == tcpSynAck && t.halfOpenFlows.Contains(fid) {
+		// TCP 3-way-handshake 2nd step
+		t.halfOpenFlows.Remove(fid)
+		t.establishedFlows.Add(fid)
+		json.Set("connection established", "hint")
+	} else if fl == tcpFinAck && t.establishedFlows.Contains(fid) {
+		t.establishedFlows.Remove(fid)
+		t.halfClosedFlows.Add(fid)
+		json.Set("closing connection", "hint")
+	} else if fl == tcpFinAck && t.halfClosedFlows.Contains(fid) {
+		t.halfClosedFlows.Remove(fid)
+		shouldRemoveTracking = true
+		json.Set("connection closed", "hint")
+	} else if fl == tcpRst && t.halfOpenFlows.Contains(fid) {
+		t.halfOpenFlows.Remove(fid)
+		shouldRemoveTracking = true
+		json.Set("connection timeout", "hint")
+	} else if fl == tcpRst && t.establishedFlows.Contains(fid) {
+		t.establishedFlows.Remove(fid)
+		shouldRemoveTracking = true
+		json.Set("connection reset", "hint")
+	}
+
+	timestamp := (*packet).Metadata().Timestamp
+	if ts, ok := t.flowToTimestamp.Load(fid); ok {
+		json.Set(timestamp.Sub(*ts).Milliseconds(), "latency")
+		t.flowToTimestamp.Store(fid, &timestamp)
+	} else {
+		t.flowToTimestamp.SetIfAbsent(fid, &timestamp)
+	}
+
+	if shouldRemoveTracking {
+		t.flowToTraceMap.Delete(fid)
+		t.flowToSpanMap.Delete(fid)
+		t.flowToTimestamp.Delete(fid)
+	}
+}
+
+func (t *JSONPcapTranslator) trySetTraceAndSpan(json *gabs.Container, flowID *uint64) bool {
+	traceID, traceOK := t.flowToTraceMap.Load(*flowID)
+	if spanID, spanOK := t.flowToSpanMap.Load(*flowID); traceOK && spanOK {
+		// if trace is available, span must also be available
+		t.setTraceAndSpan(json, traceID, spanID)
+		return true
+	}
+	return false
+}
+
 func (t *JSONPcapTranslator) trySetHTTP11(
 	packet *gopacket.Packet,
+	tcpFlags *uint8,
 	appLayer *gopacket.ApplicationLayer,
+	flowID *uint64,
 	json *gabs.Container,
 	message *string,
 ) bool {
@@ -496,7 +634,7 @@ func (t *JSONPcapTranslator) trySetHTTP11(
 			if traceAndSpan := t.setHTTPHeaders(L7, &request.Header); traceAndSpan != nil {
 				// include trace and span id for traceability
 				t.setTraceAndSpan(json, &traceAndSpan[0], &traceAndSpan[1])
-				t.recordHTTP11Request(packet, &traceAndSpan[0], &request.Method, &request.Host, &url)
+				t.recordHTTP11Request(packet, flowID, &traceAndSpan[0], &traceAndSpan[1], &request.Method, &request.Host, &url)
 			}
 			json.Set(stringFormatter.Format("{0} | {1} {2} {3}", *message, request.Proto, request.Method, url), "message")
 			return true
@@ -514,7 +652,7 @@ func (t *JSONPcapTranslator) trySetHTTP11(
 			if traceAndSpan := t.setHTTPHeaders(L7, &response.Header); traceAndSpan != nil {
 				// include trace and span id for traceability
 				t.setTraceAndSpan(json, &traceAndSpan[0], &traceAndSpan[1])
-				if err := t.linkHTTP11ResponseToRequest(packet, L7, &traceAndSpan[0]); err != nil {
+				if err := t.linkHTTP11ResponseToRequest(packet, tcpFlags, flowID, L7, &traceAndSpan[0]); err != nil {
 					io.WriteString(os.Stderr, err.Error())
 				}
 			}
@@ -554,7 +692,7 @@ func (t *JSONPcapTranslator) trySetHTTP11(
 		L7.Set(requestParts[2], "url")
 		host := "0"
 		if traceAndSpan != nil {
-			t.recordHTTP11Request(packet, &traceAndSpan[0], &requestParts[1], &host, &requestParts[2])
+			t.recordHTTP11Request(packet, flowID, &traceAndSpan[0], &traceAndSpan[1], &requestParts[1], &host, &requestParts[2])
 		}
 		return true
 	}
@@ -568,14 +706,14 @@ func (t *JSONPcapTranslator) trySetHTTP11(
 	}
 	L7.Set(responseParts[2], "status")
 	if traceAndSpan != nil {
-		if err := t.linkHTTP11ResponseToRequest(packet, L7, &traceAndSpan[0]); err != nil {
+		if err := t.linkHTTP11ResponseToRequest(packet, tcpFlags, flowID, L7, &traceAndSpan[0]); err != nil {
 			io.WriteString(os.Stderr, err.Error())
 		}
 	}
 	return true
 }
 
-func (t *JSONPcapTranslator) recordHTTP11Request(packet *gopacket.Packet, traceID, method, host, url *string) {
+func (t *JSONPcapTranslator) recordHTTP11Request(packet *gopacket.Packet, flowID *uint64, traceID, spanID, method, host, url *string) {
 	fullURL := stringFormatter.Format("{0}{1}", *host, *url)
 	jsonTranslatorRequest := &JSONTranslatorRequest{
 		timestamp: &(*packet).Metadata().Timestamp,
@@ -583,11 +721,13 @@ func (t *JSONPcapTranslator) recordHTTP11Request(packet *gopacket.Packet, traceI
 		url:       &fullURL,
 	}
 	// if a response is never seen for this trace id, it will cause a memory leak
-	t.requests.SetIfAbsent(*traceID, jsonTranslatorRequest)
+	t.traceToRequestMap.SetIfAbsent(*traceID, jsonTranslatorRequest)
+	t.flowToTraceMap.SetIfAbsent(*flowID, traceID)
+	t.flowToSpanMap.SetIfAbsent(*flowID, spanID)
 }
 
-func (t *JSONPcapTranslator) linkHTTP11ResponseToRequest(packet *gopacket.Packet, response *gabs.Container, traceID *string) error {
-	jsonTranslatorRequest, ok := t.requests.Load(*traceID)
+func (t *JSONPcapTranslator) linkHTTP11ResponseToRequest(packet *gopacket.Packet, flags *uint8, flowID *uint64, response *gabs.Container, traceID *string) error {
+	jsonTranslatorRequest, ok := t.traceToRequestMap.Load(*traceID)
 	if !ok {
 		return errors.New(stringFormatter.Format("no request found for trace-id: {0}", *traceID))
 	}
@@ -603,7 +743,7 @@ func (t *JSONPcapTranslator) linkHTTP11ResponseToRequest(packet *gopacket.Packet
 	request.Set(requestTimestamp.String(), "timestamp")
 	request.Set(latency.Milliseconds(), "latency")
 
-	if !t.requests.Delete(*traceID) {
+	if !t.traceToRequestMap.Delete(*traceID) {
 		return errors.New(stringFormatter.Format("failed to delete request with trace-id: {0}", *traceID))
 	}
 	return nil
@@ -660,17 +800,45 @@ func (t *JSONPcapTranslator) write(ctx context.Context, writer io.Writer, packet
 }
 
 func newJSONPcapTranslator(iface *PcapIface) *JSONPcapTranslator {
-	requests := csmap.Create[string, *JSONTranslatorRequest](
+	traceToRequestMap := csmap.Create[string, *JSONTranslatorRequest](
 		// set the number of map shards. the default value is 32.
 		csmap.WithShardCount[string, *JSONTranslatorRequest](32),
 		// if don't set custom hasher, use the built-in maphash.
 		csmap.WithCustomHasher[string, *JSONTranslatorRequest](func(key string) uint64 {
-			hash := fnv.New64a()
-			hash.Write([]byte(key))
-			return hash.Sum64()
+			return fnv1a.HashString64(key)
 		}),
 		// set the total capacity, every shard map has total capacity/shard count capacity. the default value is 0.
 		csmap.WithSize[string, *JSONTranslatorRequest](1000),
 	)
-	return &JSONPcapTranslator{iface: iface, requests: *requests}
+	// `flowID` is already a hash, so no need to further hash anything
+	flowToTraceMap := csmap.Create[uint64, *string](
+		csmap.WithShardCount[uint64, *string](32),
+		csmap.WithCustomHasher[uint64, *string](func(key uint64) uint64 { return key }),
+		csmap.WithSize[uint64, *string](1000),
+	)
+	flowToSpanMap := csmap.Create[uint64, *string](
+		csmap.WithShardCount[uint64, *string](32),
+		csmap.WithCustomHasher[uint64, *string](func(key uint64) uint64 { return key }),
+		csmap.WithSize[uint64, *string](1000),
+	)
+	flowToTimestamp := csmap.Create[uint64, *time.Time](
+		csmap.WithShardCount[uint64, *time.Time](32),
+		csmap.WithCustomHasher[uint64, *time.Time](func(key uint64) uint64 { return key }),
+		csmap.WithSize[uint64, *time.Time](1000),
+	)
+
+	halfOpenFlows := mapset.NewSet[uint64]()
+	halfClosedFlows := mapset.NewSet[uint64]()
+	establishedFlows := mapset.NewSet[uint64]()
+
+	return &JSONPcapTranslator{
+		iface:             iface,
+		traceToRequestMap: traceToRequestMap,
+		flowToTraceMap:    flowToTraceMap,
+		flowToSpanMap:     flowToSpanMap,
+		flowToTimestamp:   flowToTimestamp,
+		halfOpenFlows:     halfOpenFlows,
+		halfClosedFlows:   halfClosedFlows,
+		establishedFlows:  establishedFlows,
+	}
 }

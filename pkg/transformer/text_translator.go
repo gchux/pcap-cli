@@ -148,7 +148,7 @@ func (t *TextPcapTranslator) merge(ctx context.Context, tgt fmt.Stringer, src fm
 	return tgt, nil
 }
 
-func (t *TextPcapTranslator) finalize(ctx context.Context, serial *uint64, p *gopacket.Packet, packet fmt.Stringer) (fmt.Stringer, error) {
+func (t *TextPcapTranslator) finalize(ctx context.Context, serial *uint64, p *gopacket.Packet, connTrack bool, packet fmt.Stringer) (fmt.Stringer, error) {
 	return packet, nil
 }
 

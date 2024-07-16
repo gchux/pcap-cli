@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"sync"
 	"syscall"
 	"time"
 
@@ -30,6 +31,7 @@ var (
 	extension = flag.String("ext", "", "Set pcap files extension: pcap, json, txt")
 	stdout    = flag.Bool("stdout", false, "Log translation to standard output; only if 'w' is not 'stdout'")
 	ordered   = flag.Bool("ordered", false, "write translation in the order in which packets were captured")
+	conntrack = flag.Bool("conntrack", false, "enable connection tracking (includes 'ordered')")
 	timezone  = flag.String("tz", "UTC", "timezone to be used by PCAP files template")
 )
 
@@ -66,7 +68,6 @@ func main() {
 
 	config := &pcap.PcapConfig{
 		Promisc:   *promisc,
-		Iface:     *iface,
 		Snaplen:   *snaplen,
 		TsType:    *tsType,
 		Format:    *format,
@@ -75,24 +76,11 @@ func main() {
 		Interval:  *interval,
 		Extension: *extension,
 		Ordered:   *ordered,
+		ConnTrack: *conntrack,
 	}
 
 	exp, _ := regexp.Compile(fmt.Sprintf("^(?:ipvlan-)?%s.*", *iface))
 	devs, _ := pcap.FindDevicesByRegex(exp)
-	logger.Printf("device: %+v\n", devs)
-
-	if *engine == "tcpdump" && *stdout {
-		*writeTo = "stdout"
-	}
-
-	var err error
-	var pcapEngine pcap.PcapEngine
-
-	pcapEngine, err = newPcapEngine(engine, config)
-	if err != nil {
-		log.Fatalf("%s", err)
-		return
-	}
 
 	ctx := context.Background()
 	var cancel context.CancelFunc
@@ -105,6 +93,42 @@ func main() {
 		ctx, cancel = context.WithTimeout(ctx, time.Duration(*timeout)*time.Second)
 	} else {
 		ctx, cancel = context.WithCancel(ctx)
+	}
+
+	var wg sync.WaitGroup
+
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
+	go func() {
+		<-signals
+		cancel()
+	}()
+
+	for _, dev := range devs {
+		wg.Add(1)
+		go startPCAP(ctx, &id, dev, config, &wg)
+	}
+	wg.Wait()
+}
+
+func startPCAP(ctx context.Context, id *string, dev *pcap.PcapDevice, config *pcap.PcapConfig, wg *sync.WaitGroup) {
+	iface := dev.NetInterface.Name
+
+	logger.Printf("device: %+v\n", iface)
+
+	config.Iface = iface
+
+	if *engine == "tcpdump" && *stdout {
+		*writeTo = "stdout"
+	}
+
+	var err error
+	var pcapEngine pcap.PcapEngine
+
+	pcapEngine, err = newPcapEngine(engine, config)
+	if err != nil {
+		log.Fatalf("%s", err)
+		return
 	}
 
 	if *writeTo == "stdout" {
@@ -128,18 +152,12 @@ func main() {
 		}
 	}
 
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
-	go func() {
-		<-signals
-		cancel()
-	}()
-
-	prefix := fmt.Sprintf("execution '%s'", id)
+	prefix := fmt.Sprintf("[iface:%s] execution '%s'", iface, *id)
 	logger.Printf("%s started", prefix)
 	// this is a blocking call
 	err = pcapEngine.Start(ctx, pcapWriters)
 	if err != nil {
 		handleError(&prefix, err)
 	}
+	wg.Done()
 }

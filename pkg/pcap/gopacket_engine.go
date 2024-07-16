@@ -118,6 +118,8 @@ func (p *Pcap) Start(ctx context.Context, writers []PcapWriter) error {
 	var fn transformer.IPcapTransformer
 	if cfg.Ordered {
 		fn, err = transformer.NewOrderedTransformer(ctx, iface, ioWriters, &format)
+	} else if cfg.ConnTrack {
+		fn, err = transformer.NewConnTrackTransformer(ctx, iface, ioWriters, &format)
 	} else {
 		fn, err = transformer.NewTransformer(ctx, iface, ioWriters, &format)
 	}

@@ -7,6 +7,7 @@ retract v1.0.0-dev
 require (
 	dario.cat/mergo v1.0.0
 	github.com/Jeffail/gabs/v2 v2.7.0
+	github.com/deckarep/golang-set/v2 v2.6.0
 	github.com/easyCZ/logrotate v0.3.0
 	github.com/google/gopacket v1.1.19
 	github.com/google/uuid v1.6.0
@@ -28,6 +29,7 @@ require (
 	atomicgo.dev/keyboard v0.2.9 // indirect
 	atomicgo.dev/schedule v0.1.0 // indirect
 	github.com/containerd/console v1.0.3 // indirect
+	github.com/google/go-cmp v0.5.9 // indirect
 	github.com/gookit/color v1.5.4 // indirect
 	github.com/lithammer/fuzzysearch v1.1.8 // indirect
 	github.com/mattn/go-runewidth v0.0.15 // indirect

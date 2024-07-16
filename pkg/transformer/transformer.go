@@ -29,7 +29,7 @@ type (
 		translateTLSLayer(context.Context, *layers.TLS) fmt.Stringer
 		translateDNSLayer(context.Context, *layers.DNS) fmt.Stringer
 		merge(context.Context, fmt.Stringer, fmt.Stringer) (fmt.Stringer, error)
-		finalize(context.Context, *uint64, *gopacket.Packet, fmt.Stringer) (fmt.Stringer, error)
+		finalize(context.Context, *uint64, *gopacket.Packet, bool, fmt.Stringer) (fmt.Stringer, error)
 		write(context.Context, io.Writer, *fmt.Stringer) (int, error)
 	}
 
@@ -45,6 +45,7 @@ type (
 		writeQueues    []chan *fmt.Stringer
 		wg             *sync.WaitGroup
 		preserveOrder  bool
+		connTracking   bool
 		apply          func(*pcapTranslatorWorker) error
 	}
 
@@ -97,7 +98,70 @@ const (
 )
 
 var (
-	tcpFlagNames                 = []string{"SYN", "ACK", "PSH", "FIN", "RST", "URG", "ECE", "CWR"}
+	tcpSynStr = "SYN"
+	tcpAckStr = "ACK"
+	tcpPshStr = "PSH"
+	tcpFinStr = "FIN"
+	tcpRstStr = "RST"
+	tcpUrgStr = "URG"
+	tcpEceStr = "ECE"
+	tcpCwrStr = "CWR"
+
+	tcpFlags = map[string]uint8{
+		tcpFinStr: 0b00000001,
+		tcpSynStr: 0b00000010,
+		tcpRstStr: 0b00000100,
+		tcpPshStr: 0b00001000,
+		tcpAckStr: 0b00010000,
+		tcpUrgStr: 0b00100000,
+		tcpEceStr: 0b01000000,
+		tcpCwrStr: 0b10000000,
+	}
+
+	tcpSynAckStr    = tcpSynStr + "|" + tcpAckStr
+	tcpPshAckStr    = tcpPshStr + "|" + tcpAckStr
+	tcpFinAckStr    = tcpFinStr + "|" + tcpAckStr
+	tcpRstAckStr    = tcpRstStr + "|" + tcpAckStr
+	tcpUrgAckStr    = tcpUrgStr + "|" + tcpAckStr
+	tcpSynPshAckStr = tcpSynStr + "|" + tcpPshStr + "|" + tcpAckStr
+	tcpFinRstAckStr = tcpFinStr + "|" + tcpRstStr + "|" + tcpAckStr
+
+	tcpSyn       = tcpFlags[tcpSynStr]
+	tcpAck       = tcpFlags[tcpAckStr]
+	tcpPsh       = tcpFlags[tcpPshStr]
+	tcpFin       = tcpFlags[tcpFinStr]
+	tcpRst       = tcpFlags[tcpRstStr]
+	tcpUrg       = tcpFlags[tcpUrgStr]
+	tcpEce       = tcpFlags[tcpEceStr]
+	tcpCwr       = tcpFlags[tcpCwrStr]
+	tcpSynAck    = tcpSyn | tcpAck
+	tcpPshAck    = tcpPsh | tcpAck
+	tcpFinAck    = tcpFin | tcpAck
+	tcpRstAck    = tcpRst | tcpAck
+	tcpUrgAck    = tcpUrg | tcpAck
+	tcpSynPshAck = tcpSyn | tcpPsh | tcpAck
+	tcpFinRstAck = tcpFin | tcpRst | tcpAck
+
+	tcpFlagsStr = map[uint8]string{
+		tcpSyn:       tcpSynStr,
+		tcpAck:       tcpAckStr,
+		tcpPsh:       tcpPshStr,
+		tcpFin:       tcpFinStr,
+		tcpRst:       tcpRstStr,
+		tcpUrg:       tcpUrgStr,
+		tcpEce:       tcpEceStr,
+		tcpCwr:       tcpCwrStr,
+		tcpSynAck:    tcpSynAckStr,
+		tcpPshAck:    tcpPshAckStr,
+		tcpFinAck:    tcpFinAckStr,
+		tcpRstAck:    tcpRstAckStr,
+		tcpUrgAck:    tcpUrgAckStr,
+		tcpSynPshAck: tcpSynPshAckStr,
+		tcpFinRstAck: tcpFinRstAckStr,
+	}
+)
+
+var (
 	tcpOptionRgx                 = regexp.MustCompile(tcpOptionsRegex)
 	http11RequestPayloadRegex    = regexp.MustCompile(http11RequestPayloadRegexStr)
 	http11ResponsePayloadRegex   = regexp.MustCompile(http11ResponsePayloadRegexStr)
@@ -178,7 +242,7 @@ func (t *PcapTransformer) WaitDone() {
 func (t *PcapTransformer) Apply(ctx context.Context, packet *gopacket.Packet, serial *uint64) error {
 	// It is assumed that packets will be produced faster than translations.
 	// process/translate packets concurrently in order to avoid blocking `gopacket` packets channel.
-	worker := newPcapTranslatorWorker(serial, packet, t.translator)
+	worker := newPcapTranslatorWorker(serial, packet, t.translator, t.connTracking)
 	t.wg.Add(len(t.writers))
 	return t.apply(worker)
 }
@@ -232,8 +296,20 @@ func provideWorkerPools(ctx context.Context, transformer *PcapTransformer, numWr
 	transformer.writerPool = writerPool
 }
 
-func provideConcurrentQueue(ctx context.Context, transformer *PcapTransformer, numWriters int) {
-	queueSize := 25 * numWriters
+func provideConcurrentQueue(ctx context.Context, connTrack bool, transformer *PcapTransformer, numWriters int) {
+	queueSize := 30 * numWriters
+	// when `queueSize` is greater than 1: even when written in order,
+	// packets are processed concurrently which makes connection tracking
+	// a very complex process to be done on-the-fly as order of packet translation
+	// is not guaranteed; also introducing contention may slow down the whole process.
+	if connTrack {
+		// if connection tracking is enabled, the whole process is synchronous,
+		// so the following considerations apply:
+		//   - should be enabled only in combination with a very specific filter
+		//   - should not be used when high traffic rate is expected:
+		//       non-concurrent processing is slower, so more memory is required to buffer packets
+		queueSize = 1
+	}
 
 	ochOpts := &concurrently.Options{
 		PoolSize:         queueSize,
@@ -271,7 +347,7 @@ func provideStrategy(transformer *PcapTransformer, preserveOrder bool) {
 }
 
 // transformers get instances of `io.Writer` instead of `pcap.PcapWriter` to prevent closing.
-func newTransformer(ctx context.Context, iface *PcapIface, writers []io.Writer, format *string, preserveOrder bool) (IPcapTransformer, error) {
+func newTransformer(ctx context.Context, iface *PcapIface, writers []io.Writer, format *string, preserveOrder, connTrack bool) (IPcapTransformer, error) {
 	pcapFmt := pcapTranslatorFmts[*format]
 	translator, err := newTranslator(iface, pcapFmt)
 	if err != nil {
@@ -294,7 +370,8 @@ func newTransformer(ctx context.Context, iface *PcapIface, writers []io.Writer, 
 		translator:    translator,
 		writers:       writers,
 		writeQueues:   writeQueues,
-		preserveOrder: preserveOrder,
+		preserveOrder: preserveOrder || connTrack,
+		connTracking:  connTrack,
 	}
 
 	provideStrategy(transformer, preserveOrder)
@@ -302,7 +379,7 @@ func newTransformer(ctx context.Context, iface *PcapIface, writers []io.Writer, 
 	// `preserveOrder==true` causes writes to be sequential and blocking per `io.Writer`.
 	// `preserveOrder==true` although blocking at writting, does not cause `transformer.Apply` to block.
 	if preserveOrder {
-		provideConcurrentQueue(ctx, transformer, numWriters)
+		provideConcurrentQueue(ctx, connTrack, transformer, numWriters)
 		go transformer.waitForContextDone(ctx)
 		go transformer.produceTranslations(ctx)
 	} else {
@@ -320,9 +397,13 @@ func newTransformer(ctx context.Context, iface *PcapIface, writers []io.Writer, 
 }
 
 func NewOrderedTransformer(ctx context.Context, iface *PcapIface, writers []io.Writer, format *string) (IPcapTransformer, error) {
-	return newTransformer(ctx, iface, writers, format, true /* preserveOrder */)
+	return newTransformer(ctx, iface, writers, format, true /* preserveOrder */, false /* connTrack */)
+}
+
+func NewConnTrackTransformer(ctx context.Context, iface *PcapIface, writers []io.Writer, format *string) (IPcapTransformer, error) {
+	return newTransformer(ctx, iface, writers, format, true /* preserveOrder */, true /* connTrack */)
 }
 
 func NewTransformer(ctx context.Context, iface *PcapIface, writers []io.Writer, format *string) (IPcapTransformer, error) {
-	return newTransformer(ctx, iface, writers, format, false /* preserveOrder */)
+	return newTransformer(ctx, iface, writers, format, false /* preserveOrder */, false /* connTrack */)
 }

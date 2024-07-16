@@ -14,6 +14,7 @@ type (
 		serial     *uint64
 		packet     *gopacket.Packet
 		translator PcapTranslator
+		connTrack  bool
 	}
 
 	packetLayerTranslator func(context.Context, *pcapTranslatorWorker) fmt.Stringer
@@ -170,19 +171,22 @@ func (w *pcapTranslatorWorker) Run(ctx context.Context) interface{} {
 		}
 	}
 
-	buffer, _ = w.translator.finalize(ctx, w.serial, w.packet, buffer)
+	buffer, _ = w.translator.finalize(ctx, w.serial, w.packet, w.connTrack, buffer)
 
 	return &buffer
 }
 
 func newPcapTranslatorWorker(
-	serial *uint64, packet *gopacket.Packet,
+	serial *uint64,
+	packet *gopacket.Packet,
 	translator PcapTranslator,
+	connTrack bool,
 ) *pcapTranslatorWorker {
 	worker := &pcapTranslatorWorker{
 		serial:     serial,
 		packet:     packet,
 		translator: translator,
+		connTrack:  connTrack,
 	}
 	return worker
 }
