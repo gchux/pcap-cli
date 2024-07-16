@@ -84,12 +84,10 @@ func (t *JSONPcapTranslator) next(ctx context.Context, serial *uint64, packet *g
 	iface, _ := json.Object("iface")
 	iface.Set(t.iface.Index, "index")
 	iface.Set(t.iface.Name, "name")
-	/*
-		addrs, _ := iface.ArrayOfSize(len(t.iface.Addrs), "addrs")
-		for i, addr := range t.iface.Addrs {
-			addrs.SetIndex(addr.IP.String(), i)
-		}
-	*/
+	addrs, _ := iface.ArrayOfSize(len(t.iface.Addrs), "addrs")
+	for i, addr := range t.iface.Addrs {
+		addrs.SetIndex(addr.IP.String(), i)
+	}
 
 	json.Set(fnv1a.AddUint64(fnv1a.Init64, uint64(t.iface.Index)), "flow")
 
