@@ -166,8 +166,11 @@ func (t *JSONPcapTranslator) translateIPv6Layer(ctx context.Context, ip *layers.
 	L3.Set(ip.Length, "len")
 	L3.Set(ip.TrafficClass, "traffic_class")
 	L3.Set(ip.FlowLabel, "flow_label")
-	L3.Set(ip.NextHeader.String(), "next_header")
 	L3.Set(ip.HopLimit, "hop_limit")
+
+	proto, _ := L3.Object("proto")
+	proto.Set(ip.NextHeader, "num")
+	proto.Set(ip.NextHeader.String(), "name")
 
 	// hashing bytes yields `uint64`, and addition is commutatie:
 	//   - so hashing the IP byte array representations and then adding then resulting `uint64`s is a commutative operation as well.
