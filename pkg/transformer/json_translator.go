@@ -492,8 +492,8 @@ func (t *JSONPcapTranslator) finalize(
 	if connTrack {
 		t.trackConnection(p, &flowID, &setFlags, json)
 	} else if setFlags == tcpRst || setFlags == tcpFinAck {
-		t.flowToTraceMap.Delete(flowID)
-		t.flowToSpanMap.Delete(flowID)
+		defer t.flowToTraceMap.Delete(flowID)
+		defer t.flowToSpanMap.Delete(flowID)
 	}
 
 	if setFlagsStr, ok := tcpFlagsStr[setFlags]; ok {
