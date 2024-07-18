@@ -581,15 +581,19 @@ func (t *JSONPcapTranslator) trackConnection(packet *gopacket.Packet, flowID *ui
 }
 
 func (t *JSONPcapTranslator) untrackFlowID(flowID *uint64) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	if ftsm, ok := t.flowToSequenceMap.Load(*flowID); ok {
 		sequences := make([]uint32, ftsm.Len())
 		index := 0
-		ftsm.Range(func(sequence uint32, _ *traceAndSpan) bool {
+		ftsm.Range(func(sequence uint32, value *traceAndSpan) bool {
 			sequences[index] = sequence
-			return true
+			t.traceToHttpRequestMap.Delete(*value.traceID)
+			index += 1
+			return index >= 0
 		})
-		for sequence := range sequences {
-			ftsm.Delete(uint32(sequence))
+		for i := index - 1; index >= 0; i-- {
+			ftsm.Delete(sequences[i])
 		}
 		t.flowsWithTrace.Remove(*flowID)
 		return t.flowToSequenceMap.Delete(*flowID)
