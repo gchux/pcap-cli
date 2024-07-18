@@ -515,7 +515,9 @@ func (t *JSONPcapTranslator) finalize(
 
 	appLayer := (*p).ApplicationLayer()
 	if setFlags == tcpPshAck && appLayer != nil {
-		if !t.trySetHTTP11(p, &setFlags, &appLayer, &flowID, &seq, json, &message) {
+		if t.trySetHTTP11(p, &setFlags, &appLayer, &flowID, &seq, json, &message) {
+			return json, nil
+		} else {
 			t.trySetTraceAndSpan(json, &flowID, &seq)
 		}
 	} else {
@@ -523,9 +525,10 @@ func (t *JSONPcapTranslator) finalize(
 	}
 
 	if setFlags == tcpFinAck || setFlags == tcpRst {
-		t.untrackFlowID(&flowID)
+		defer t.untrackFlowID(&flowID)
 	}
 
+	json.Set(message, "message")
 	return json, nil
 }
 
