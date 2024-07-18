@@ -297,26 +297,26 @@ func provideWorkerPools(ctx context.Context, transformer *PcapTransformer, numWr
 }
 
 func provideConcurrentQueue(ctx context.Context, connTrack bool, transformer *PcapTransformer, numWriters int) {
-	queueSize := 30 * numWriters
-	// when `queueSize` is greater than 1: even when written in order,
+	poolSize := 30 * numWriters
+	// when `poolSize` is greater than 1: even when written in order,
 	// packets are processed concurrently which makes connection tracking
 	// a very complex process to be done on-the-fly as order of packet translation
-	// is not guaranteed; also introducing contention may slow down the whole process.
+	// is not guaranteed; introducing contention may slow down the whole process.
 	if connTrack {
 		// if connection tracking is enabled, the whole process is synchronous,
 		// so the following considerations apply:
 		//   - should be enabled only in combination with a very specific filter
 		//   - should not be used when high traffic rate is expected:
 		//       non-concurrent processing is slower, so more memory is required to buffer packets
-		queueSize = 1
+		poolSize = 1
 	}
 
 	ochOpts := &concurrently.Options{
-		PoolSize:         queueSize,
-		OutChannelBuffer: queueSize,
+		PoolSize:         poolSize,
+		OutChannelBuffer: 100,
 	}
 
-	transformer.ich = make(chan concurrently.WorkFunction, queueSize)
+	transformer.ich = make(chan concurrently.WorkFunction, 100)
 	transformer.och = concurrently.Process(ctx, transformer.ich, ochOpts)
 }
 
@@ -378,7 +378,7 @@ func newTransformer(ctx context.Context, iface *PcapIface, writers []io.Writer, 
 
 	// `preserveOrder==true` causes writes to be sequential and blocking per `io.Writer`.
 	// `preserveOrder==true` although blocking at writting, does not cause `transformer.Apply` to block.
-	if preserveOrder {
+	if preserveOrder || connTrack {
 		provideConcurrentQueue(ctx, connTrack, transformer, numWriters)
 		go transformer.waitForContextDone(ctx)
 		go transformer.produceTranslations(ctx)

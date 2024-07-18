@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
@@ -18,6 +19,15 @@ type (
 	}
 
 	packetLayerTranslator func(context.Context, *pcapTranslatorWorker) fmt.Stringer
+
+	httpRequest struct {
+		timestamp   *time.Time
+		url, method *string
+	}
+
+	traceAndSpan struct {
+		traceID, spanID *string
+	}
 )
 
 var (
