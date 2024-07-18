@@ -526,7 +526,6 @@ func (t *JSONPcapTranslator) finalize(
 		t.untrackFlowID(&flowID)
 	}
 
-	json.Set(message, "message")
 	return json, nil
 }
 
@@ -608,14 +607,13 @@ func (t *JSONPcapTranslator) trySetTraceAndSpan(json *gabs.Container, flowID *ui
 	// an HTTP/1.1 request with a `traceID` has already been seen for this `flowID`
 	var ts, lastTS *traceAndSpan = nil, nil
 	sequenceToTraceMap.Range(func(key uint32, value *traceAndSpan) bool {
-		// Loop over the map keys (sequence numbers) until one greater than `sequence` is found.
+		// Loop over the map keys (ascending sequence numbers) until one greater than `sequence` is found.
 		// HTTP/1.1 is not multiplexed, so a new request using the same TCP connection ( i/e: pooling )
 		// should be observed (alongside its `traceID`) with a higher sequence number than the previous one;
 		// when the key (a sequence number) is greater than the current one, stop looping;
 		// the previously analyzed `key` (sequence number) must be pointing to the correct `traceID`.
-		// TL;DR: `traceID`s exist within a specific TCP sequence range which configure a boundary.
-		isSequenceGreaterThanKey := *sequence > key
-		if isSequenceGreaterThanKey {
+		// TL;DR: `traceID`s exist within a specific TCP sequence range which configures a boundary.
+		if *sequence > key {
 			ts = value
 		}
 		lastTS = value
@@ -778,7 +776,9 @@ func (t *JSONPcapTranslator) recordHTTP11Request(packet *gopacket.Packet, flowID
 }
 
 func (t *JSONPcapTranslator) linkHTTP11ResponseToRequest(packet *gopacket.Packet, flags *uint8, flowID *uint64, response *gabs.Container, traceID *string) error {
+	t.mu.Lock()
 	jsonTranslatorRequest, ok := t.traceToHttpRequestMap.Load(*traceID)
+	t.mu.Unlock()
 	if !ok {
 		return errors.New(stringFormatter.Format("no request found for trace-id: {0}", *traceID))
 	}
