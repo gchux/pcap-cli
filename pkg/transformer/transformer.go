@@ -119,6 +119,7 @@ var (
 	}
 
 	tcpSynAckStr    = tcpSynStr + "|" + tcpAckStr
+	tcpSynRstStr    = tcpSynStr + "|" + tcpRstStr
 	tcpPshAckStr    = tcpPshStr + "|" + tcpAckStr
 	tcpFinAckStr    = tcpFinStr + "|" + tcpAckStr
 	tcpRstAckStr    = tcpRstStr + "|" + tcpAckStr
@@ -126,15 +127,17 @@ var (
 	tcpSynPshAckStr = tcpSynStr + "|" + tcpPshStr + "|" + tcpAckStr
 	tcpFinRstAckStr = tcpFinStr + "|" + tcpRstStr + "|" + tcpAckStr
 
-	tcpSyn       = tcpFlags[tcpSynStr]
-	tcpAck       = tcpFlags[tcpAckStr]
-	tcpPsh       = tcpFlags[tcpPshStr]
-	tcpFin       = tcpFlags[tcpFinStr]
-	tcpRst       = tcpFlags[tcpRstStr]
-	tcpUrg       = tcpFlags[tcpUrgStr]
-	tcpEce       = tcpFlags[tcpEceStr]
-	tcpCwr       = tcpFlags[tcpCwrStr]
+	tcpSyn = tcpFlags[tcpSynStr]
+	tcpAck = tcpFlags[tcpAckStr]
+	tcpPsh = tcpFlags[tcpPshStr]
+	tcpFin = tcpFlags[tcpFinStr]
+	tcpRst = tcpFlags[tcpRstStr]
+	tcpUrg = tcpFlags[tcpUrgStr]
+	tcpEce = tcpFlags[tcpEceStr]
+	tcpCwr = tcpFlags[tcpCwrStr]
+
 	tcpSynAck    = tcpSyn | tcpAck
+	tcpSynRst    = tcpSyn | tcpRst
 	tcpPshAck    = tcpPsh | tcpAck
 	tcpFinAck    = tcpFin | tcpAck
 	tcpRstAck    = tcpRst | tcpAck
@@ -152,6 +155,7 @@ var (
 		tcpEce:       tcpEceStr,
 		tcpCwr:       tcpCwrStr,
 		tcpSynAck:    tcpSynAckStr,
+		tcpSynRst:    tcpSynRstStr,
 		tcpPshAck:    tcpPshAckStr,
 		tcpFinAck:    tcpFinAckStr,
 		tcpRstAck:    tcpRstAckStr,
@@ -211,7 +215,7 @@ func (t *PcapTransformer) consumeTranslations(ctx context.Context, index *uint8)
 			translation: translation,
 		}
 
-		if t.preserveOrder {
+		if t.preserveOrder || t.connTracking {
 			// this is mostly blocking
 			t.writeTranslation(ctx, task)
 		} else {
@@ -232,16 +236,16 @@ func (t *PcapTransformer) WaitDone() {
 	for _, writeQueue := range t.writeQueues {
 		close(writeQueue) // close writer channels
 	}
-	// if order is not enforced, there are not worker pools to be stopped
+	// if order is not enforced: there are 2 worker pools to be stopped
 	if !t.preserveOrder {
 		t.translatorPool.Release()
-		t.writerPool.ReleaseTimeout(0)
+		t.writerPool.ReleaseTimeout(5 * time.Second)
 	}
 }
 
 func (t *PcapTransformer) Apply(ctx context.Context, packet *gopacket.Packet, serial *uint64) error {
-	// It is assumed that packets will be produced faster than translations.
-	// process/translate packets concurrently in order to avoid blocking `gopacket` packets channel.
+	// It is assumed that packets will be produced faster than translations and writing operations, so:
+	//   - process/translate packets concurrently in order to avoid blocking `gopacket` packets channel as much as possible.
 	worker := newPcapTranslatorWorker(serial, packet, t.translator, t.connTracking)
 	t.wg.Add(len(t.writers))
 	return t.apply(worker)
@@ -292,23 +296,25 @@ func provideWorkerPools(ctx context.Context, transformer *PcapTransformer, numWr
 	writerPoolFn := func(i interface{}) {
 		transformer.writeTranslationFn(ctx, i)
 	}
+
+	// I/O ( writing ) is slow; so there will be more writers than translator routines
 	writerPool, _ := ants.NewMultiPoolWithFunc(numWriters, poolSize, writerPoolFn, ants.LeastTasks, poolOpt)
 	transformer.writerPool = writerPool
 }
 
 func provideConcurrentQueue(ctx context.Context, connTrack bool, transformer *PcapTransformer, numWriters int) {
-	poolSize := 30 * numWriters
-	// when `poolSize` is greater than 1: even when written in order,
-	// packets are processed concurrently which makes connection tracking
-	// a very complex process to be done on-the-fly as order of packet translation
-	// is not guaranteed; introducing contention may slow down the whole process.
-	if connTrack {
-		// if connection tracking is enabled, the whole process is synchronous,
-		// so the following considerations apply:
-		//   - should be enabled only in combination with a very specific filter
-		//   - should not be used when high traffic rate is expected:
-		//       non-concurrent processing is slower, so more memory is required to buffer packets
-		poolSize = 1
+	// if connection tracking is enabled, the whole process is synchronous,
+	// so the following considerations apply:
+	//   - should be enabled only in combination with a very specific filter
+	//   - should not be used when high traffic rate is expected:
+	//       non-concurrent processing is slower, so more memory is required to buffer packets
+	poolSize := 1
+	if !connTrack {
+		// when `poolSize` is greater than 1: even when written in order,
+		// packets are processed concurrently which makes connection tracking
+		// a very complex process to be done on-the-fly as order of packet translation
+		// is not guaranteed; introducing contention may slow down the whole process.
+		poolSize = 30 * numWriters
 	}
 
 	ochOpts := &concurrently.Options{
@@ -320,10 +326,10 @@ func provideConcurrentQueue(ctx context.Context, connTrack bool, transformer *Pc
 	transformer.och = concurrently.Process(ctx, transformer.ich, ochOpts)
 }
 
-func provideStrategy(transformer *PcapTransformer, preserveOrder bool) {
+func provideStrategy(transformer *PcapTransformer, preserveOrder, connTracking bool) {
 	var strategy func(*pcapTranslatorWorker) error
 
-	if preserveOrder {
+	if preserveOrder || connTracking {
 		// If ordered output is enabled, enqueue translation workers in packet capture order;
 		// this will introduce some level of contention as the translation Q starts to fill (saturation):
 		// if the next packet to arrive finds a full Q, this method will block until slots are available.
@@ -347,7 +353,7 @@ func provideStrategy(transformer *PcapTransformer, preserveOrder bool) {
 }
 
 // transformers get instances of `io.Writer` instead of `pcap.PcapWriter` to prevent closing.
-func newTransformer(ctx context.Context, iface *PcapIface, writers []io.Writer, format *string, preserveOrder, connTrack bool) (IPcapTransformer, error) {
+func newTransformer(ctx context.Context, iface *PcapIface, writers []io.Writer, format *string, preserveOrder, connTracking bool) (IPcapTransformer, error) {
 	pcapFmt := pcapTranslatorFmts[*format]
 	translator, err := newTranslator(iface, pcapFmt)
 	if err != nil {
@@ -370,16 +376,16 @@ func newTransformer(ctx context.Context, iface *PcapIface, writers []io.Writer, 
 		translator:    translator,
 		writers:       writers,
 		writeQueues:   writeQueues,
-		preserveOrder: preserveOrder || connTrack,
-		connTracking:  connTrack,
+		preserveOrder: preserveOrder || connTracking,
+		connTracking:  connTracking,
 	}
 
-	provideStrategy(transformer, preserveOrder)
+	provideStrategy(transformer, preserveOrder, connTracking)
 
 	// `preserveOrder==true` causes writes to be sequential and blocking per `io.Writer`.
 	// `preserveOrder==true` although blocking at writting, does not cause `transformer.Apply` to block.
-	if preserveOrder || connTrack {
-		provideConcurrentQueue(ctx, connTrack, transformer, numWriters)
+	if preserveOrder || connTracking {
+		provideConcurrentQueue(ctx, connTracking, transformer, numWriters)
 		go transformer.waitForContextDone(ctx)
 		go transformer.produceTranslations(ctx)
 	} else {
@@ -397,13 +403,13 @@ func newTransformer(ctx context.Context, iface *PcapIface, writers []io.Writer, 
 }
 
 func NewOrderedTransformer(ctx context.Context, iface *PcapIface, writers []io.Writer, format *string) (IPcapTransformer, error) {
-	return newTransformer(ctx, iface, writers, format, true /* preserveOrder */, false /* connTrack */)
+	return newTransformer(ctx, iface, writers, format, true /* preserveOrder */, false /* connTracking */)
 }
 
 func NewConnTrackTransformer(ctx context.Context, iface *PcapIface, writers []io.Writer, format *string) (IPcapTransformer, error) {
-	return newTransformer(ctx, iface, writers, format, true /* preserveOrder */, true /* connTrack */)
+	return newTransformer(ctx, iface, writers, format, true /* preserveOrder */, true /* connTracking */)
 }
 
 func NewTransformer(ctx context.Context, iface *PcapIface, writers []io.Writer, format *string) (IPcapTransformer, error) {
-	return newTransformer(ctx, iface, writers, format, false /* preserveOrder */, false /* connTrack */)
+	return newTransformer(ctx, iface, writers, format, false /* preserveOrder */, false /* connTracking */)
 }

@@ -54,6 +54,9 @@ func (t *JSONPcapTranslator) translate(packet *gopacket.Packet) error {
 
 // return pointer to `struct` `gabs.Container`
 func (t *JSONPcapTranslator) next(ctx context.Context, serial *uint64, packet *gopacket.Packet) fmt.Stringer {
+	flowID := fnv1a.AddUint64(fnv1a.Init64, uint64(t.iface.Index))
+	flowIDstr := strconv.FormatUint(flowID, 10)
+
 	json := gabs.New()
 
 	id := ctx.Value(ContextID)
@@ -71,6 +74,7 @@ func (t *JSONPcapTranslator) next(ctx context.Context, serial *uint64, packet *g
 	meta.Set(metadata.Truncated, "trunc")
 	meta.Set(info.Length, "len")
 	meta.Set(info.CaptureLength, "cap_len")
+	meta.Set(flowIDstr, "flow")
 
 	metaTimestamp, _ := meta.Object("timestamp")
 	metaTimestamp.Set(info.Timestamp.String(), "str")
@@ -87,8 +91,6 @@ func (t *JSONPcapTranslator) next(ctx context.Context, serial *uint64, packet *g
 	for i, addr := range t.iface.Addrs {
 		addrs.SetIndex(addr.IP.String(), i)
 	}
-
-	json.Set(fnv1a.AddUint64(fnv1a.Init64, uint64(t.iface.Index)), "flow")
 
 	labels, _ := json.Object("logging.googleapis.com/labels")
 	labels.Set("pcap", "tools.chux.dev/tool")
@@ -197,8 +199,11 @@ func (t *JSONPcapTranslator) translateUDPLayer(ctx context.Context, udp *layers.
 		L4.Set(name, "dproto")
 	}
 
-	// `SrcPort` and `DstPort` are `uint8`
-	L4.Set(fnv1a.HashUint64(17+uint64(udp.SrcPort)+uint64(udp.DstPort)), "flow") // UDP(17) (0x11)
+	// UDP(17) (0x11) | `SrcPort` and `DstPort` are `uint8`
+	flowID := fnv1a.HashUint64(17 + uint64(udp.SrcPort) + uint64(udp.DstPort))
+	flowIDstr := strconv.FormatUint(flowID, 10)
+
+	L4.Set(flowIDstr, "flow")
 
 	return json
 }
@@ -273,8 +278,12 @@ func (t *JSONPcapTranslator) translateTCPLayer(ctx context.Context, tcp *layers.
 		L4.Set(name, "dproto")
 	}
 
+	// TCP(6) (0x06) | `SrcPort` and `DstPort` are `uint8`
+	flowID := fnv1a.HashUint64(6 + uint64(tcp.SrcPort) + uint64(tcp.DstPort))
+	flowIDstr := strconv.FormatUint(flowID, 10)
+
 	// `SrcPort` and `DstPort` are `uint8`
-	L4.Set(fnv1a.HashUint64(6+uint64(tcp.SrcPort)+uint64(tcp.DstPort)), "flow") // TCP(6) (0x06)
+	L4.Set(flowIDstr, "flow")
 
 	return json
 }
@@ -408,7 +417,7 @@ func (t *JSONPcapTranslator) finalize(
 	ctx context.Context,
 	serial *uint64,
 	p *gopacket.Packet,
-	connTrack bool,
+	conntrack bool,
 	packet fmt.Stringer,
 ) (fmt.Stringer, error) {
 	json := t.asTranslation(packet)
@@ -443,7 +452,7 @@ func (t *JSONPcapTranslator) finalize(
 	// Addition is commutative, so after hashing `net.IP` bytes and L4 ports to `uint64`,
 	// the same `uint64`/`flowID` is produced after adding everything up, no matter the order.
 	// Using the same `flowID` will produce grouped logs in Cloud Logging.
-	flowID, _ := json.Path("flow").Data().(uint64) // this is always available
+	flowID, _ := json.Path("meta.flow").Data().(uint64) // this is always available
 	if l3FlowID, l3OK := json.Path("L3.flow").Data().(uint64); l3OK {
 		flowID = fnv1a.AddUint64(flowID, l3FlowID)
 	}
@@ -452,9 +461,10 @@ func (t *JSONPcapTranslator) finalize(
 	} else {
 		flowID = fnv1a.AddUint64(flowID, 255) // RESERVED (0xFF)
 	}
+	flowIDstr := strconv.FormatUint(flowID, 10)
 
-	data["flowID"] = flowID
-	json.Set(flowID, "flow")
+	data["flowID"] = flowIDstr
+	json.Set(flowIDstr, "flow")
 
 	if !isTCP && !isUDP {
 		operation.Set(stringFormatter.Format(jsonTranslationFlowTemplate, id, t.iface.Name, "x", flowID), "id")
@@ -489,7 +499,7 @@ func (t *JSONPcapTranslator) finalize(
 
 	setFlags, _ := json.Path("L4.flags.dec").Data().(uint8)
 
-	if connTrack {
+	if conntrack {
 		t.trackConnection(p, &flowID, &setFlags, json)
 	}
 
@@ -525,7 +535,7 @@ func (t *JSONPcapTranslator) finalize(
 	}
 
 	if setFlags == tcpFinAck || setFlags == tcpRst {
-		defer t.untrackFlowID(&flowID)
+		defer t.untrackConnection(&flowID)
 	}
 
 	json.Set(message, "message")
@@ -576,21 +586,23 @@ func (t *JSONPcapTranslator) trackConnection(packet *gopacket.Packet, flowID *ui
 
 	if shouldRemoveTracking {
 		t.flowToTimestamp.Delete(fid)
-		go t.untrackFlowID(flowID)
+		go t.untrackConnection(flowID)
 	}
 }
 
-func (t *JSONPcapTranslator) untrackFlowID(flowID *uint64) bool {
+func (t *JSONPcapTranslator) untrackConnection(flowID *uint64) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+
 	if ftsm, ok := t.flowToSequenceMap.Load(*flowID); ok {
 		sequences := make([]uint32, ftsm.Len())
 		index := 0
 		ftsm.Range(func(sequence uint32, value *traceAndSpan) bool {
 			sequences[index] = sequence
+			// remove orphaned `traceID`s:
 			t.traceToHttpRequestMap.Delete(*value.traceID)
 			index += 1
-			return index >= 0
+			return true
 		})
 		for i := index - 1; index >= 0; i-- {
 			ftsm.Delete(sequences[i])
@@ -604,6 +616,7 @@ func (t *JSONPcapTranslator) untrackFlowID(flowID *uint64) bool {
 func (t *JSONPcapTranslator) trySetTraceAndSpan(json *gabs.Container, flowID *uint64, sequence *uint32) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+
 	sequenceToTraceMap, ok := t.flowToSequenceMap.Load(*flowID)
 
 	// no HTTP/1.1 request with a `traceID` has been seen for this `flowID`
@@ -619,7 +632,7 @@ func (t *JSONPcapTranslator) trySetTraceAndSpan(json *gabs.Container, flowID *ui
 		// should be observed (alongside its `traceID`) with a higher sequence number than the previous one;
 		// when the key (a sequence number) is greater than the current one, stop looping;
 		// the previously analyzed `key` (sequence number) must be pointing to the correct `traceID`.
-		// TL;DR: `traceID`s exist within a specific TCP sequence range which configures a boundary.
+		// TL;DR: `traceID`s exist within a specific TCP sequence range, which configures a boundary.
 		if *sequence > key {
 			ts = value
 		}
@@ -630,7 +643,7 @@ func (t *JSONPcapTranslator) trySetTraceAndSpan(json *gabs.Container, flowID *ui
 	// TCP sequence number is `uint32` so it is possible
 	// for for it to be rolled over if it gets too big.
 	// In such case `sequence` was not greater than any `key` in the map,
-	// so the last visited `key` must be pointing to the correct `traceID`
+	// so the last visited `key` might be pointing to the correct `traceID`
 	if ts == nil {
 		ts = lastTS
 	}
@@ -649,6 +662,9 @@ func (t *JSONPcapTranslator) trySetHTTP11(
 	json *gabs.Container,
 	message *string,
 ) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
 	appLayerData := (*appLayer).LayerContents()
 
 	isHTTP11Request := http11RequestPayloadRegex.Match(appLayerData)
@@ -769,7 +785,6 @@ func (t *JSONPcapTranslator) recordHTTP11Request(packet *gopacket.Packet, flowID
 	t.traceToHttpRequestMap.SetIfAbsent(*traceID, _httpRequest)
 
 	var sequenceToTraceMap *skipmap.Uint32Map[*traceAndSpan] = nil
-	t.mu.Lock()
 	if ftsm, ok := t.flowToSequenceMap.Load(*flowID); ok {
 		sequenceToTraceMap = ftsm
 	} else {
@@ -777,15 +792,11 @@ func (t *JSONPcapTranslator) recordHTTP11Request(packet *gopacket.Packet, flowID
 		sequenceToTraceMap = skipmap.NewUint32[*traceAndSpan]()
 		t.flowToSequenceMap.Store(*flowID, sequenceToTraceMap)
 	}
-	// [ToDo]: store a pointer to a `struct` with both: `traceID` and `spanID`
 	sequenceToTraceMap.Store(*sequence, &traceAndSpan{traceID, spanID})
-	t.mu.Unlock()
 }
 
 func (t *JSONPcapTranslator) linkHTTP11ResponseToRequest(packet *gopacket.Packet, flags *uint8, flowID *uint64, response *gabs.Container, traceID *string) error {
-	t.mu.Lock()
 	jsonTranslatorRequest, ok := t.traceToHttpRequestMap.Load(*traceID)
-	t.mu.Unlock()
 	if !ok {
 		return errors.New(stringFormatter.Format("no request found for trace-id: {0}", *traceID))
 	}
@@ -801,9 +812,9 @@ func (t *JSONPcapTranslator) linkHTTP11ResponseToRequest(packet *gopacket.Packet
 	request.Set(requestTimestamp.String(), "timestamp")
 	request.Set(latency.Milliseconds(), "latency")
 
-	if !t.traceToHttpRequestMap.Delete(*traceID) {
-		return errors.New(stringFormatter.Format("failed to delete request with trace-id: {0}", *traceID))
-	}
+	// intentionally not removing from `traceToHttpRequestMap`:
+	//   - it will be done by `untrackConnection` on `RST` or `FIN+ACK`
+	//   - allows to link multiple `traceID`s with the same flow
 	return nil
 }
 
@@ -826,9 +837,9 @@ func (t *JSONPcapTranslator) getTraceAndSpan(rawTraceAndSpan *string) []string {
 	return nil
 }
 
-func (t *JSONPcapTranslator) setTraceAndSpan(json *gabs.Container, trace, span *string) {
-	json.Set(cloudTracePrefix+*trace, "logging.googleapis.com/trace")
-	json.Set(*span, "logging.googleapis.com/spanId")
+func (t *JSONPcapTranslator) setTraceAndSpan(json *gabs.Container, traceID, spanID *string) {
+	json.Set(cloudTracePrefix+*traceID, "logging.googleapis.com/trace")
+	json.Set(*spanID, "logging.googleapis.com/spanId")
 	json.Set(true, "logging.googleapis.com/trace_sampled")
 }
 
@@ -869,7 +880,7 @@ func newJSONPcapTranslator(iface *PcapIface) *JSONPcapTranslator {
 		csmap.WithSize[string, *httpRequest](1000),
 	)
 
-	flowToTimestamp := csmap.Create[uint64, *time.Time](
+	flowToTimestamp := csmap.Create(
 		csmap.WithShardCount[uint64, *time.Time](32),
 		csmap.WithCustomHasher[uint64, *time.Time](func(key uint64) uint64 { return key }),
 		csmap.WithSize[uint64, *time.Time](1000),

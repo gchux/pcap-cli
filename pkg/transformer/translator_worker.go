@@ -15,7 +15,7 @@ type (
 		serial     *uint64
 		packet     *gopacket.Packet
 		translator PcapTranslator
-		connTrack  bool
+		conntrack  bool
 	}
 
 	packetLayerTranslator func(context.Context, *pcapTranslatorWorker) fmt.Stringer
@@ -162,7 +162,8 @@ func (w *pcapTranslatorWorker) Run(ctx context.Context) interface{} {
 	}()
 
 	for _, translators := range packetLayerTranslators {
-		// translate layers concurrently
+		// translate layers concurrently:
+		//   - layers should know nothing about each other
 		go func(translators []packetLayerTranslator) {
 			for _, translator := range translators {
 				if t := translator(ctx, w); t != nil {
@@ -181,7 +182,8 @@ func (w *pcapTranslatorWorker) Run(ctx context.Context) interface{} {
 		}
 	}
 
-	buffer, _ = w.translator.finalize(ctx, w.serial, w.packet, w.connTrack, buffer)
+	// `finalize` is the only method that works across layers
+	buffer, _ = w.translator.finalize(ctx, w.serial, w.packet, w.conntrack, buffer)
 
 	return &buffer
 }
@@ -196,7 +198,7 @@ func newPcapTranslatorWorker(
 		serial:     serial,
 		packet:     packet,
 		translator: translator,
-		connTrack:  connTrack,
+		conntrack:  connTrack,
 	}
 	return worker
 }
