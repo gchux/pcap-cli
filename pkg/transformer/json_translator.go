@@ -617,6 +617,7 @@ func (t *JSONPcapTranslator) trySetTraceAndSpan(json *gabs.Container, flowID *ui
 	if lock {
 		// this is necessary because:
 		//   - `trySetHTTP11` will attempt to set `traceID` by TCP sequence if HTTP Reqponse does not contain trace headers
+		//     - in such scenario: `trySetHTTP11` already has the lock so locking again must be skipped to prevent a deadlock
 		t.mu.Lock()
 		defer t.mu.Unlock()
 	}
@@ -667,7 +668,6 @@ func (t *JSONPcapTranslator) trySetHTTP11(
 	message *string,
 ) bool {
 	t.mu.Lock()
-	defer t.mu.Unlock()
 
 	appLayerData := (*appLayer).LayerContents()
 
