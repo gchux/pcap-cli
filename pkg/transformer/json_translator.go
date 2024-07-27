@@ -668,6 +668,7 @@ func (t *JSONPcapTranslator) trySetHTTP11(
 	message *string,
 ) bool {
 	t.mu.Lock()
+	defer t.mu.Unlock()
 
 	appLayerData := (*appLayer).LayerContents()
 
