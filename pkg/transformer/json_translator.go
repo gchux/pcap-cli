@@ -528,10 +528,10 @@ func (t *JSONPcapTranslator) finalize(
 		if t.trySetHTTP11(p, &setFlags, &appLayer, &flowID, &seq, json, &message) {
 			return json, nil
 		} else {
-			t.trySetTraceAndSpan(json, &flowID, &seq)
+			t.trySetTraceAndSpan(json, &flowID, &seq, true)
 		}
 	} else {
-		t.trySetTraceAndSpan(json, &flowID, &seq)
+		t.trySetTraceAndSpan(json, &flowID, &seq, true)
 	}
 
 	if setFlags == tcpFinAck || setFlags == tcpRst {
@@ -613,9 +613,13 @@ func (t *JSONPcapTranslator) untrackConnection(flowID *uint64) bool {
 	return false
 }
 
-func (t *JSONPcapTranslator) trySetTraceAndSpan(json *gabs.Container, flowID *uint64, sequence *uint32) (*traceAndSpan, bool) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+func (t *JSONPcapTranslator) trySetTraceAndSpan(json *gabs.Container, flowID *uint64, sequence *uint32, lock bool) (*traceAndSpan, bool) {
+	if lock {
+		// this is necessary because:
+		//   - `trySetHTTP11` will attempt to set `traceID` by TCP sequence if HTTP Reqponse does not contain trace headers
+		t.mu.Lock()
+		defer t.mu.Unlock()
+	}
 
 	sequenceToTraceMap, ok := t.flowToSequenceMap.Load(*flowID)
 
@@ -716,7 +720,7 @@ func (t *JSONPcapTranslator) trySetHTTP11(
 				if err := t.linkHTTP11ResponseToRequest(packet, tcpFlags, flowID, L7, &traceAndSpan[0]); err != nil {
 					io.WriteString(os.Stderr, err.Error())
 				}
-			} else if ts, ok := t.trySetTraceAndSpan(json, flowID, sequence); ok {
+			} else if ts, ok := t.trySetTraceAndSpan(json, flowID, sequence, false /* lock */); ok {
 				t.linkHTTP11ResponseToRequest(packet, tcpFlags, flowID, L7, ts.traceID)
 			}
 			json.Set(stringFormatter.Format("{0} | {1} {2}", *message, response.Proto, response.Status), "message")
@@ -772,7 +776,7 @@ func (t *JSONPcapTranslator) trySetHTTP11(
 		if err := t.linkHTTP11ResponseToRequest(packet, tcpFlags, flowID, L7, &traceAndSpan[0]); err != nil {
 			io.WriteString(os.Stderr, err.Error())
 		}
-	} else if ts, ok := t.trySetTraceAndSpan(json, flowID, sequence); ok {
+	} else if ts, ok := t.trySetTraceAndSpan(json, flowID, sequence, false /* lock */); ok {
 		t.linkHTTP11ResponseToRequest(packet, tcpFlags, flowID, L7, ts.traceID)
 	}
 	return true
