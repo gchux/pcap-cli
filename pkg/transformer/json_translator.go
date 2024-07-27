@@ -719,7 +719,7 @@ func (t *JSONPcapTranslator) trySetHTTP11(
 				// include trace and span id for traceability
 				t.setTraceAndSpan(json, &traceAndSpan[0], &traceAndSpan[1])
 				if err := t.linkHTTP11ResponseToRequest(packet, tcpFlags, flowID, L7, &traceAndSpan[0]); err != nil {
-					io.WriteString(os.Stderr, err.Error())
+					io.WriteString(os.Stderr, err.Error()+"\n")
 				}
 			} else if ts, ok := t.trySetTraceAndSpan(json, flowID, sequence, false /* lock */); ok {
 				t.linkHTTP11ResponseToRequest(packet, tcpFlags, flowID, L7, ts.traceID)
@@ -775,7 +775,7 @@ func (t *JSONPcapTranslator) trySetHTTP11(
 	L7.Set(responseParts[2], "status")
 	if traceAndSpan != nil {
 		if err := t.linkHTTP11ResponseToRequest(packet, tcpFlags, flowID, L7, &traceAndSpan[0]); err != nil {
-			io.WriteString(os.Stderr, err.Error())
+			io.WriteString(os.Stderr, err.Error()+"\n")
 		}
 	} else if ts, ok := t.trySetTraceAndSpan(json, flowID, sequence, false /* lock */); ok {
 		t.linkHTTP11ResponseToRequest(packet, tcpFlags, flowID, L7, ts.traceID)
