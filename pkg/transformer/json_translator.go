@@ -528,10 +528,10 @@ func (t *JSONPcapTranslator) finalize(
 		if t.trySetHTTP11(p, &setFlags, &appLayer, &flowID, &seq, json, &message) {
 			return json, nil
 		} else {
-			t.trySetTraceAndSpan(json, &flowID, &seq, true)
+			t.trySetTraceAndSpan(json, &flowID, &seq, true /* lock */)
 		}
 	} else {
-		t.trySetTraceAndSpan(json, &flowID, &seq, true)
+		t.trySetTraceAndSpan(json, &flowID, &seq, true /* lock */)
 	}
 
 	if setFlags == tcpFinAck || setFlags == tcpRst {
@@ -702,14 +702,7 @@ func (t *JSONPcapTranslator) trySetHTTP11(
 				t.setTraceAndSpan(json, &traceAndSpan[0], &traceAndSpan[1])
 				t.recordHTTP11Request(packet, flowID, sequence, &traceAndSpan[0], &traceAndSpan[1], &request.Method, &request.Host, &url)
 			}
-			bodyBytes, err := io.ReadAll(request.Body)
-			if err == nil {
-				bodyJSON, _ := L7.Object("body")
-				bodyLengthJSON, _ := bodyJSON.ArrayOfSize(2, "length")
-				bodyLengthJSON.SetIndex(len(bodyBytes), 0)
-				bodyLengthJSON.SetIndex(request.ContentLength, 1)
-				bodyJSON.Set(string(bodyBytes), "content")
-			}
+			t.addHTTP11BodyDetails(L7, &request.ContentLength, request.Body)
 			json.Set(stringFormatter.Format("{0} | {1} {2} {3}", *message, request.Proto, request.Method, url), "message")
 			return true
 		}
@@ -732,6 +725,7 @@ func (t *JSONPcapTranslator) trySetHTTP11(
 			} else if ts, ok := t.trySetTraceAndSpan(json, flowID, sequence, false /* lock */); ok {
 				t.linkHTTP11ResponseToRequest(packet, tcpFlags, flowID, L7, ts.traceID)
 			}
+			t.addHTTP11BodyDetails(L7, &response.ContentLength, response.Body)
 			json.Set(stringFormatter.Format("{0} | {1} {2}", *message, response.Proto, response.Status), "message")
 			return true
 		}
@@ -757,6 +751,13 @@ func (t *JSONPcapTranslator) trySetHTTP11(
 		}
 	}
 
+	bodyJSON, _ := L7.Object("body")
+	sizeOfBody := len(dataBytes[1])
+	bodyJSON.Set(sizeOfBody, "length")
+	if sizeOfBody > 0 {
+		bodyJSON.Set(string(dataBytes[1]), "data")
+	}
+
 	line := string(parts[0])
 	L7.Set(line, "line")
 	json.Set(stringFormatter.Format("{0} | {1}", *message, line), "message")
@@ -769,9 +770,6 @@ func (t *JSONPcapTranslator) trySetHTTP11(
 		if traceAndSpan != nil {
 			t.recordHTTP11Request(packet, flowID, sequence, &traceAndSpan[0], &traceAndSpan[1], &requestParts[1], &host, &requestParts[2])
 		}
-		bodyJSON, _ := L7.Object("body")
-		bodyJSON.Set(len(dataBytes[1]), "length")
-		bodyJSON.Set(string(dataBytes[1]), "content")
 		return true
 	}
 
@@ -791,6 +789,24 @@ func (t *JSONPcapTranslator) trySetHTTP11(
 		t.linkHTTP11ResponseToRequest(packet, tcpFlags, flowID, L7, ts.traceID)
 	}
 	return true
+}
+
+func (t *JSONPcapTranslator) addHTTP11BodyDetails(L7 *gabs.Container, length *int64, body io.Reader) {
+	bodyBytes, err := io.ReadAll(body)
+	if err != nil {
+		return
+	}
+
+	bodyJSON, _ := L7.Object("body")
+
+	sizeOfBody := len(bodyBytes)
+	bodyLengthJSON, _ := bodyJSON.ArrayOfSize(2, "length")
+	bodyLengthJSON.SetIndex(sizeOfBody, 0)
+	bodyLengthJSON.SetIndex(*length, 1)
+
+	if sizeOfBody > 0 {
+		bodyJSON.Set(string(bodyBytes), "data")
+	}
 }
 
 func (t *JSONPcapTranslator) recordHTTP11Request(packet *gopacket.Packet, flowID *uint64, sequence *uint32, traceID, spanID, method, host, url *string) {
