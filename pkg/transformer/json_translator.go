@@ -148,7 +148,9 @@ func (t *JSONPcapTranslator) translateIPv4Layer(ctx context.Context, ip *layers.
 
 	// hashing bytes yields `uint64`, and addition is commutatie:
 	//   - so hashing the IP byte array representations and then adding then resulting `uint64`s is a commutative operation as well.
-	L3.Set(fnv1a.HashUint64(4+fnv1a.HashBytes64(ip.SrcIP.To4())+fnv1a.HashBytes64(ip.DstIP.To4())), "flow") // IPv4(4) (0x04)
+	flowID := fnv1a.HashUint64(4 + fnv1a.HashBytes64(ip.SrcIP.To4()) + fnv1a.HashBytes64(ip.DstIP.To4()))
+	flowIDstr := strconv.FormatUint(flowID, 10)
+	L3.Set(flowIDstr, "flow") // IPv4(4) (0x04)
 
 	return json
 }
@@ -173,7 +175,9 @@ func (t *JSONPcapTranslator) translateIPv6Layer(ctx context.Context, ip *layers.
 
 	// hashing bytes yields `uint64`, and addition is commutatie:
 	//   - so hashing the IP byte array representations and then adding then resulting `uint64`s is a commutative operation as well.
-	L3.Set(fnv1a.HashUint64(41+fnv1a.HashBytes64(ip.SrcIP.To16())+fnv1a.HashBytes64(ip.DstIP.To16())), "flow") // IPv6(41) (0x29)
+	flowID := fnv1a.HashUint64(41 + fnv1a.HashBytes64(ip.SrcIP.To16()) + fnv1a.HashBytes64(ip.DstIP.To16()))
+	flowIDstr := strconv.FormatUint(flowID, 10)
+	L3.Set(flowIDstr, "flow") // IPv6(41) (0x29)
 
 	// missing `HopByHop`: https://github.com/google/gopacket/blob/master/layers/ip6.go#L40
 	return json
@@ -202,7 +206,6 @@ func (t *JSONPcapTranslator) translateUDPLayer(ctx context.Context, udp *layers.
 	// UDP(17) (0x11) | `SrcPort` and `DstPort` are `uint8`
 	flowID := fnv1a.HashUint64(17 + uint64(udp.SrcPort) + uint64(udp.DstPort))
 	flowIDstr := strconv.FormatUint(flowID, 10)
-
 	L4.Set(flowIDstr, "flow")
 
 	return json
@@ -281,8 +284,6 @@ func (t *JSONPcapTranslator) translateTCPLayer(ctx context.Context, tcp *layers.
 	// TCP(6) (0x06) | `SrcPort` and `DstPort` are `uint8`
 	flowID := fnv1a.HashUint64(6 + uint64(tcp.SrcPort) + uint64(tcp.DstPort))
 	flowIDstr := strconv.FormatUint(flowID, 10)
-
-	// `SrcPort` and `DstPort` are `uint8`
 	L4.Set(flowIDstr, "flow")
 
 	return json
@@ -452,22 +453,25 @@ func (t *JSONPcapTranslator) finalize(
 	// Addition is commutative, so after hashing `net.IP` bytes and L4 ports to `uint64`,
 	// the same `uint64`/`flowID` is produced after adding everything up, no matter the order.
 	// Using the same `flowID` will produce grouped logs in Cloud Logging.
-	flowID, _ := json.Path("meta.flow").Data().(uint64) // this is always available
-	if l3FlowID, l3OK := json.Path("L3.flow").Data().(uint64); l3OK {
+	flowIDstr, _ := json.Path("meta.flow").Data().(string) // this is always available
+	flowID, _ := strconv.ParseUint(flowIDstr, 10, 64)
+	if l3FlowIDstr, l3OK := json.Path("L3.flow").Data().(string); l3OK {
+		l3FlowID, _ := strconv.ParseUint(l3FlowIDstr, 10, 64)
 		flowID = fnv1a.AddUint64(flowID, l3FlowID)
 	}
-	if l4FlowID, l4OK := json.Path("L4.flow").Data().(uint64); l4OK {
+	if l4FlowIDstr, l4OK := json.Path("L4.flow").Data().(string); l4OK {
+		l4FlowID, _ := strconv.ParseUint(l4FlowIDstr, 10, 64)
 		flowID = fnv1a.AddUint64(flowID, l4FlowID)
 	} else {
 		flowID = fnv1a.AddUint64(flowID, 255) // RESERVED (0xFF)
 	}
-	flowIDstr := strconv.FormatUint(flowID, 10)
+	flowIDstr = strconv.FormatUint(flowID, 10)
 
 	data["flowID"] = flowIDstr
 	json.Set(flowIDstr, "flow")
 
 	if !isTCP && !isUDP {
-		operation.Set(stringFormatter.Format(jsonTranslationFlowTemplate, id, t.iface.Name, "x", flowID), "id")
+		operation.Set(stringFormatter.Format(jsonTranslationFlowTemplate, id, t.iface.Name, "x", flowIDstr), "id")
 		json.Set(stringFormatter.FormatComplex(jsonTranslationSummaryWithoutL4, data), "message")
 		return json, nil
 	}
@@ -484,7 +488,7 @@ func (t *JSONPcapTranslator) finalize(
 		data["L4Src"] = uint16(srcPort)
 		dstPort, _ := json.Path("L4.dst").Data().(layers.UDPPort)
 		data["L4Dst"] = uint16(dstPort)
-		operation.Set(stringFormatter.Format(jsonTranslationFlowTemplate, id, t.iface.Name, "udp", flowID), "id")
+		operation.Set(stringFormatter.Format(jsonTranslationFlowTemplate, id, t.iface.Name, "udp", flowIDstr), "id")
 		json.Set(stringFormatter.FormatComplex(jsonTranslationSummaryUDP, data), "message")
 		return json, nil
 	}
@@ -495,7 +499,7 @@ func (t *JSONPcapTranslator) finalize(
 	dstPort, _ := json.Path("L4.dst").Data().(layers.TCPPort)
 	data["L4Dst"] = uint16(dstPort)
 
-	operation.Set(stringFormatter.Format(jsonTranslationFlowTemplate, id, t.iface.Name, "tcp", flowID), "id")
+	operation.Set(stringFormatter.Format(jsonTranslationFlowTemplate, id, t.iface.Name, "tcp", flowIDstr), "id")
 
 	setFlags, _ := json.Path("L4.flags.dec").Data().(uint8)
 
