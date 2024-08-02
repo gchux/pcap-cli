@@ -702,6 +702,14 @@ func (t *JSONPcapTranslator) trySetHTTP11(
 				t.setTraceAndSpan(json, &traceAndSpan[0], &traceAndSpan[1])
 				t.recordHTTP11Request(packet, flowID, sequence, &traceAndSpan[0], &traceAndSpan[1], &request.Method, &request.Host, &url)
 			}
+			bodyBytes, err := io.ReadAll(request.Body)
+			if err == nil {
+				bodyJSON, _ := L7.Object("body")
+				bodyLengthJSON, _ := bodyJSON.ArrayOfSize(2, "length")
+				bodyLengthJSON.SetIndex(len(bodyBytes), 0)
+				bodyLengthJSON.SetIndex(request.ContentLength, 1)
+				bodyJSON.Set(string(bodyBytes), "content")
+			}
 			json.Set(stringFormatter.Format("{0} | {1} {2} {3}", *message, request.Proto, request.Method, url), "message")
 			return true
 		}
@@ -730,10 +738,9 @@ func (t *JSONPcapTranslator) trySetHTTP11(
 	}
 
 	// fallback to a minimal (naive) attempt to parse HTTP/1.1
-	//   - intentionally dropping HTTP request/response payload
 	// see: https://www.rfc-editor.org/rfc/rfc7540#section-8.1.3
-	dataBytes := bytes.SplitN(appLayerData, http11BodySeparator, 2)[0]
-	parts := bytes.Split(dataBytes, http11Separator)
+	dataBytes := bytes.SplitN(appLayerData, http11BodySeparator, 2)
+	parts := bytes.Split(dataBytes[0], http11Separator)
 
 	var traceAndSpan []string = nil
 
@@ -762,6 +769,9 @@ func (t *JSONPcapTranslator) trySetHTTP11(
 		if traceAndSpan != nil {
 			t.recordHTTP11Request(packet, flowID, sequence, &traceAndSpan[0], &traceAndSpan[1], &requestParts[1], &host, &requestParts[2])
 		}
+		bodyJSON, _ := L7.Object("body")
+		bodyJSON.Set(len(dataBytes[1]), "length")
+		bodyJSON.Set(string(dataBytes[1]), "content")
 		return true
 	}
 
