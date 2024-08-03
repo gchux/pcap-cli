@@ -3,4 +3,5 @@
 **/Taskfile.yaml
 **/README.md
 **/.task
+**/release
 Dockerfile
