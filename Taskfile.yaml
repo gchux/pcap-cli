@@ -30,8 +30,8 @@ tasks:
     dotenv: ['.env']
     cmds:
       - task: clean
-      - task: proto-gen
       - task: go-fmt
+      - task: proto-gen
       - task: go-gen
       - >-
         go build
@@ -48,9 +48,10 @@ tasks:
   docker-build:
     cmds:
       - task: clean
-      - task: go-fmt
+      - task: proto-gen
       - >-
         docker buildx build
+        --platform=linux/amd64
         --no-cache --file=Dockerfile
         --output={{.USER_WORKING_DIR}}/bin
         --target=releaser {{.USER_WORKING_DIR}}
