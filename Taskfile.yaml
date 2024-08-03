@@ -38,6 +38,10 @@ tasks:
         -o bin/$PCAP_BIN_NAME
         {{if .VERBOSE}}-v -a{{end}}
         cmd/pcap.go
+    sources:
+      - ./**/*.go
+    generates:
+      - ./release/bin/pcap
 
   dist:
     cmds:
@@ -53,5 +57,10 @@ tasks:
         docker buildx build
         --platform=linux/amd64
         --no-cache --file=Dockerfile
-        --output={{.USER_WORKING_DIR}}/bin
+        --build-arg="BIN_NAME=$PCAP_BIN_NAME"
+        --output={{.USER_WORKING_DIR}}/release
         --target=releaser {{.USER_WORKING_DIR}}
+    sources:
+      - ./**/*.go
+    generates:
+      - ./release/bin/pcap

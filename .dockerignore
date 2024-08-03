@@ -2,4 +2,5 @@
 **/.gitignore
 **/Taskfile.yaml
 **/README.md
+**/.task
 Dockerfile
