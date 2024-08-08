@@ -679,15 +679,20 @@ func (t *JSONPcapTranslator) trySetHTTP11(
 	isHTTP11Request := http11RequestPayloadRegex.Match(appLayerData)
 	isHTTP11Response := !isHTTP11Request && http11ResponsePayloadRegex.Match(appLayerData)
 
+	L7, _ := json.Object("L7")
+
 	// if content is not HTTP in clear text, abort
 	if !isHTTP11Request && !isHTTP11Response {
+		data, _ := L7.Object("data")
+		data.Set(len(appLayerData), "length")
+		data.Set(string(appLayerData), "content")
 		json.Set(*message, "message")
 		return false
 	}
 	// making at least 1 big assumption:
 	//   HTTP request/status line and headers fit in 1 packet
 	//     which is not always the case when fragmentation occurs
-	L7, _ := json.Object("L7")
+	_http, _ := L7.Object("http")
 
 	httpDataReader := bufio.NewReaderSize(bytes.NewReader(appLayerData), len(appLayerData))
 
@@ -695,18 +700,18 @@ func (t *JSONPcapTranslator) trySetHTTP11(
 	if isHTTP11Request {
 		request, err := http.ReadRequest(httpDataReader)
 		if err == nil {
-			L7.Set("request", "kind")
+			_http.Set("request", "kind")
 			url := request.URL.String()
-			L7.Set(url, "url")
-			L7.Set(request.Proto, "proto")
-			L7.Set(request.Method, "method")
-			if traceAndSpan := t.setHTTPHeaders(L7, &request.Header); traceAndSpan != nil {
+			_http.Set(url, "url")
+			_http.Set(request.Proto, "proto")
+			_http.Set(request.Method, "method")
+			if traceAndSpan := t.setHTTPHeaders(_http, &request.Header); traceAndSpan != nil {
 				t.flowsWithTrace.Add(*flowID)
 				// include trace and span id for traceability
 				t.setTraceAndSpan(json, &traceAndSpan[0], &traceAndSpan[1])
 				t.recordHTTP11Request(packet, flowID, sequence, &traceAndSpan[0], &traceAndSpan[1], &request.Method, &request.Host, &url)
 			}
-			t.addHTTP11BodyDetails(L7, &request.ContentLength, request.Body)
+			t.addHTTP11BodyDetails(_http, &request.ContentLength, request.Body)
 			json.Set(stringFormatter.Format("{0} | {1} {2} {3}", *message, request.Proto, request.Method, url), "message")
 			return true
 		}
@@ -716,11 +721,11 @@ func (t *JSONPcapTranslator) trySetHTTP11(
 	if isHTTP11Response {
 		response, err := http.ReadResponse(httpDataReader, nil)
 		if err == nil {
-			L7.Set("response", "kind")
-			L7.Set(response.Proto, "proto")
-			L7.Set(response.StatusCode, "code")
-			L7.Set(response.Status, "status")
-			if traceAndSpan := t.setHTTPHeaders(L7, &response.Header); traceAndSpan != nil {
+			_http.Set("response", "kind")
+			_http.Set(response.Proto, "proto")
+			_http.Set(response.StatusCode, "code")
+			_http.Set(response.Status, "status")
+			if traceAndSpan := t.setHTTPHeaders(_http, &response.Header); traceAndSpan != nil {
 				// include trace and span id for traceability
 				t.setTraceAndSpan(json, &traceAndSpan[0], &traceAndSpan[1])
 				if err := t.linkHTTP11ResponseToRequest(packet, tcpFlags, flowID, L7, &traceAndSpan[0]); err != nil {
@@ -729,7 +734,7 @@ func (t *JSONPcapTranslator) trySetHTTP11(
 			} else if ts, ok := t.trySetTraceAndSpan(json, flowID, sequence, false /* lock */); ok {
 				t.linkHTTP11ResponseToRequest(packet, tcpFlags, flowID, L7, ts.traceID)
 			}
-			t.addHTTP11BodyDetails(L7, &response.ContentLength, response.Body)
+			t.addHTTP11BodyDetails(_http, &response.ContentLength, response.Body)
 			json.Set(stringFormatter.Format("{0} | {1} {2}", *message, response.Proto, response.Status), "message")
 			return true
 		}
@@ -742,7 +747,7 @@ func (t *JSONPcapTranslator) trySetHTTP11(
 
 	var traceAndSpan []string = nil
 
-	headers, _ := L7.Object("headers")
+	headers, _ := _http.Object("headers")
 	for _, header := range parts[1:] {
 		headerParts := bytes.SplitN(header, http11HeaderSeparator, 2)
 		value := string(bytes.TrimSpace(headerParts[1]))
@@ -755,7 +760,7 @@ func (t *JSONPcapTranslator) trySetHTTP11(
 		}
 	}
 
-	bodyJSON, _ := L7.Object("body")
+	bodyJSON, _ := _http.Object("body")
 	sizeOfBody := len(dataBytes[1])
 	bodyJSON.Set(sizeOfBody, "length")
 	if sizeOfBody > 0 {
@@ -763,13 +768,13 @@ func (t *JSONPcapTranslator) trySetHTTP11(
 	}
 
 	line := string(parts[0])
-	L7.Set(line, "line")
+	_http.Set(line, "line")
 	json.Set(stringFormatter.Format("{0} | {1}", *message, line), "message")
 
 	if isHTTP11Request {
 		requestParts := http11RequestPayloadRegex.FindStringSubmatch(line)
-		L7.Set(requestParts[1], "method")
-		L7.Set(requestParts[2], "url")
+		_http.Set(requestParts[1], "method")
+		_http.Set(requestParts[2], "url")
 		host := "0"
 		if traceAndSpan != nil {
 			t.recordHTTP11Request(packet, flowID, sequence, &traceAndSpan[0], &traceAndSpan[1], &requestParts[1], &host, &requestParts[2])
@@ -780,17 +785,17 @@ func (t *JSONPcapTranslator) trySetHTTP11(
 	// isHTTP11Response
 	responseParts := http11ResponsePayloadRegex.FindStringSubmatch(line)
 	if code, err := strconv.Atoi(responseParts[1]); err == nil {
-		L7.Set(code, "code")
+		_http.Set(code, "code")
 	} else {
-		L7.Set(responseParts[1], "code")
+		_http.Set(responseParts[1], "code")
 	}
-	L7.Set(responseParts[2], "status")
+	_http.Set(responseParts[2], "status")
 	if traceAndSpan != nil {
 		if err := t.linkHTTP11ResponseToRequest(packet, tcpFlags, flowID, L7, &traceAndSpan[0]); err != nil {
 			io.WriteString(os.Stderr, err.Error()+"\n")
 		}
 	} else if ts, ok := t.trySetTraceAndSpan(json, flowID, sequence, false /* lock */); ok {
-		t.linkHTTP11ResponseToRequest(packet, tcpFlags, flowID, L7, ts.traceID)
+		t.linkHTTP11ResponseToRequest(packet, tcpFlags, flowID, _http, ts.traceID)
 	}
 	return true
 }
