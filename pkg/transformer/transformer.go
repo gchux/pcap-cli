@@ -93,6 +93,7 @@ const (
 	http11RequestPayloadRegexStr  = `^(?P<method>.+?)\s(?P<url>.+?)\sHTTP/1\.1(?:\r?\n)?.*`
 	http11ResponsePayloadRegexStr = `^HTTP/1\.1\s(?P<code>\d{3})\s(?P<status>.+?)(?:\r?\n)?.*`
 	http11LineSeparator           = "\r\n"
+	httpContentLengthHeader       = "Content-Length"
 	cloudTraceContextHeader       = "X-Cloud-Trace-Context"
 	traceAndSpanRegexStr          = `^(?P<trace>.+?)/(?P<span>.+?)(?:;o=.*)?$`
 )
@@ -172,6 +173,7 @@ var (
 	http11Separator              = []byte(http11LineSeparator)
 	http11BodySeparator          = []byte(http11LineSeparator + http11LineSeparator)
 	http11HeaderSeparator        = []byte(":")
+	httpContentLengthHeaderBytes = []byte(httpContentLengthHeader)
 	cloudTraceContextHeaderBytes = []byte(cloudTraceContextHeader)
 	traceAndSpanRegex            = regexp.MustCompile(traceAndSpanRegexStr)
 	cloudProjectID               = os.Getenv(projectIdEnvVarName)
