@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Jeffail/gabs/v2"
@@ -55,8 +56,13 @@ type (
 	}
 
 	flowLockCarrier struct {
-		mu *sync.Mutex
-		wg *sync.WaitGroup
+		mu             *sync.Mutex
+		wg             *sync.WaitGroup
+		released       *atomic.Bool
+		createdAt      *time.Time
+		lastLockedAt   *time.Time
+		lastUnlockedAt *time.Time
+		trackingReaper *time.Timer
 	}
 )
 
@@ -66,15 +72,51 @@ const (
 	jsonTranslationSummaryUDP       = jsonTranslationSummary + "{L4Proto} | {srcProto}/{L3Src}:{L4Src} > {dstProto}/{L3Dst}:{L4Dst}"
 	jsonTranslationSummaryTCP       = jsonTranslationSummaryUDP + " | [{tcpFlags}] | seq/ack:{tcpSeq}/{tcpAck}"
 	jsonTranslationFlowTemplate     = "{0}/iface/{1}/flow/{2}:{3}"
+
+	carrierDeadline  = 300 * time.Second
+	trackingDeadline = 300 * time.Second
 )
 
 func newFlowMutex(
+	ctx context.Context,
 	flowToSequenceMap *csmap.CsMap[uint64, *skipmap.Uint32Map[*traceAndSpan]],
 	traceToHttpRequestMap *csmap.CsMap[string, *httpRequest],
 ) *flowMutex {
-	return &flowMutex{
+	fm := &flowMutex{
 		flowToSequenceMap:     flowToSequenceMap,
 		traceToHttpRequestMap: traceToHttpRequestMap,
+	}
+	// reap orphaned `flowLockCarrier`s
+	go fm.startReaper(ctx)
+	return fm
+}
+
+func (fm *flowMutex) startReaper(ctx context.Context) {
+	// reaping is necessary as packets translations order is not guaranteed:
+	// so if all non `FIN+ACK`/`RST+*` are seen before other non-termination combinations within the same flow:
+	//   - a new carrier will be created to hold its flow lock, and this carrier will not be organically reaped.
+	// additionally: for connection pooling, long running not-used connections should be dropped to reclaim memory.
+	ticker := time.NewTicker(carrierDeadline)
+
+	for {
+		select {
+		case <-ctx.Done():
+			ticker.Stop()
+			return
+		case <-ticker.C:
+			fm.MutexMap.Range(func(k, v any) bool {
+				flowID := k.(uint64)
+				carrier := v.(*flowLockCarrier)
+				lastUnlocked := time.Since(*carrier.lastUnlockedAt)
+				if lastUnlocked >= carrierDeadline && carrier.mu.TryLock() {
+					fm.MutexMap.Delete(flowID)
+					fm.untrackConnection(&flowID)
+					io.WriteString(os.Stderr,
+						fmt.Sprintf("reaped flow '%d' after %v\n", flowID, lastUnlocked))
+				}
+				return true
+			})
+		}
 	}
 }
 
@@ -117,6 +159,7 @@ func (fm *flowMutex) trackConnection(flowID *uint64, sequence *uint32, ts *trace
 	if ts == nil {
 		return false
 	}
+
 	var sequenceToTraceMap *skipmap.Uint32Map[*traceAndSpan] = nil
 	if ftsm, ok := fm.flowToSequenceMap.Load(*flowID); ok {
 		sequenceToTraceMap = ftsm
@@ -151,16 +194,24 @@ func (fm *flowMutex) isConnectionTermination(tcpFlags *uint8) bool {
 	return *tcpFlags == tcpFinAck || *tcpFlags == tcpRstAck || *tcpFlags == tcpRst
 }
 
+func (fm *flowMutex) newFlowLockCarrier() *flowLockCarrier {
+	var released atomic.Bool
+	released.Store(false)
+	createdAt := time.Now()
+	return &flowLockCarrier{
+		mu:        new(sync.Mutex),
+		wg:        new(sync.WaitGroup),
+		released:  &released,
+		createdAt: &createdAt,
+	}
+}
+
 func (fm *flowMutex) Lock(
 	flowID *uint64,
 	tcpFlags *uint8,
 	sequence, ack *uint32,
 ) (*flowLock, *traceAndSpan, bool) {
-	carrier, _ := fm.MutexMap.LoadOrStore(*flowID,
-		&flowLockCarrier{
-			mu: new(sync.Mutex),
-			wg: new(sync.WaitGroup),
-		})
+	carrier, _ := fm.MutexMap.LoadOrStore(*flowID, fm.newFlowLockCarrier())
 
 	_carrier := carrier.(*flowLockCarrier)
 	mu := _carrier.mu
@@ -168,29 +219,47 @@ func (fm *flowMutex) Lock(
 
 	// changing the order os `Wait` and `Lock` causes a deadlock
 	if fm.isConnectionTermination(tcpFlags) {
+		// Connection termination events must wait
+		// for the flow to stop being trace-tracked.
+		// If this flow is not trace-tracked `Wait()` won't block.
 		wg.Wait()
 	}
+
 	mu.Lock()
+	lastLockedAt := time.Now()
+	_carrier.lastLockedAt = &lastLockedAt
 
 	_ts, traced := fm.getTraceAndSpan(flowID, sequence)
 
+	errorHandler := func() {
+		// handle `panic` if `_unlock()`/`_done()` invocations fail
+		if err := recover(); err != nil {
+			io.WriteString(os.Stderr, fmt.Sprintf("error at flow[%d]: %+v\n", *flowID, err))
+		}
+	}
+
 	_unlock := func() {
+		defer errorHandler()
 		mu.Unlock()
+		lastUnlockedAt := time.Now()
+		_carrier.lastLockedAt = &lastUnlockedAt
 	}
 
 	_done := func() {
-		defer func() {
-			if err := recover(); err != nil {
-				io.WriteString(os.Stderr, fmt.Sprintf("error at flow[%d]: %+v\n", *flowID, err))
-			}
-		}()
+		defer errorHandler()
 		wg.Done()
 	}
 
 	UnlockAndReleaseFN := func() bool {
 		defer _unlock()
-		fm.MutexMap.Delete(*flowID)
-		return fm.untrackConnection(flowID)
+		// many translations within the same flow may be waiting to acquire the lock;
+		// if multiple translations try to release, i/e: 2*`FIN+ACK`,
+		// then both will release the lock, but just 1 must yield connection untracking.
+		if _carrier.released.CompareAndSwap(false, true) {
+			fm.MutexMap.Delete(*flowID)
+			return fm.untrackConnection(flowID)
+		}
+		return false
 	}
 
 	UnlockWithTCPFlagsFN := func(tcpFlags *uint8) bool {
@@ -205,10 +274,12 @@ func (fm *flowMutex) Lock(
 		return UnlockWithTCPFlagsFN(tcpFlags)
 	}
 
-	// since `flowID` and `sequence` are known:
+	// since all TCP data is known:
 	//   - it is possible to return a `traceID`
 	//   - since this is guarded by a lock, it is thread-safe
+	// much richer analysis is also possible
 
+	// these are the only methods for consumers to interact with the lock
 	lock := &flowLock{
 		Unlock:             UnlockFn,
 		UnlockAndRelease:   UnlockAndReleaseFN,
@@ -216,24 +287,35 @@ func (fm *flowMutex) Lock(
 	}
 
 	if *tcpFlags == tcpPshAck {
+		// provide trace tracking only for TCP `PSH+ACK`
 		lock.UnlockWithTraceAndSpan = func(ts *traceAndSpan, stopTracking bool) {
 			defer _unlock()
 			// if any `flow` unlocks with `traceAndSpan`: increment `WaitGroup`:
 			//   - `FIN+ACK`/`RST+*` should not get the lock until the `WaitGroup` is done.
-			//   - should also have a timer –deadline– to unblock if no HTTP response is ever seen.
 			if traced && (ts != nil) && (*_ts.traceID == *ts.traceID) && stopTracking {
+				// if `traced` is `true`, `trackConnection` succeeded and so `trackingReaper` is available
+				_carrier.trackingReaper.Stop()
 				_done()
+				// [ToDo]: delete trace from `flowToSequenceMap`
+				_carrier.trackingReaper = nil // allow GC to collect the reaper
 			} else if !traced {
 				wg.Add(1)
 				if fm.trackConnection(flowID, sequence, ts) {
-					time.AfterFunc(300*time.Second, _done)
+					// unlock orphaned trace-tracked connections: allow termination events to continue
+					_carrier.trackingReaper = time.AfterFunc(trackingDeadline, func() {
+						_done()
+						io.WriteString(os.Stderr,
+							fmt.Sprintf("unlocked flow '%d' after %v\n", flowID, trackingDeadline))
+					})
 				} else {
 					_done() // connection tracking failed, unblock
 				}
 			}
 		}
 	} else {
-		lock.UnlockWithTraceAndSpan = func(ts *traceAndSpan, stopTracking bool) {
+		// do not provide trace tracking for non TCP `PSH+ACK`
+		lock.UnlockWithTraceAndSpan = func(*traceAndSpan, bool) {
+			// fallback to unlock by TCP flags
 			UnlockWithTCPFlagsFN(tcpFlags)
 		}
 	}
@@ -716,7 +798,8 @@ func (t *JSONPcapTranslator) finalize(
 	// `finalize` is invoked from a `worker` via a go-routine `pool`:
 	//   - there are no guarantees about which packet will get `finalize`d 1st
 	//   - there are no guarantees about about which packet will get the `lock` next
-	// minimize locking: lock per-flow instead of across-flows
+	// minimize locking: lock per-flow instead of across-flows.
+	// locking is done in the name of throubleshoot-ability, so some contention should be acceptable...
 	lock, ts, traced := t.fm.Lock(&flowID, &setFlags, &seq, &ack)
 
 	if conntrack {
@@ -730,6 +813,7 @@ func (t *JSONPcapTranslator) finalize(
 		return t.addAppLayerData(lock, p, &setFlags, &appLayer, &flowID, &seq, json, &message, ts)
 	}
 
+	// packet is not carrying any data, unlock using TCP flags
 	defer lock.UnlockWithTCPFlags(&setFlags)
 
 	json.Set(message, "message")
@@ -812,15 +896,18 @@ func (t *JSONPcapTranslator) addAppLayerData(
 		return json, errors.New("AppLayer is empty")
 	}
 
-	if L7, ok := t.trySetHTTP11(lock, packet, appLayerData,
-		flowID, sequence, json, message, ts); ok {
+	if L7, ok := t.trySetHTTP11(lock, packet, tcpFlags,
+		appLayerData, flowID, sequence, json, message, ts); ok {
 		// this `size` is not the same as `length`:
 		//   - `size` includes everything, not only the HTTP `payload`
 		L7.Set(sizeOfAppLayerData, "size")
+		// `trySetHTTP11()` unlocks if data is HTTP
 		return json, nil
 	}
 
-	defer lock.UnlockWithTraceAndSpan(ts, sizeOfAppLayerData > 1 /* stop-tracking */)
+	// if data is not HTTP, unlock with `traceAndSpan`
+	defer lock.UnlockWithTraceAndSpan(ts,
+		sizeOfAppLayerData >= 1 /* stop-tracking */)
 
 	// best-effort to add some information about L7
 	json.Set(stringFormatter.Format("{0} | size:{1}",
@@ -828,7 +915,12 @@ func (t *JSONPcapTranslator) addAppLayerData(
 
 	L7, _ := json.Object("L7")
 	L7.Set(sizeOfAppLayerData, "length")
-	L7.Set(string(appLayerData), "content")
+
+	if sizeOfAppLayerData > 256 {
+		L7.Set(string(appLayerData[:256-3])+"...", "sample")
+	} else {
+		L7.Set(string(appLayerData), "content")
+	}
 
 	t.setTraceAndSpan(json, ts)
 
@@ -838,6 +930,7 @@ func (t *JSONPcapTranslator) addAppLayerData(
 func (t *JSONPcapTranslator) trySetHTTP11(
 	lock *flowLock,
 	packet *gopacket.Packet,
+	tcpFlags *uint8,
 	appLayerData []byte,
 	flowID *uint64,
 	sequence *uint32,
@@ -867,15 +960,18 @@ func (t *JSONPcapTranslator) trySetHTTP11(
 	fragmented := false // stop tracking is the default behavior
 
 	defer func() {
-		// some HttpServers split headers and body by flushing immediately after headers,
-		// so if this has an HTTP Response, stop tracking if:
-		//   - `Content-Length` header value is equal to the observed `size-of-payload`
+		// some HTTP Servers split headers and body by flushing immediately after headers,
+		// so if this packet is carrying an HTTP Response, stop trace-tracking if:
+		//   - the packet contains the full HTTP Response body, or more specifically:
+		//     - if the `Content-Length` header value is equal to the observed `size-of-payload`:
+		//       - which means that the HTTP Response is not fragmented.
+		// otherwise: allow trace-tracking to continue tagging packets.
 		if _ts != nil {
-			lock.UnlockWithTraceAndSpan(_ts, !fragmented)
+			lock.UnlockWithTraceAndSpan(_ts, !fragmented /* stop-tracking */)
 		} else if ts != nil {
-			lock.UnlockWithTraceAndSpan(ts, !fragmented)
+			lock.UnlockWithTraceAndSpan(ts, !fragmented /* stop-tracking */)
 		} else {
-			lock.Unlock()
+			lock.UnlockWithTCPFlags(tcpFlags)
 		}
 	}()
 
@@ -920,7 +1016,7 @@ func (t *JSONPcapTranslator) trySetHTTP11(
 			sizeOfBody := t.addHTTP11BodyDetails(L7, &response.ContentLength, response.Body)
 			if cl, err := strconv.ParseUint(response.Header.Get(httpContentLengthHeader), 10, 64); err == nil {
 				// if content-length is greater than the size of body:
-				//   - this message is fragmented and so there's more to come
+				//   - this HTTP message is fragmented and so there's more to come
 				fragmented = cl > sizeOfBody
 			}
 			json.Set(stringFormatter.Format("{0} | {1} {2} | fragmented:{3}",
@@ -932,11 +1028,14 @@ func (t *JSONPcapTranslator) trySetHTTP11(
 	// fallback to a minimal (naive) attempt to parse HTTP/1.1
 	// see: https://www.rfc-editor.org/rfc/rfc7540#section-8.1.3
 	dataBytes := bytes.SplitN(appLayerData, http11BodySeparator, 2)
+	// `parts` is everything before HTTP payload separator (`2*line-break`)
+	//   - it includes: the HTTP line, and HTTP headers
 	parts := bytes.Split(dataBytes[0], http11Separator)
 
 	contentLength := uint64(0)
 
 	headers, _ := L7.Object("headers")
+	// HTTP headers starts at `parts[1]`
 	for _, header := range parts[1:] {
 		headerParts := bytes.SplitN(header, http11HeaderSeparator, 2)
 		nameBytes := bytes.TrimSpace(headerParts[0])
@@ -956,14 +1055,18 @@ func (t *JSONPcapTranslator) trySetHTTP11(
 	}
 
 	bodyJSON, _ := L7.Object("body")
-	sizeOfBody := uint64(len(dataBytes[1]))
-	bodyJSON.Set(sizeOfBody, "length")
-	if sizeOfBody > 0 {
-		bodyJSON.Set(string(dataBytes[1]), "data")
+	sizeOfBody := uint64(0)
+	if len(dataBytes) > 1 {
+		sizeOfBody = uint64(len(dataBytes[1]))
+		if sizeOfBody > 0 {
+			bodyJSON.Set(string(dataBytes[1]), "data")
+		}
 	}
+	bodyJSON.Set(sizeOfBody, "length")
 
 	fragmented = contentLength > sizeOfBody
 
+	// `parts[0]` contains the HTTP line
 	line := string(parts[0])
 	L7.Set(line, "line")
 	json.Set(stringFormatter.Format("{0} | {1} | fragmented:{2}", *message, line, fragmented), "message")
@@ -1011,8 +1114,10 @@ func (t *JSONPcapTranslator) addHTTP11BodyDetails(L7 *gabs.Container, contentLen
 	bodyLengthJSON.SetIndex(sizeOfBody, 0)
 	bodyLengthJSON.SetIndex(*contentLength, 1)
 
-	if sizeOfBody > 0 {
-		bodyJSON.Set(string(bodyBytes[:512]), "data")
+	if sizeOfBody > 512 {
+		bodyJSON.Set(string(bodyBytes[:512-3])+"...", "sample")
+	} else {
+		bodyJSON.Set(string(bodyBytes), "data")
 	}
 
 	return sizeOfBody
@@ -1079,6 +1184,7 @@ func (t *JSONPcapTranslator) setTraceAndSpan(json *gabs.Container, ts *traceAndS
 
 	json.Set(cloudTracePrefix+*ts.traceID, "logging.googleapis.com/trace")
 	json.Set(*ts.spanID, "logging.googleapis.com/spanId")
+	json.Set(true, "logging.googleapis.com/trace_sampled")
 
 	return true
 }
@@ -1108,7 +1214,7 @@ func (t *JSONPcapTranslator) write(ctx context.Context, writer io.Writer, packet
 	return writtenBytes, nil
 }
 
-func newJSONPcapTranslator(iface *PcapIface) *JSONPcapTranslator {
+func newJSONPcapTranslator(ctx context.Context, iface *PcapIface) *JSONPcapTranslator {
 	traceToHttpRequestMap := csmap.Create(
 		// set the number of map shards. the default value is 32.
 		csmap.WithShardCount[string, *httpRequest](32),
@@ -1137,7 +1243,7 @@ func newJSONPcapTranslator(iface *PcapIface) *JSONPcapTranslator {
 	)
 
 	return &JSONPcapTranslator{
-		fm:                    newFlowMutex(flowToSequenceMap, traceToHttpRequestMap),
+		fm:                    newFlowMutex(ctx, flowToSequenceMap, traceToHttpRequestMap),
 		iface:                 iface,
 		traceToHttpRequestMap: traceToHttpRequestMap,
 		flowToTimestamp:       flowToTimestamp,

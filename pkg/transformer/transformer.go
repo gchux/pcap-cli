@@ -261,10 +261,10 @@ func (t *PcapTransformer) writeTranslationFn(ctx context.Context, task interface
 	t.writeTranslation(ctx, task.(*pcapWriteTask))
 }
 
-func newTranslator(iface *PcapIface, format PcapTranslatorFmt) (PcapTranslator, error) {
+func newTranslator(ctx context.Context, iface *PcapIface, format PcapTranslatorFmt) (PcapTranslator, error) {
 	switch format {
 	case JSON:
-		return newJSONPcapTranslator(iface), nil
+		return newJSONPcapTranslator(ctx, iface), nil
 	case TEXT:
 		return newTextPcapTranslator(iface), nil
 	case PROTO:
@@ -357,7 +357,7 @@ func provideStrategy(transformer *PcapTransformer, preserveOrder, connTracking b
 // transformers get instances of `io.Writer` instead of `pcap.PcapWriter` to prevent closing.
 func newTransformer(ctx context.Context, iface *PcapIface, writers []io.Writer, format *string, preserveOrder, connTracking bool) (IPcapTransformer, error) {
 	pcapFmt := pcapTranslatorFmts[*format]
-	translator, err := newTranslator(iface, pcapFmt)
+	translator, err := newTranslator(ctx, iface, pcapFmt)
 	if err != nil {
 		return nil, err
 	}
