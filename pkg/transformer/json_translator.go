@@ -804,13 +804,11 @@ func (t *JSONPcapTranslator) addAppLayerData(
 	message *string,
 	ts *traceAndSpan,
 ) (*gabs.Container, error) {
-	defer lock.UnlockWithTraceAndSpan(ts, true /* stop-tracking */)
-
 	appLayerData := (*appLayer).LayerContents()
 
 	sizeOfAppLayerData := len(appLayerData)
-
 	if sizeOfAppLayerData == 0 {
+		lock.UnlockWithTCPFlags(tcpFlags)
 		return json, errors.New("AppLayer is empty")
 	}
 
@@ -821,6 +819,8 @@ func (t *JSONPcapTranslator) addAppLayerData(
 		L7.Set(sizeOfAppLayerData, "size")
 		return json, nil
 	}
+
+	defer lock.UnlockWithTraceAndSpan(ts, sizeOfAppLayerData > 1 /* stop-tracking */)
 
 	// best-effort to add some information about L7
 	json.Set(stringFormatter.Format("{0} | size:{1}",
