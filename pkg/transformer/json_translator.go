@@ -1285,7 +1285,7 @@ func (t *JSONPcapTranslator) linkHTTP11ResponseToRequest(packet *gopacket.Packet
 	requestTimestamp := *translatorRequest.timestamp
 	responseTimestamp := (*packet).Metadata().Timestamp
 	latency := responseTimestamp.Sub(requestTimestamp)
-	request.Set(requestTimestamp.String(), "timestamp")
+	request.Set(requestTimestamp.Format(time.RFC3339Nano), "timestamp")
 	request.Set(latency.Milliseconds(), "latency")
 
 	// intentionally not removing from `traceToHttpRequestMap`:
