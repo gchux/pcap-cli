@@ -1090,6 +1090,7 @@ func (t *JSONPcapTranslator) trySetHTTP(
 	fragmented := false // stop tracking is the default behavior
 
 	defer func() {
+		L7.Set(fragmented, "fragmented")
 		// some HTTP Servers split headers and body by flushing immediately after headers,
 		// so if this packet is carrying an HTTP Response, stop trace-tracking if:
 		//   - the packet contains the full HTTP Response body, or more specifically:
@@ -1151,8 +1152,8 @@ func (t *JSONPcapTranslator) trySetHTTP(
 				//   - this HTTP message is fragmented and so there's more to come
 				fragmented = cl > sizeOfBody
 			}
-			json.Set(stringFormatter.Format("{0} | {1} {2} | fragmented:{3}",
-				*message, response.Proto, response.Status, fragmented), "message")
+			json.Set(stringFormatter.Format("{0} | {1} {2}",
+				*message, response.Proto, response.Status), "message")
 			return L7, true
 		}
 	}
@@ -1204,7 +1205,7 @@ func (t *JSONPcapTranslator) trySetHTTP(
 	// `parts[0]` contains the HTTP line
 	line := string(parts[0])
 	L7.Set(line, "line")
-	json.Set(stringFormatter.Format("{0} | {1} | fragmented:{2}", *message, line, fragmented), "message")
+	json.Set(stringFormatter.Format("{0} | {1}", *message, line), "message")
 
 	if isHTTP11Request {
 		requestParts := http11RequestPayloadRegex.FindStringSubmatch(line)
