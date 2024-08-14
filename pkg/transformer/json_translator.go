@@ -1050,8 +1050,9 @@ func (t *JSONPcapTranslator) trySetHTTP(
 
 			case *http2.MetaHeadersFrame:
 				frameJSON.Set("metadata", "type")
+				mdJSON, _ := frameJSON.Object("metadata")
 				for _, md := range frame.Fields {
-					frameJSON.Set(md.Value, md.Name)
+					mdJSON.Set(md.Value, md.Name)
 				}
 
 			case *http2.DataFrame:
