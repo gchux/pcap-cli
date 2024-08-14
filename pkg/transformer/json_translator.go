@@ -111,11 +111,12 @@ func (fm *flowMutex) startReaper(ctx context.Context) {
 			fm.MutexMap.Range(func(k, v any) bool {
 				flowID := k.(uint64)
 				carrier := v.(*flowLockCarrier)
-				if carrier == nil {
+				if carrier == nil || carrier.lastLockedAt == nil {
 					return true
 				}
 				lastUnlocked := time.Since(*carrier.lastUnlockedAt)
-				if lastUnlocked >= carrierDeadline && carrier.mu.TryLock() {
+				if carrier.mu.TryLock() && lastUnlocked >= carrierDeadline {
+					defer carrier.mu.Unlock()
 					fm.MutexMap.Delete(flowID)
 					fm.untrackConnection(&flowID)
 					io.WriteString(os.Stderr,
