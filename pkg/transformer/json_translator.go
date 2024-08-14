@@ -21,6 +21,8 @@ import (
 	"github.com/pkg/errors"
 	"github.com/segmentio/fasthash/fnv1a"
 	"github.com/wissance/stringFormatter"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
 
 	mapset "github.com/deckarep/golang-set/v2"
 	csmap "github.com/mhmtszr/concurrent-swiss-map"
@@ -29,17 +31,18 @@ import (
 
 type (
 	JSONPcapTranslator struct {
-		fm                    *flowMutex
-		iface                 *PcapIface
-		halfOpenFlows         mapset.Set[uint64]
-		establishedFlows      mapset.Set[uint64]
-		halfClosedFlows       mapset.Set[uint64]
-		flowToTimestamp       *csmap.CsMap[uint64, *time.Time]
+		fm               *flowMutex
+		iface            *PcapIface
+		halfOpenFlows    mapset.Set[uint64]
+		establishedFlows mapset.Set[uint64]
+		halfClosedFlows  mapset.Set[uint64]
+		flowToTimestamp  *csmap.CsMap[uint64, *time.Time]
+		// [ToDo]: tracking should mind `StreamID`
 		traceToHttpRequestMap *csmap.CsMap[string, *httpRequest]
 		flowToSequenceMap     *csmap.CsMap[uint64, *skipmap.Uint32Map[*traceAndSpan]]
 	}
 
-	UnlockWithTraceAndSpan = func(*traceAndSpan, bool /* stopTracking */)
+	UnlockWithTraceAndSpan = func(bool /* stopTracking */, ...*traceAndSpan)
 	UnlockWithTCPFlags     = func(*uint8 /* TCP flags */) bool
 
 	flowMutex struct {
@@ -77,6 +80,7 @@ const (
 	trackingDeadline = 300 * time.Second
 )
 
+// [ToDo]: move `FlowMutex` into its own package/file
 func newFlowMutex(
 	ctx context.Context,
 	flowToSequenceMap *csmap.CsMap[uint64, *skipmap.Uint32Map[*traceAndSpan]],
@@ -107,6 +111,9 @@ func (fm *flowMutex) startReaper(ctx context.Context) {
 			fm.MutexMap.Range(func(k, v any) bool {
 				flowID := k.(uint64)
 				carrier := v.(*flowLockCarrier)
+				if carrier == nil {
+					return true
+				}
 				lastUnlocked := time.Since(*carrier.lastUnlockedAt)
 				if lastUnlocked >= carrierDeadline && carrier.mu.TryLock() {
 					fm.MutexMap.Delete(flowID)
@@ -239,7 +246,11 @@ func (fm *flowMutex) Lock(
 	}
 
 	_unlock := func() {
-		defer errorHandler()
+		defer func(mu *sync.Mutex) {
+			if err := recover(); err != nil {
+				io.WriteString(os.Stderr, fmt.Sprintf("error at flow[%d]: %+v | %+v\n", *flowID, err, mu))
+			}
+		}(mu)
 		mu.Unlock()
 		lastUnlockedAt := time.Now()
 		_carrier.lastLockedAt = &lastUnlockedAt
@@ -266,7 +277,7 @@ func (fm *flowMutex) Lock(
 		if fm.isConnectionTermination(tcpFlags) {
 			return UnlockAndReleaseFN()
 		}
-		defer _unlock()
+		_unlock()
 		return false
 	}
 
@@ -288,33 +299,37 @@ func (fm *flowMutex) Lock(
 
 	if *tcpFlags == tcpPshAck {
 		// provide trace tracking only for TCP `PSH+ACK`
-		lock.UnlockWithTraceAndSpan = func(ts *traceAndSpan, stopTracking bool) {
+		// [ToDo]: support unlocking with multiple `traceAndSpan`s:
+		//           - required by h2c multiplexing ( multiple streams within the same TCP segment )
+		lock.UnlockWithTraceAndSpan = func(stopTracking bool, tss ...*traceAndSpan) {
 			defer _unlock()
 			// if any `flow` unlocks with `traceAndSpan`: increment `WaitGroup`:
 			//   - `FIN+ACK`/`RST+*` should not get the lock until the `WaitGroup` is done.
-			if traced && (ts != nil) && (*_ts.traceID == *ts.traceID) && stopTracking {
+			if traced && len(tss) > 0 && (*tss[0].traceID == *_ts.traceID) && stopTracking {
+				_done()
 				// if `traced` is `true`, `trackConnection` succeeded and so `trackingReaper` is available
 				_carrier.trackingReaper.Stop()
-				_done()
 				// [ToDo]: delete trace from `flowToSequenceMap`
 				_carrier.trackingReaper = nil // allow GC to collect the reaper
-			} else if !traced {
+			} else if !traced && len(tss) > 0 {
 				wg.Add(1)
-				if fm.trackConnection(flowID, sequence, ts) {
-					// unlock orphaned trace-tracked connections: allow termination events to continue
-					_carrier.trackingReaper = time.AfterFunc(trackingDeadline, func() {
-						_done()
-						io.WriteString(os.Stderr,
-							fmt.Sprintf("unlocked flow '%d' after %v\n", flowID, trackingDeadline))
-					})
-				} else {
+				if !fm.trackConnection(flowID, sequence, tss[0]) {
 					_done() // connection tracking failed, unblock
+					return
 				}
+				// unlock orphaned trace-tracked connections: allow termination events to continue
+				_carrier.trackingReaper = time.AfterFunc(trackingDeadline, func() {
+					_done()
+					io.WriteString(os.Stderr,
+						fmt.Sprintf("unlocked flow '%d' after %v\n", flowID, trackingDeadline))
+				})
+			} else {
+				_done()
 			}
 		}
 	} else {
 		// do not provide trace tracking for non TCP `PSH+ACK`
-		lock.UnlockWithTraceAndSpan = func(*traceAndSpan, bool) {
+		lock.UnlockWithTraceAndSpan = func(bool, ...*traceAndSpan) {
 			// fallback to unlock by TCP flags
 			UnlockWithTCPFlagsFN(tcpFlags)
 		}
@@ -896,7 +911,7 @@ func (t *JSONPcapTranslator) addAppLayerData(
 		return json, errors.New("AppLayer is empty")
 	}
 
-	if L7, ok := t.trySetHTTP11(lock, packet, tcpFlags,
+	if L7, ok := t.trySetHTTP(lock, packet, tcpFlags,
 		appLayerData, flowID, sequence, json, message, ts); ok {
 		// this `size` is not the same as `length`:
 		//   - `size` includes everything, not only the HTTP `payload`
@@ -905,9 +920,13 @@ func (t *JSONPcapTranslator) addAppLayerData(
 		return json, nil
 	}
 
-	// if data is not HTTP, unlock with `traceAndSpan`
-	defer lock.UnlockWithTraceAndSpan(ts,
-		sizeOfAppLayerData >= 1 /* stop-tracking */)
+	if ts != nil {
+		// if data is not HTTP, unlock with `traceAndSpan`
+		defer lock.UnlockWithTraceAndSpan(
+			sizeOfAppLayerData >= 1 /* stop-tracking */, ts)
+	} else {
+		defer lock.UnlockWithTCPFlags(tcpFlags)
+	}
 
 	// best-effort to add some information about L7
 	json.Set(stringFormatter.Format("{0} | size:{1}",
@@ -927,7 +946,7 @@ func (t *JSONPcapTranslator) addAppLayerData(
 	return json, nil
 }
 
-func (t *JSONPcapTranslator) trySetHTTP11(
+func (t *JSONPcapTranslator) trySetHTTP(
 	lock *flowLock,
 	packet *gopacket.Packet,
 	tcpFlags *uint8,
@@ -941,8 +960,11 @@ func (t *JSONPcapTranslator) trySetHTTP11(
 	isHTTP11Request := http11RequestPayloadRegex.Match(appLayerData)
 	isHTTP11Response := !isHTTP11Request && http11ResponsePayloadRegex.Match(appLayerData)
 
+	framer := http2.NewFramer(io.Discard, bytes.NewReader(appLayerData))
+	frame, _ := framer.ReadFrame()
+
 	// if content is not HTTP in clear text, abort
-	if !isHTTP11Request && !isHTTP11Response {
+	if !isHTTP11Request && !isHTTP11Response && frame == nil {
 		json.Set(*message, "message")
 		return nil, false
 	}
@@ -952,11 +974,118 @@ func (t *JSONPcapTranslator) trySetHTTP11(
 	//     which is not always the case when fragmentation occurs
 	L7, _ := json.Object("http")
 
-	L7.Set("HTTP", "type")
+	// handle h2c traffic
+	if frame != nil {
+		L7.Set("h2c", "proto")
+		streams, _ := L7.Object("streams")
+		_, _ = L7.Array("includes")
+
+		// multple h2 frames ( from multiple streams ) may be delivered by the same packet
+		for frame != nil {
+
+			isRequest := false
+			isResponse := false
+
+			frameHeader := frame.Header()
+
+			// h2 is multiplexed, `StreamID` will allows to link HTTP conversations
+			StreamID := frameHeader.StreamID
+			StreamIDstr := strconv.FormatUint(uint64(StreamID), 10)
+
+			var stream, frames *gabs.Container
+			if stream = streams.S(StreamIDstr); stream == nil {
+				stream, _ = streams.Object(StreamIDstr)
+				_, _ = stream.Array("frames")
+				stream.Set(StreamID, "id")
+				L7.ArrayAppend(StreamID, "includes")
+			} else if frames = stream.S("frames"); frames == nil {
+				_, _ = stream.Array("frames")
+			}
+
+			frameJSON := gabs.New()
+			stream.ArrayAppend(frameJSON, "frames")
+
+			if m := http2RawFrameRegex.
+				FindStringSubmatch(frameHeader.String()); len(m) > 0 {
+				frameJSON.Set(m[1], "raw")
+			}
+
+			sizeOfFrame := frameHeader.Length /* uint32 */
+			frameJSON.Set(sizeOfFrame, "length")
+
+			// see: https://pkg.go.dev/golang.org/x/net/http2#Flags
+			frameJSON.Set("0b"+strconv.FormatUint(uint64(frameHeader.Flags /* uint8 */), 2), "flags")
+
+			switch frame := frame.(type) {
+			case *http2.PingFrame:
+				frameJSON.Set("ping", "type")
+				frameJSON.Set(frame.IsAck(), "ack")
+				frameJSON.Set(string(frame.Data[:]), "data")
+
+			case *http2.SettingsFrame:
+				frameJSON.Set("sttings", "type")
+				settings, _ := frameJSON.Object("settings")
+				frame.ForeachSetting(func(s http2.Setting) error {
+					// see: https://pkg.go.dev/golang.org/x/net/http2#SettingID
+					settings.Set(strconv.FormatUint(uint64(s.Val), 10),
+						"0x"+strconv.FormatUint(uint64(s.ID), 16))
+					return nil
+				})
+				frameJSON.Set(frame.IsAck(), "ack")
+
+			case *http2.HeadersFrame:
+				decoder := hpack.NewDecoder(2048, nil)
+				hf, _ := decoder.DecodeFull(frame.HeaderBlockFragment())
+				headers := http.Header{}
+				for _, header := range hf {
+					isRequest = (isRequest || (header.Name == ":method"))
+					isResponse = (isResponse || (header.Name == ":status"))
+					// `Add(...)` internally applies `http.CanonicalHeaderKey(...)`
+					headers.Add(header.Name, header.Value)
+				}
+				decoder.Close()
+				frameJSON.Set("headers", "type")
+				// [ToDo]: gather all `traceAndSpans`
+				_ = t.addHTTPHeaders(frameJSON, &headers)
+
+			case *http2.MetaHeadersFrame:
+				frameJSON.Set("metadata", "type")
+				for _, md := range frame.Fields {
+					frameJSON.Set(md.Value, md.Name)
+				}
+
+			case *http2.DataFrame:
+				frameJSON.Set("data", "type")
+				data := frame.Data()
+				sizeOfData := int64(sizeOfFrame)
+				t.addHTTPBodyDetails(frameJSON, &sizeOfData, bytes.NewReader(data))
+			}
+
+			if isRequest {
+				frameJSON.Set("request", "kind")
+			} else if isResponse {
+				frameJSON.Set("response", "kind")
+			}
+
+			// read next frame
+			frame, _ = framer.ReadFrame()
+		}
+
+		// [ToDo]: gather all `traceAndSpans` and unlock using all of them
+		defer lock.UnlockWithTCPFlags(tcpFlags)
+
+		json.Set(stringFormatter.Format("{0} | {1}", *message, "h2c"), "message")
+
+		return json, true
+	}
+
+	// HTTP/1.1 is not multiplexed, so `StreamID` is always `0`
+	StreamID := http11StreamID
 
 	httpDataReader := bufio.NewReaderSize(bytes.NewReader(appLayerData), len(appLayerData))
 
 	var _ts *traceAndSpan = nil
+
 	fragmented := false // stop tracking is the default behavior
 
 	defer func() {
@@ -967,9 +1096,9 @@ func (t *JSONPcapTranslator) trySetHTTP11(
 		//       - which means that the HTTP Response is not fragmented.
 		// otherwise: allow trace-tracking to continue tagging packets.
 		if _ts != nil {
-			lock.UnlockWithTraceAndSpan(_ts, !fragmented /* stop-tracking */)
+			lock.UnlockWithTraceAndSpan(!fragmented /* stop-tracking */, _ts)
 		} else if ts != nil {
-			lock.UnlockWithTraceAndSpan(ts, !fragmented /* stop-tracking */)
+			lock.UnlockWithTraceAndSpan(!fragmented /* stop-tracking */, ts)
 		} else {
 			lock.UnlockWithTCPFlags(tcpFlags)
 		}
@@ -984,12 +1113,13 @@ func (t *JSONPcapTranslator) trySetHTTP11(
 			L7.Set(url, "url")
 			L7.Set(request.Proto, "proto")
 			L7.Set(request.Method, "method")
-			if _ts = t.setHTTPHeaders(L7, &request.Header); _ts != nil {
+			if _ts = t.addHTTPHeaders(L7, &request.Header); _ts != nil {
+				_ts.streamID = &StreamID
 				// include trace and span id for traceability
 				t.setTraceAndSpan(json, _ts)
 				t.recordHTTP11Request(packet, flowID, sequence, _ts, &request.Method, &request.Host, &url)
 			}
-			t.addHTTP11BodyDetails(L7, &request.ContentLength, request.Body)
+			t.addHTTPBodyDetails(L7, &request.ContentLength, request.Body)
 			json.Set(stringFormatter.Format("{0} | {1} {2} {3}", *message, request.Proto, request.Method, url), "message")
 			return L7, true
 		}
@@ -1003,7 +1133,8 @@ func (t *JSONPcapTranslator) trySetHTTP11(
 			L7.Set(response.Proto, "proto")
 			L7.Set(response.StatusCode, "code")
 			L7.Set(response.Status, "status")
-			if _ts = t.setHTTPHeaders(L7, &response.Header); _ts != nil {
+			if _ts = t.addHTTPHeaders(L7, &response.Header); _ts != nil {
+				_ts.streamID = &StreamID
 				// include trace and span id for traceability
 				t.setTraceAndSpan(json, _ts)
 				if err := t.linkHTTP11ResponseToRequest(packet, flowID, L7, _ts.traceID); err != nil {
@@ -1013,7 +1144,7 @@ func (t *JSONPcapTranslator) trySetHTTP11(
 				t.setTraceAndSpan(json, ts)
 				t.linkHTTP11ResponseToRequest(packet, flowID, L7, ts.traceID)
 			}
-			sizeOfBody := t.addHTTP11BodyDetails(L7, &response.ContentLength, response.Body)
+			sizeOfBody := t.addHTTPBodyDetails(L7, &response.ContentLength, response.Body)
 			if cl, err := strconv.ParseUint(response.Header.Get(httpContentLengthHeader), 10, 64); err == nil {
 				// if content-length is greater than the size of body:
 				//   - this HTTP message is fragmented and so there's more to come
@@ -1045,6 +1176,7 @@ func (t *JSONPcapTranslator) trySetHTTP11(
 		switch {
 		case bytes.EqualFold(nameBytes, cloudTraceContextHeaderBytes):
 			if _ts = t.getTraceAndSpan(&value); _ts != nil {
+				_ts.streamID = &StreamID
 				t.setTraceAndSpan(json, _ts)
 			}
 		case bytes.EqualFold(nameBytes, httpContentLengthHeaderBytes):
@@ -1054,13 +1186,15 @@ func (t *JSONPcapTranslator) trySetHTTP11(
 		}
 	}
 
+	if len(dataBytes) == 1 {
+		return L7, false
+	}
+
 	bodyJSON, _ := L7.Object("body")
 	sizeOfBody := uint64(0)
-	if len(dataBytes) > 1 {
-		sizeOfBody = uint64(len(dataBytes[1]))
-		if sizeOfBody > 0 {
-			bodyJSON.Set(string(dataBytes[1]), "data")
-		}
+	sizeOfBody = uint64(len(dataBytes[1]))
+	if sizeOfBody > 0 {
+		bodyJSON.Set(string(dataBytes[1]), "data")
 	}
 	bodyJSON.Set(sizeOfBody, "length")
 
@@ -1101,7 +1235,7 @@ func (t *JSONPcapTranslator) trySetHTTP11(
 	return L7, true
 }
 
-func (t *JSONPcapTranslator) addHTTP11BodyDetails(L7 *gabs.Container, contentLength *int64, body io.Reader) uint64 {
+func (t *JSONPcapTranslator) addHTTPBodyDetails(L7 *gabs.Container, contentLength *int64, body io.Reader) uint64 {
 	bodyBytes, err := io.ReadAll(body)
 	if err != nil {
 		return 0
@@ -1157,7 +1291,7 @@ func (t *JSONPcapTranslator) linkHTTP11ResponseToRequest(packet *gopacket.Packet
 	return nil
 }
 
-func (t *JSONPcapTranslator) setHTTPHeaders(L7 *gabs.Container, headers *http.Header) *traceAndSpan {
+func (t *JSONPcapTranslator) addHTTPHeaders(L7 *gabs.Container, headers *http.Header) *traceAndSpan {
 	jsonHeaders, _ := L7.Object("headers")
 	var traceAndSpan *traceAndSpan = nil
 	for key, value := range *headers {

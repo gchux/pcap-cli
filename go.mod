@@ -22,6 +22,7 @@ require (
 	github.com/wissance/stringFormatter v1.2.0
 	github.com/zhangyunhao116/skipmap v0.10.1
 	golang.org/x/crypto v0.0.0-20210921155107-089bfa567519
+	golang.org/x/net v0.6.0
 	google.golang.org/protobuf v1.34.2
 )
 

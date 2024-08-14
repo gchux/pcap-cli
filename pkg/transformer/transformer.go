@@ -93,9 +93,12 @@ const (
 	http11RequestPayloadRegexStr  = `^(?P<method>.+?)\s(?P<url>.+?)\sHTTP/1\.1(?:\r?\n)?.*`
 	http11ResponsePayloadRegexStr = `^HTTP/1\.1\s(?P<code>\d{3})\s(?P<status>.+?)(?:\r?\n)?.*`
 	http11LineSeparator           = "\r\n"
+	http2RawFrameRegexStr         = `^\[FrameHeader\s(.+?)\]`
 	httpContentLengthHeader       = "Content-Length"
 	cloudTraceContextHeader       = "X-Cloud-Trace-Context"
 	traceAndSpanRegexStr          = `^(?P<trace>.+?)/(?P<span>.+?)(?:;o=.*)?$`
+
+	http11StreamID = uint32(0)
 )
 
 var (
@@ -170,6 +173,7 @@ var (
 	tcpOptionRgx                 = regexp.MustCompile(tcpOptionsRegex)
 	http11RequestPayloadRegex    = regexp.MustCompile(http11RequestPayloadRegexStr)
 	http11ResponsePayloadRegex   = regexp.MustCompile(http11ResponsePayloadRegexStr)
+	http2RawFrameRegex           = regexp.MustCompile(http2RawFrameRegexStr)
 	http11Separator              = []byte(http11LineSeparator)
 	http11BodySeparator          = []byte(http11LineSeparator + http11LineSeparator)
 	http11HeaderSeparator        = []byte(":")
