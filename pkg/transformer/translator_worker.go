@@ -27,6 +27,7 @@ type (
 
 	traceAndSpan struct {
 		traceID, spanID *string
+		streamID        *uint32
 	}
 )
 

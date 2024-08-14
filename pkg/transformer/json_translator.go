@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Jeffail/gabs/v2"
@@ -20,6 +21,8 @@ import (
 	"github.com/pkg/errors"
 	"github.com/segmentio/fasthash/fnv1a"
 	"github.com/wissance/stringFormatter"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
 
 	mapset "github.com/deckarep/golang-set/v2"
 	csmap "github.com/mhmtszr/concurrent-swiss-map"
@@ -28,15 +31,41 @@ import (
 
 type (
 	JSONPcapTranslator struct {
-		mu                    sync.Mutex
-		iface                 *PcapIface
+		fm               *flowMutex
+		iface            *PcapIface
+		halfOpenFlows    mapset.Set[uint64]
+		establishedFlows mapset.Set[uint64]
+		halfClosedFlows  mapset.Set[uint64]
+		flowToTimestamp  *csmap.CsMap[uint64, *time.Time]
+		// [ToDo]: tracking should mind `StreamID`
 		traceToHttpRequestMap *csmap.CsMap[string, *httpRequest]
-		flowsWithTrace        mapset.Set[uint64]
-		halfOpenFlows         mapset.Set[uint64]
-		establishedFlows      mapset.Set[uint64]
-		halfClosedFlows       mapset.Set[uint64]
-		flowToTimestamp       *csmap.CsMap[uint64, *time.Time]
 		flowToSequenceMap     *csmap.CsMap[uint64, *skipmap.Uint32Map[*traceAndSpan]]
+	}
+
+	UnlockWithTraceAndSpan = func(bool /* stopTracking */, ...*traceAndSpan)
+	UnlockWithTCPFlags     = func(*uint8 /* TCP flags */) bool
+
+	flowMutex struct {
+		MutexMap              sync.Map
+		traceToHttpRequestMap *csmap.CsMap[string, *httpRequest]
+		flowToSequenceMap     *csmap.CsMap[uint64, *skipmap.Uint32Map[*traceAndSpan]]
+	}
+
+	flowLock struct {
+		Unlock                 func() bool
+		UnlockAndRelease       func() bool
+		UnlockWithTCPFlags     UnlockWithTCPFlags
+		UnlockWithTraceAndSpan UnlockWithTraceAndSpan
+	}
+
+	flowLockCarrier struct {
+		mu             *sync.Mutex
+		wg             *sync.WaitGroup
+		released       *atomic.Bool
+		createdAt      *time.Time
+		lastLockedAt   *time.Time
+		lastUnlockedAt *time.Time
+		trackingReaper *time.Timer
 	}
 )
 
@@ -46,7 +75,268 @@ const (
 	jsonTranslationSummaryUDP       = jsonTranslationSummary + "{L4Proto} | {srcProto}/{L3Src}:{L4Src} > {dstProto}/{L3Dst}:{L4Dst}"
 	jsonTranslationSummaryTCP       = jsonTranslationSummaryUDP + " | [{tcpFlags}] | seq/ack:{tcpSeq}/{tcpAck}"
 	jsonTranslationFlowTemplate     = "{0}/iface/{1}/flow/{2}:{3}"
+
+	carrierDeadline  = 300 * time.Second
+	trackingDeadline = 300 * time.Second
 )
+
+// [ToDo]: move `FlowMutex` into its own package/file
+func newFlowMutex(
+	ctx context.Context,
+	flowToSequenceMap *csmap.CsMap[uint64, *skipmap.Uint32Map[*traceAndSpan]],
+	traceToHttpRequestMap *csmap.CsMap[string, *httpRequest],
+) *flowMutex {
+	fm := &flowMutex{
+		flowToSequenceMap:     flowToSequenceMap,
+		traceToHttpRequestMap: traceToHttpRequestMap,
+	}
+	// reap orphaned `flowLockCarrier`s
+	go fm.startReaper(ctx)
+	return fm
+}
+
+func (fm *flowMutex) startReaper(ctx context.Context) {
+	// reaping is necessary as packets translations order is not guaranteed:
+	// so if all non `FIN+ACK`/`RST+*` are seen before other non-termination combinations within the same flow:
+	//   - a new carrier will be created to hold its flow lock, and this carrier will not be organically reaped.
+	// additionally: for connection pooling, long running not-used connections should be dropped to reclaim memory.
+	ticker := time.NewTicker(carrierDeadline)
+
+	for {
+		select {
+		case <-ctx.Done():
+			ticker.Stop()
+			return
+		case <-ticker.C:
+			fm.MutexMap.Range(func(k, v any) bool {
+				flowID := k.(uint64)
+				carrier := v.(*flowLockCarrier)
+				if carrier == nil {
+					return true
+				}
+				lastUnlocked := time.Since(*carrier.lastUnlockedAt)
+				if lastUnlocked >= carrierDeadline && carrier.mu.TryLock() {
+					fm.MutexMap.Delete(flowID)
+					fm.untrackConnection(&flowID)
+					io.WriteString(os.Stderr,
+						fmt.Sprintf("reaped flow '%d' after %v\n", flowID, lastUnlocked))
+				}
+				return true
+			})
+		}
+	}
+}
+
+func (fm *flowMutex) getTraceAndSpan(flowID *uint64, sequence *uint32) (*traceAndSpan, bool) {
+	sequenceToTraceMap, ok := fm.flowToSequenceMap.Load(*flowID)
+
+	// no HTTP/1.1 request with a `traceID` has been seen for this `flowID`
+	if !ok { // it is also possible that packet for HTTP request for this `flowID`
+		return nil, false
+	}
+
+	// an HTTP/1.1 request with a `traceID` has already been seen for this `flowID`
+	var ts, lastTS *traceAndSpan = nil, nil
+	sequenceToTraceMap.Range(func(key uint32, value *traceAndSpan) bool {
+		// Loop over the map keys (ascending sequence numbers) until one greater than `sequence` is found.
+		// HTTP/1.1 is not multiplexed, so a new request using the same TCP connection ( i/e: pooling )
+		// should be observed (alongside its `traceID`) with a higher sequence number than the previous one;
+		// when the key (a sequence number) is greater than the current one, stop looping;
+		// the previously analyzed `key` (sequence number) must be pointing to the correct `traceID`.
+		// TL;DR: `traceID`s exist within a specific TCP sequence range, which configures a boundary.
+		if *sequence > key {
+			ts = value
+		}
+		lastTS = value
+		return true
+	})
+
+	// TCP sequence number is `uint32` so it is possible
+	// for for it to be rolled over if it gets too big.
+	// In such case `sequence` was not greater than any `key` in the map,
+	// so the last visited `key` might be pointing to the correct `traceID`
+	if ts == nil {
+		ts = lastTS
+	}
+
+	return ts, true
+}
+
+func (fm *flowMutex) trackConnection(flowID *uint64, sequence *uint32, ts *traceAndSpan) bool {
+	if ts == nil {
+		return false
+	}
+
+	var sequenceToTraceMap *skipmap.Uint32Map[*traceAndSpan] = nil
+	if ftsm, ok := fm.flowToSequenceMap.Load(*flowID); ok {
+		sequenceToTraceMap = ftsm
+	} else {
+		sequenceToTraceMap = skipmap.NewUint32[*traceAndSpan]()
+		fm.flowToSequenceMap.Store(*flowID, sequenceToTraceMap)
+	}
+	sequenceToTraceMap.Store(*sequence, ts)
+	return true
+}
+
+func (fm *flowMutex) untrackConnection(flowID *uint64) bool {
+	if ftsm, ok := fm.flowToSequenceMap.Load(*flowID); ok {
+		sequences := make([]uint32, ftsm.Len())
+		index := 0
+		ftsm.Range(func(sequence uint32, value *traceAndSpan) bool {
+			sequences[index] = sequence
+			// remove orphaned `traceID`s:
+			fm.traceToHttpRequestMap.Delete(*value.traceID)
+			index += 1
+			return true
+		})
+		for i := index - 1; i >= 0; i-- {
+			ftsm.Delete(sequences[i])
+		}
+		return fm.flowToSequenceMap.Delete(*flowID)
+	}
+	return false
+}
+
+func (fm *flowMutex) isConnectionTermination(tcpFlags *uint8) bool {
+	return *tcpFlags == tcpFinAck || *tcpFlags == tcpRstAck || *tcpFlags == tcpRst
+}
+
+func (fm *flowMutex) newFlowLockCarrier() *flowLockCarrier {
+	var released atomic.Bool
+	released.Store(false)
+	createdAt := time.Now()
+	return &flowLockCarrier{
+		mu:        new(sync.Mutex),
+		wg:        new(sync.WaitGroup),
+		released:  &released,
+		createdAt: &createdAt,
+	}
+}
+
+func (fm *flowMutex) Lock(
+	flowID *uint64,
+	tcpFlags *uint8,
+	sequence, ack *uint32,
+) (*flowLock, *traceAndSpan, bool) {
+	carrier, _ := fm.MutexMap.LoadOrStore(*flowID, fm.newFlowLockCarrier())
+
+	_carrier := carrier.(*flowLockCarrier)
+	mu := _carrier.mu
+	wg := _carrier.wg
+
+	// changing the order os `Wait` and `Lock` causes a deadlock
+	if fm.isConnectionTermination(tcpFlags) {
+		// Connection termination events must wait
+		// for the flow to stop being trace-tracked.
+		// If this flow is not trace-tracked `Wait()` won't block.
+		wg.Wait()
+	}
+
+	mu.Lock()
+	lastLockedAt := time.Now()
+	_carrier.lastLockedAt = &lastLockedAt
+
+	_ts, traced := fm.getTraceAndSpan(flowID, sequence)
+
+	errorHandler := func() {
+		// handle `panic` if `_unlock()`/`_done()` invocations fail
+		if err := recover(); err != nil {
+			io.WriteString(os.Stderr, fmt.Sprintf("error at flow[%d]: %+v\n", *flowID, err))
+		}
+	}
+
+	_unlock := func() {
+		defer func(mu *sync.Mutex) {
+			if err := recover(); err != nil {
+				io.WriteString(os.Stderr, fmt.Sprintf("error at flow[%d]: %+v | %+v\n", *flowID, err, mu))
+			}
+		}(mu)
+		mu.Unlock()
+		lastUnlockedAt := time.Now()
+		_carrier.lastLockedAt = &lastUnlockedAt
+	}
+
+	_done := func() {
+		defer errorHandler()
+		wg.Done()
+	}
+
+	UnlockAndReleaseFN := func() bool {
+		defer _unlock()
+		// many translations within the same flow may be waiting to acquire the lock;
+		// if multiple translations try to release, i/e: 2*`FIN+ACK`,
+		// then both will release the lock, but just 1 must yield connection untracking.
+		if _carrier.released.CompareAndSwap(false, true) {
+			fm.MutexMap.Delete(*flowID)
+			return fm.untrackConnection(flowID)
+		}
+		return false
+	}
+
+	UnlockWithTCPFlagsFN := func(tcpFlags *uint8) bool {
+		if fm.isConnectionTermination(tcpFlags) {
+			return UnlockAndReleaseFN()
+		}
+		_unlock()
+		return false
+	}
+
+	UnlockFn := func() bool {
+		return UnlockWithTCPFlagsFN(tcpFlags)
+	}
+
+	// since all TCP data is known:
+	//   - it is possible to return a `traceID`
+	//   - since this is guarded by a lock, it is thread-safe
+	// much richer analysis is also possible
+
+	// these are the only methods for consumers to interact with the lock
+	lock := &flowLock{
+		Unlock:             UnlockFn,
+		UnlockAndRelease:   UnlockAndReleaseFN,
+		UnlockWithTCPFlags: UnlockWithTCPFlagsFN,
+	}
+
+	if *tcpFlags == tcpPshAck {
+		// provide trace tracking only for TCP `PSH+ACK`
+		// [ToDo]: support unlocking with multiple `traceAndSpan`s:
+		//           - required by h2c multiplexing ( multiple streams within the same TCP segment )
+		lock.UnlockWithTraceAndSpan = func(stopTracking bool, tss ...*traceAndSpan) {
+			defer _unlock()
+			// if any `flow` unlocks with `traceAndSpan`: increment `WaitGroup`:
+			//   - `FIN+ACK`/`RST+*` should not get the lock until the `WaitGroup` is done.
+			if traced && len(tss) > 0 && (*tss[0].traceID == *_ts.traceID) && stopTracking {
+				_done()
+				// if `traced` is `true`, `trackConnection` succeeded and so `trackingReaper` is available
+				_carrier.trackingReaper.Stop()
+				// [ToDo]: delete trace from `flowToSequenceMap`
+				_carrier.trackingReaper = nil // allow GC to collect the reaper
+			} else if !traced && len(tss) > 0 {
+				wg.Add(1)
+				if !fm.trackConnection(flowID, sequence, tss[0]) {
+					_done() // connection tracking failed, unblock
+					return
+				}
+				// unlock orphaned trace-tracked connections: allow termination events to continue
+				_carrier.trackingReaper = time.AfterFunc(trackingDeadline, func() {
+					_done()
+					io.WriteString(os.Stderr,
+						fmt.Sprintf("unlocked flow '%d' after %v\n", flowID, trackingDeadline))
+				})
+			} else {
+				_done()
+			}
+		}
+	} else {
+		// do not provide trace tracking for non TCP `PSH+ACK`
+		lock.UnlockWithTraceAndSpan = func(bool, ...*traceAndSpan) {
+			// fallback to unlock by TCP flags
+			UnlockWithTCPFlagsFN(tcpFlags)
+		}
+	}
+
+	return lock, _ts, traced
+}
 
 func (t *JSONPcapTranslator) translate(packet *gopacket.Packet) error {
 	return fmt.Errorf("not implemented")
@@ -502,11 +792,6 @@ func (t *JSONPcapTranslator) finalize(
 	operation.Set(stringFormatter.Format(jsonTranslationFlowTemplate, id, t.iface.Name, "tcp", flowIDstr), "id")
 
 	setFlags, _ := json.Path("L4.flags.dec").Data().(uint8)
-
-	if conntrack {
-		t.trackConnection(p, &flowID, &setFlags, json)
-	}
-
 	if setFlagsStr, ok := tcpFlagsStr[setFlags]; ok {
 		data["tcpFlags"] = setFlagsStr
 	} else {
@@ -525,24 +810,42 @@ func (t *JSONPcapTranslator) finalize(
 	ack, _ := json.Path("L4.ack").Data().(uint32)
 	data["tcpAck"] = ack
 
+	// `finalize` is invoked from a `worker` via a go-routine `pool`:
+	//   - there are no guarantees about which packet will get `finalize`d 1st
+	//   - there are no guarantees about about which packet will get the `lock` next
+	// minimize locking: lock per-flow instead of across-flows.
+	// locking is done in the name of throubleshoot-ability, so some contention should be acceptable...
+	lock, ts, traced := t.fm.Lock(&flowID, &setFlags, &seq, &ack)
+
+	if conntrack {
+		t.analyzeConnection(p, &flowID, &setFlags, json)
+	}
+
 	message := stringFormatter.FormatComplex(jsonTranslationSummaryTCP, data)
 
 	appLayer := (*p).ApplicationLayer()
 	if setFlags == tcpPshAck && appLayer != nil {
-		return t.addAppLayerData(p, &setFlags, &appLayer, &flowID, &seq, json, &message)
-	} else {
-		t.trySetTraceAndSpan(json, &flowID, &seq, true /* lock */)
+		return t.addAppLayerData(lock, p, &setFlags, &appLayer, &flowID, &seq, json, &message, ts)
 	}
 
-	if setFlags == tcpFinAck || setFlags == tcpRst {
-		defer t.untrackConnection(&flowID)
-	}
+	// packet is not carrying any data, unlock using TCP flags
+	defer lock.UnlockWithTCPFlags(&setFlags)
 
 	json.Set(message, "message")
+
+	if traced {
+		t.setTraceAndSpan(json, ts)
+	}
+
 	return json, nil
 }
 
-func (t *JSONPcapTranslator) trackConnection(packet *gopacket.Packet, flowID *uint64, flags *uint8, json *gabs.Container) {
+func (t *JSONPcapTranslator) analyzeConnection(
+	packet *gopacket.Packet,
+	flowID *uint64,
+	flags *uint8,
+	json *gabs.Container,
+) {
 	fl := *flags
 	fid := *flowID
 
@@ -586,79 +889,11 @@ func (t *JSONPcapTranslator) trackConnection(packet *gopacket.Packet, flowID *ui
 
 	if shouldRemoveTracking {
 		t.flowToTimestamp.Delete(fid)
-		go t.untrackConnection(flowID)
 	}
-}
-
-func (t *JSONPcapTranslator) untrackConnection(flowID *uint64) bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	if ftsm, ok := t.flowToSequenceMap.Load(*flowID); ok {
-		sequences := make([]uint32, ftsm.Len())
-		index := 0
-		ftsm.Range(func(sequence uint32, value *traceAndSpan) bool {
-			sequences[index] = sequence
-			// remove orphaned `traceID`s:
-			t.traceToHttpRequestMap.Delete(*value.traceID)
-			index += 1
-			return true
-		})
-		for i := index - 1; i >= 0; i-- {
-			ftsm.Delete(sequences[i])
-		}
-		t.flowsWithTrace.Remove(*flowID)
-		return t.flowToSequenceMap.Delete(*flowID)
-	}
-	return false
-}
-
-func (t *JSONPcapTranslator) trySetTraceAndSpan(json *gabs.Container, flowID *uint64, sequence *uint32, lock bool) (*traceAndSpan, bool) {
-	if lock {
-		// this is necessary because:
-		//   - `trySetHTTP11` will attempt to set `traceID` by TCP sequence if HTTP Reqponse does not contain trace headers
-		//     - in such scenario: `trySetHTTP11` already has the lock so locking again must be skipped to prevent a deadlock
-		t.mu.Lock()
-		defer t.mu.Unlock()
-	}
-
-	sequenceToTraceMap, ok := t.flowToSequenceMap.Load(*flowID)
-
-	// no HTTP/1.1 request with a `traceID` has been seen for this `flowID`
-	if !ok { // it is also possible that packet for HTTP request for this `flowID`
-		return nil, false
-	}
-
-	// an HTTP/1.1 request with a `traceID` has already been seen for this `flowID`
-	var ts, lastTS *traceAndSpan = nil, nil
-	sequenceToTraceMap.Range(func(key uint32, value *traceAndSpan) bool {
-		// Loop over the map keys (ascending sequence numbers) until one greater than `sequence` is found.
-		// HTTP/1.1 is not multiplexed, so a new request using the same TCP connection ( i/e: pooling )
-		// should be observed (alongside its `traceID`) with a higher sequence number than the previous one;
-		// when the key (a sequence number) is greater than the current one, stop looping;
-		// the previously analyzed `key` (sequence number) must be pointing to the correct `traceID`.
-		// TL;DR: `traceID`s exist within a specific TCP sequence range, which configures a boundary.
-		if *sequence > key {
-			ts = value
-		}
-		lastTS = value
-		return true
-	})
-
-	// TCP sequence number is `uint32` so it is possible
-	// for for it to be rolled over if it gets too big.
-	// In such case `sequence` was not greater than any `key` in the map,
-	// so the last visited `key` might be pointing to the correct `traceID`
-	if ts == nil {
-		ts = lastTS
-	}
-
-	t.setTraceAndSpan(json, ts.traceID, ts.spanID)
-
-	return ts, true
 }
 
 func (t *JSONPcapTranslator) addAppLayerData(
+	lock *flowLock,
 	packet *gopacket.Packet,
 	tcpFlags *uint8,
 	appLayer *gopacket.ApplicationLayer,
@@ -666,18 +901,31 @@ func (t *JSONPcapTranslator) addAppLayerData(
 	sequence *uint32,
 	json *gabs.Container,
 	message *string,
+	ts *traceAndSpan,
 ) (*gabs.Container, error) {
 	appLayerData := (*appLayer).LayerContents()
 
 	sizeOfAppLayerData := len(appLayerData)
 	if sizeOfAppLayerData == 0 {
+		lock.UnlockWithTCPFlags(tcpFlags)
 		return json, errors.New("AppLayer is empty")
 	}
 
-	if L7, ok := t.trySetHTTP11(packet, tcpFlags,
-		appLayerData, flowID, sequence, json, message); ok {
-		L7.Set(sizeOfAppLayerData, "length")
+	if L7, ok := t.trySetHTTP(lock, packet, tcpFlags,
+		appLayerData, flowID, sequence, json, message, ts); ok {
+		// this `size` is not the same as `length`:
+		//   - `size` includes everything, not only the HTTP `payload`
+		L7.Set(sizeOfAppLayerData, "size")
+		// `trySetHTTP11()` unlocks if data is HTTP
 		return json, nil
+	}
+
+	if ts != nil {
+		// if data is not HTTP, unlock with `traceAndSpan`
+		defer lock.UnlockWithTraceAndSpan(
+			sizeOfAppLayerData >= 1 /* stop-tracking */, ts)
+	} else {
+		defer lock.UnlockWithTCPFlags(tcpFlags)
 	}
 
 	// best-effort to add some information about L7
@@ -686,14 +934,20 @@ func (t *JSONPcapTranslator) addAppLayerData(
 
 	L7, _ := json.Object("L7")
 	L7.Set(sizeOfAppLayerData, "length")
-	L7.Set(string(appLayerData), "content")
 
-	t.trySetTraceAndSpan(json, flowID, sequence, true /* lock */)
+	if sizeOfAppLayerData > 256 {
+		L7.Set(string(appLayerData[:256-3])+"...", "sample")
+	} else {
+		L7.Set(string(appLayerData), "content")
+	}
+
+	t.setTraceAndSpan(json, ts)
 
 	return json, nil
 }
 
-func (t *JSONPcapTranslator) trySetHTTP11(
+func (t *JSONPcapTranslator) trySetHTTP(
+	lock *flowLock,
 	packet *gopacket.Packet,
 	tcpFlags *uint8,
 	appLayerData []byte,
@@ -701,15 +955,16 @@ func (t *JSONPcapTranslator) trySetHTTP11(
 	sequence *uint32,
 	json *gabs.Container,
 	message *string,
+	ts *traceAndSpan,
 ) (*gabs.Container, bool) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
 	isHTTP11Request := http11RequestPayloadRegex.Match(appLayerData)
 	isHTTP11Response := !isHTTP11Request && http11ResponsePayloadRegex.Match(appLayerData)
 
+	framer := http2.NewFramer(io.Discard, bytes.NewReader(appLayerData))
+	frame, _ := framer.ReadFrame()
+
 	// if content is not HTTP in clear text, abort
-	if !isHTTP11Request && !isHTTP11Response {
+	if !isHTTP11Request && !isHTTP11Response && frame == nil {
 		json.Set(*message, "message")
 		return nil, false
 	}
@@ -719,9 +974,135 @@ func (t *JSONPcapTranslator) trySetHTTP11(
 	//     which is not always the case when fragmentation occurs
 	L7, _ := json.Object("http")
 
-	L7.Set("HTTP", "type")
+	// handle h2c traffic
+	if frame != nil {
+		L7.Set("h2c", "proto")
+		streams, _ := L7.Object("streams")
+		_, _ = L7.Array("includes")
+
+		// multple h2 frames ( from multiple streams ) may be delivered by the same packet
+		for frame != nil {
+
+			isRequest := false
+			isResponse := false
+
+			frameHeader := frame.Header()
+
+			// h2 is multiplexed, `StreamID` will allows to link HTTP conversations
+			StreamID := frameHeader.StreamID
+			StreamIDstr := strconv.FormatUint(uint64(StreamID), 10)
+
+			var stream, frames *gabs.Container
+			if stream = streams.S(StreamIDstr); stream == nil {
+				stream, _ = streams.Object(StreamIDstr)
+				_, _ = stream.Array("frames")
+				stream.Set(StreamID, "id")
+				L7.ArrayAppend(StreamID, "includes")
+			} else if frames = stream.S("frames"); frames == nil {
+				_, _ = stream.Array("frames")
+			}
+
+			frameJSON := gabs.New()
+			stream.ArrayAppend(frameJSON, "frames")
+
+			if m := http2RawFrameRegex.
+				FindStringSubmatch(frameHeader.String()); len(m) > 0 {
+				frameJSON.Set(m[1], "raw")
+			}
+
+			sizeOfFrame := frameHeader.Length /* uint32 */
+			frameJSON.Set(sizeOfFrame, "length")
+
+			// see: https://pkg.go.dev/golang.org/x/net/http2#Flags
+			frameJSON.Set("0b"+strconv.FormatUint(uint64(frameHeader.Flags /* uint8 */), 2), "flags")
+
+			switch frame := frame.(type) {
+			case *http2.PingFrame:
+				frameJSON.Set("ping", "type")
+				frameJSON.Set(frame.IsAck(), "ack")
+				frameJSON.Set(string(frame.Data[:]), "data")
+
+			case *http2.SettingsFrame:
+				frameJSON.Set("sttings", "type")
+				settings, _ := frameJSON.Object("settings")
+				frame.ForeachSetting(func(s http2.Setting) error {
+					// see: https://pkg.go.dev/golang.org/x/net/http2#SettingID
+					settings.Set(strconv.FormatUint(uint64(s.Val), 10),
+						"0x"+strconv.FormatUint(uint64(s.ID), 16))
+					return nil
+				})
+				frameJSON.Set(frame.IsAck(), "ack")
+
+			case *http2.HeadersFrame:
+				decoder := hpack.NewDecoder(2048, nil)
+				hf, _ := decoder.DecodeFull(frame.HeaderBlockFragment())
+				headers := http.Header{}
+				for _, header := range hf {
+					isRequest = (isRequest || (header.Name == ":method"))
+					isResponse = (isResponse || (header.Name == ":status"))
+					// `Add(...)` internally applies `http.CanonicalHeaderKey(...)`
+					headers.Add(header.Name, header.Value)
+				}
+				decoder.Close()
+				frameJSON.Set("headers", "type")
+				// [ToDo]: gather all `traceAndSpans`
+				_ = t.addHTTPHeaders(frameJSON, &headers)
+
+			case *http2.MetaHeadersFrame:
+				frameJSON.Set("metadata", "type")
+				for _, md := range frame.Fields {
+					frameJSON.Set(md.Value, md.Name)
+				}
+
+			case *http2.DataFrame:
+				frameJSON.Set("data", "type")
+				data := frame.Data()
+				sizeOfData := int64(sizeOfFrame)
+				t.addHTTPBodyDetails(frameJSON, &sizeOfData, bytes.NewReader(data))
+			}
+
+			if isRequest {
+				frameJSON.Set("request", "kind")
+			} else if isResponse {
+				frameJSON.Set("response", "kind")
+			}
+
+			// read next frame
+			frame, _ = framer.ReadFrame()
+		}
+
+		// [ToDo]: gather all `traceAndSpans` and unlock using all of them
+		defer lock.UnlockWithTCPFlags(tcpFlags)
+
+		json.Set(stringFormatter.Format("{0} | {1}", *message, "h2c"), "message")
+
+		return json, true
+	}
+
+	// HTTP/1.1 is not multiplexed, so `StreamID` is always `0`
+	StreamID := http11StreamID
 
 	httpDataReader := bufio.NewReaderSize(bytes.NewReader(appLayerData), len(appLayerData))
+
+	var _ts *traceAndSpan = nil
+
+	fragmented := false // stop tracking is the default behavior
+
+	defer func() {
+		// some HTTP Servers split headers and body by flushing immediately after headers,
+		// so if this packet is carrying an HTTP Response, stop trace-tracking if:
+		//   - the packet contains the full HTTP Response body, or more specifically:
+		//     - if the `Content-Length` header value is equal to the observed `size-of-payload`:
+		//       - which means that the HTTP Response is not fragmented.
+		// otherwise: allow trace-tracking to continue tagging packets.
+		if _ts != nil {
+			lock.UnlockWithTraceAndSpan(!fragmented /* stop-tracking */, _ts)
+		} else if ts != nil {
+			lock.UnlockWithTraceAndSpan(!fragmented /* stop-tracking */, ts)
+		} else {
+			lock.UnlockWithTCPFlags(tcpFlags)
+		}
+	}()
 
 	// attempt to parse HTTP/1.1 request
 	if isHTTP11Request {
@@ -732,13 +1113,13 @@ func (t *JSONPcapTranslator) trySetHTTP11(
 			L7.Set(url, "url")
 			L7.Set(request.Proto, "proto")
 			L7.Set(request.Method, "method")
-			if traceAndSpan := t.setHTTPHeaders(L7, &request.Header); traceAndSpan != nil {
-				t.flowsWithTrace.Add(*flowID)
+			if _ts = t.addHTTPHeaders(L7, &request.Header); _ts != nil {
+				_ts.streamID = &StreamID
 				// include trace and span id for traceability
-				t.setTraceAndSpan(json, &traceAndSpan[0], &traceAndSpan[1])
-				t.recordHTTP11Request(packet, flowID, sequence, &traceAndSpan[0], &traceAndSpan[1], &request.Method, &request.Host, &url)
+				t.setTraceAndSpan(json, _ts)
+				t.recordHTTP11Request(packet, flowID, sequence, _ts, &request.Method, &request.Host, &url)
 			}
-			t.addHTTP11BodyDetails(L7, &request.ContentLength, request.Body)
+			t.addHTTPBodyDetails(L7, &request.ContentLength, request.Body)
 			json.Set(stringFormatter.Format("{0} | {1} {2} {3}", *message, request.Proto, request.Method, url), "message")
 			return L7, true
 		}
@@ -752,17 +1133,25 @@ func (t *JSONPcapTranslator) trySetHTTP11(
 			L7.Set(response.Proto, "proto")
 			L7.Set(response.StatusCode, "code")
 			L7.Set(response.Status, "status")
-			if traceAndSpan := t.setHTTPHeaders(L7, &response.Header); traceAndSpan != nil {
+			if _ts = t.addHTTPHeaders(L7, &response.Header); _ts != nil {
+				_ts.streamID = &StreamID
 				// include trace and span id for traceability
-				t.setTraceAndSpan(json, &traceAndSpan[0], &traceAndSpan[1])
-				if err := t.linkHTTP11ResponseToRequest(packet, tcpFlags, flowID, L7, &traceAndSpan[0]); err != nil {
+				t.setTraceAndSpan(json, _ts)
+				if err := t.linkHTTP11ResponseToRequest(packet, flowID, L7, _ts.traceID); err != nil {
 					io.WriteString(os.Stderr, err.Error()+"\n")
 				}
-			} else if ts, ok := t.trySetTraceAndSpan(json, flowID, sequence, false /* lock */); ok {
-				t.linkHTTP11ResponseToRequest(packet, tcpFlags, flowID, L7, ts.traceID)
+			} else if ts != nil {
+				t.setTraceAndSpan(json, ts)
+				t.linkHTTP11ResponseToRequest(packet, flowID, L7, ts.traceID)
 			}
-			t.addHTTP11BodyDetails(L7, &response.ContentLength, response.Body)
-			json.Set(stringFormatter.Format("{0} | {1} {2}", *message, response.Proto, response.Status), "message")
+			sizeOfBody := t.addHTTPBodyDetails(L7, &response.ContentLength, response.Body)
+			if cl, err := strconv.ParseUint(response.Header.Get(httpContentLengthHeader), 10, 64); err == nil {
+				// if content-length is greater than the size of body:
+				//   - this HTTP message is fragmented and so there's more to come
+				fragmented = cl > sizeOfBody
+			}
+			json.Set(stringFormatter.Format("{0} | {1} {2} | fragmented:{3}",
+				*message, response.Proto, response.Status, fragmented), "message")
 			return L7, true
 		}
 	}
@@ -770,41 +1159,59 @@ func (t *JSONPcapTranslator) trySetHTTP11(
 	// fallback to a minimal (naive) attempt to parse HTTP/1.1
 	// see: https://www.rfc-editor.org/rfc/rfc7540#section-8.1.3
 	dataBytes := bytes.SplitN(appLayerData, http11BodySeparator, 2)
+	// `parts` is everything before HTTP payload separator (`2*line-break`)
+	//   - it includes: the HTTP line, and HTTP headers
 	parts := bytes.Split(dataBytes[0], http11Separator)
 
-	var traceAndSpan []string = nil
+	contentLength := uint64(0)
 
 	headers, _ := L7.Object("headers")
+	// HTTP headers starts at `parts[1]`
 	for _, header := range parts[1:] {
 		headerParts := bytes.SplitN(header, http11HeaderSeparator, 2)
+		nameBytes := bytes.TrimSpace(headerParts[0])
 		value := string(bytes.TrimSpace(headerParts[1]))
-		headers.Set(value, string(headerParts[0]))
+		headers.Set(value, string(nameBytes))
 		// include trace and span id for traceability
-		if bytes.EqualFold(parts[0], cloudTraceContextHeaderBytes) {
-			if traceAndSpan = t.getTraceAndSpan(&value); traceAndSpan != nil {
-				t.setTraceAndSpan(json, &traceAndSpan[0], &traceAndSpan[1])
+		switch {
+		case bytes.EqualFold(nameBytes, cloudTraceContextHeaderBytes):
+			if _ts = t.getTraceAndSpan(&value); _ts != nil {
+				_ts.streamID = &StreamID
+				t.setTraceAndSpan(json, _ts)
+			}
+		case bytes.EqualFold(nameBytes, httpContentLengthHeaderBytes):
+			if cl, err := strconv.ParseUint(value, 10, 64); err == nil {
+				contentLength = cl
 			}
 		}
 	}
 
+	if len(dataBytes) == 1 {
+		return L7, false
+	}
+
 	bodyJSON, _ := L7.Object("body")
-	sizeOfBody := len(dataBytes[1])
-	bodyJSON.Set(sizeOfBody, "length")
+	sizeOfBody := uint64(0)
+	sizeOfBody = uint64(len(dataBytes[1]))
 	if sizeOfBody > 0 {
 		bodyJSON.Set(string(dataBytes[1]), "data")
 	}
+	bodyJSON.Set(sizeOfBody, "length")
 
+	fragmented = contentLength > sizeOfBody
+
+	// `parts[0]` contains the HTTP line
 	line := string(parts[0])
 	L7.Set(line, "line")
-	json.Set(stringFormatter.Format("{0} | {1}", *message, line), "message")
+	json.Set(stringFormatter.Format("{0} | {1} | fragmented:{2}", *message, line, fragmented), "message")
 
 	if isHTTP11Request {
 		requestParts := http11RequestPayloadRegex.FindStringSubmatch(line)
 		L7.Set(requestParts[1], "method")
 		L7.Set(requestParts[2], "url")
 		host := "0"
-		if traceAndSpan != nil {
-			t.recordHTTP11Request(packet, flowID, sequence, &traceAndSpan[0], &traceAndSpan[1], &requestParts[1], &host, &requestParts[2])
+		if _ts != nil {
+			t.recordHTTP11Request(packet, flowID, sequence, _ts, &requestParts[1], &host, &requestParts[2])
 		}
 		return L7, true
 	}
@@ -817,35 +1224,40 @@ func (t *JSONPcapTranslator) trySetHTTP11(
 		L7.Set(responseParts[1], "code")
 	}
 	L7.Set(responseParts[2], "status")
-	if traceAndSpan != nil {
-		if err := t.linkHTTP11ResponseToRequest(packet, tcpFlags, flowID, L7, &traceAndSpan[0]); err != nil {
+	if _ts != nil {
+		if err := t.linkHTTP11ResponseToRequest(packet, flowID, L7, _ts.traceID); err != nil {
 			io.WriteString(os.Stderr, err.Error()+"\n")
 		}
-	} else if ts, ok := t.trySetTraceAndSpan(json, flowID, sequence, false /* lock */); ok {
-		t.linkHTTP11ResponseToRequest(packet, tcpFlags, flowID, L7, ts.traceID)
+	} else if ts != nil {
+		t.setTraceAndSpan(json, ts)
+		t.linkHTTP11ResponseToRequest(packet, flowID, L7, ts.traceID)
 	}
 	return L7, true
 }
 
-func (t *JSONPcapTranslator) addHTTP11BodyDetails(L7 *gabs.Container, length *int64, body io.Reader) {
+func (t *JSONPcapTranslator) addHTTPBodyDetails(L7 *gabs.Container, contentLength *int64, body io.Reader) uint64 {
 	bodyBytes, err := io.ReadAll(body)
 	if err != nil {
-		return
+		return 0
 	}
 
 	bodyJSON, _ := L7.Object("body")
 
-	sizeOfBody := len(bodyBytes)
+	sizeOfBody := uint64(len(bodyBytes))
 	bodyLengthJSON, _ := bodyJSON.ArrayOfSize(2, "length")
 	bodyLengthJSON.SetIndex(sizeOfBody, 0)
-	bodyLengthJSON.SetIndex(*length, 1)
+	bodyLengthJSON.SetIndex(*contentLength, 1)
 
-	if sizeOfBody > 0 {
+	if sizeOfBody > 512 {
+		bodyJSON.Set(string(bodyBytes[:512-3])+"...", "sample")
+	} else {
 		bodyJSON.Set(string(bodyBytes), "data")
 	}
+
+	return sizeOfBody
 }
 
-func (t *JSONPcapTranslator) recordHTTP11Request(packet *gopacket.Packet, flowID *uint64, sequence *uint32, traceID, spanID, method, host, url *string) {
+func (t *JSONPcapTranslator) recordHTTP11Request(packet *gopacket.Packet, flowID *uint64, sequence *uint32, ts *traceAndSpan, method, host, url *string) {
 	fullURL := stringFormatter.Format("{0}{1}", *host, *url)
 	_httpRequest := &httpRequest{
 		timestamp: &(*packet).Metadata().Timestamp,
@@ -853,20 +1265,10 @@ func (t *JSONPcapTranslator) recordHTTP11Request(packet *gopacket.Packet, flowID
 		url:       &fullURL,
 	}
 	// if a response is never seen for this trace id, it will cause a memory leak
-	t.traceToHttpRequestMap.SetIfAbsent(*traceID, _httpRequest)
-
-	var sequenceToTraceMap *skipmap.Uint32Map[*traceAndSpan] = nil
-	if ftsm, ok := t.flowToSequenceMap.Load(*flowID); ok {
-		sequenceToTraceMap = ftsm
-	} else {
-		t.flowsWithTrace.Add(*flowID)
-		sequenceToTraceMap = skipmap.NewUint32[*traceAndSpan]()
-		t.flowToSequenceMap.Store(*flowID, sequenceToTraceMap)
-	}
-	sequenceToTraceMap.Store(*sequence, &traceAndSpan{traceID, spanID})
+	t.traceToHttpRequestMap.SetIfAbsent(*ts.traceID, _httpRequest)
 }
 
-func (t *JSONPcapTranslator) linkHTTP11ResponseToRequest(packet *gopacket.Packet, flags *uint8, flowID *uint64, response *gabs.Container, traceID *string) error {
+func (t *JSONPcapTranslator) linkHTTP11ResponseToRequest(packet *gopacket.Packet, flowID *uint64, response *gabs.Container, traceID *string) error {
 	jsonTranslatorRequest, ok := t.traceToHttpRequestMap.Load(*traceID)
 	if !ok {
 		return errors.New(stringFormatter.Format("no request found for trace-id: {0}", *traceID))
@@ -889,9 +1291,9 @@ func (t *JSONPcapTranslator) linkHTTP11ResponseToRequest(packet *gopacket.Packet
 	return nil
 }
 
-func (t *JSONPcapTranslator) setHTTPHeaders(L7 *gabs.Container, headers *http.Header) []string {
+func (t *JSONPcapTranslator) addHTTPHeaders(L7 *gabs.Container, headers *http.Header) *traceAndSpan {
 	jsonHeaders, _ := L7.Object("headers")
-	var traceAndSpan []string = nil
+	var traceAndSpan *traceAndSpan = nil
 	for key, value := range *headers {
 		jsonHeaders.Set(value, key)
 		if strings.EqualFold(key, cloudTraceContextHeader) {
@@ -901,17 +1303,24 @@ func (t *JSONPcapTranslator) setHTTPHeaders(L7 *gabs.Container, headers *http.He
 	return traceAndSpan
 }
 
-func (t *JSONPcapTranslator) getTraceAndSpan(rawTraceAndSpan *string) []string {
-	if traceAndSpan := traceAndSpanRegex.FindStringSubmatch(*rawTraceAndSpan); traceAndSpan != nil {
-		return traceAndSpan[1:]
+func (t *JSONPcapTranslator) getTraceAndSpan(rawTraceAndSpan *string) *traceAndSpan {
+	if ts := traceAndSpanRegex.FindStringSubmatch(*rawTraceAndSpan); ts != nil {
+		return &traceAndSpan{traceID: &ts[1], spanID: &ts[2]}
 	}
 	return nil
 }
 
-func (t *JSONPcapTranslator) setTraceAndSpan(json *gabs.Container, traceID, spanID *string) {
-	json.Set(cloudTracePrefix+*traceID, "logging.googleapis.com/trace")
-	json.Set(*spanID, "logging.googleapis.com/spanId")
+func (t *JSONPcapTranslator) setTraceAndSpan(json *gabs.Container, ts *traceAndSpan) bool {
+	if ts == nil {
+		json.Set(false, "logging.googleapis.com/trace_sampled")
+		return false
+	}
+
+	json.Set(cloudTracePrefix+*ts.traceID, "logging.googleapis.com/trace")
+	json.Set(*ts.spanID, "logging.googleapis.com/spanId")
 	json.Set(true, "logging.googleapis.com/trace_sampled")
+
+	return true
 }
 
 func (t *JSONPcapTranslator) toJSONBytes(packet *fmt.Stringer) (int, []byte, error) {
@@ -939,7 +1348,7 @@ func (t *JSONPcapTranslator) write(ctx context.Context, writer io.Writer, packet
 	return writtenBytes, nil
 }
 
-func newJSONPcapTranslator(iface *PcapIface) *JSONPcapTranslator {
+func newJSONPcapTranslator(ctx context.Context, iface *PcapIface) *JSONPcapTranslator {
 	traceToHttpRequestMap := csmap.Create(
 		// set the number of map shards. the default value is 32.
 		csmap.WithShardCount[string, *httpRequest](32),
@@ -957,7 +1366,6 @@ func newJSONPcapTranslator(iface *PcapIface) *JSONPcapTranslator {
 		csmap.WithSize[uint64, *time.Time](1000),
 	)
 
-	flowsWithTrace := mapset.NewSet[uint64]()
 	halfOpenFlows := mapset.NewSet[uint64]()
 	halfClosedFlows := mapset.NewSet[uint64]()
 	establishedFlows := mapset.NewSet[uint64]()
@@ -969,13 +1377,13 @@ func newJSONPcapTranslator(iface *PcapIface) *JSONPcapTranslator {
 	)
 
 	return &JSONPcapTranslator{
+		fm:                    newFlowMutex(ctx, flowToSequenceMap, traceToHttpRequestMap),
 		iface:                 iface,
 		traceToHttpRequestMap: traceToHttpRequestMap,
 		flowToTimestamp:       flowToTimestamp,
 		halfOpenFlows:         halfOpenFlows,
 		halfClosedFlows:       halfClosedFlows,
 		establishedFlows:      establishedFlows,
-		flowsWithTrace:        flowsWithTrace,
 		flowToSequenceMap:     flowToSequenceMap,
 	}
 }

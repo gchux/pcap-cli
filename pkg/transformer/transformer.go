@@ -93,8 +93,12 @@ const (
 	http11RequestPayloadRegexStr  = `^(?P<method>.+?)\s(?P<url>.+?)\sHTTP/1\.1(?:\r?\n)?.*`
 	http11ResponsePayloadRegexStr = `^HTTP/1\.1\s(?P<code>\d{3})\s(?P<status>.+?)(?:\r?\n)?.*`
 	http11LineSeparator           = "\r\n"
+	http2RawFrameRegexStr         = `^\[FrameHeader\s(.+?)\]`
+	httpContentLengthHeader       = "Content-Length"
 	cloudTraceContextHeader       = "X-Cloud-Trace-Context"
 	traceAndSpanRegexStr          = `^(?P<trace>.+?)/(?P<span>.+?)(?:;o=.*)?$`
+
+	http11StreamID = uint32(0)
 )
 
 var (
@@ -169,9 +173,11 @@ var (
 	tcpOptionRgx                 = regexp.MustCompile(tcpOptionsRegex)
 	http11RequestPayloadRegex    = regexp.MustCompile(http11RequestPayloadRegexStr)
 	http11ResponsePayloadRegex   = regexp.MustCompile(http11ResponsePayloadRegexStr)
+	http2RawFrameRegex           = regexp.MustCompile(http2RawFrameRegexStr)
 	http11Separator              = []byte(http11LineSeparator)
 	http11BodySeparator          = []byte(http11LineSeparator + http11LineSeparator)
 	http11HeaderSeparator        = []byte(":")
+	httpContentLengthHeaderBytes = []byte(httpContentLengthHeader)
 	cloudTraceContextHeaderBytes = []byte(cloudTraceContextHeader)
 	traceAndSpanRegex            = regexp.MustCompile(traceAndSpanRegexStr)
 	cloudProjectID               = os.Getenv(projectIdEnvVarName)
@@ -259,10 +265,10 @@ func (t *PcapTransformer) writeTranslationFn(ctx context.Context, task interface
 	t.writeTranslation(ctx, task.(*pcapWriteTask))
 }
 
-func newTranslator(iface *PcapIface, format PcapTranslatorFmt) (PcapTranslator, error) {
+func newTranslator(ctx context.Context, iface *PcapIface, format PcapTranslatorFmt) (PcapTranslator, error) {
 	switch format {
 	case JSON:
-		return newJSONPcapTranslator(iface), nil
+		return newJSONPcapTranslator(ctx, iface), nil
 	case TEXT:
 		return newTextPcapTranslator(iface), nil
 	case PROTO:
@@ -355,7 +361,7 @@ func provideStrategy(transformer *PcapTransformer, preserveOrder, connTracking b
 // transformers get instances of `io.Writer` instead of `pcap.PcapWriter` to prevent closing.
 func newTransformer(ctx context.Context, iface *PcapIface, writers []io.Writer, format *string, preserveOrder, connTracking bool) (IPcapTransformer, error) {
 	pcapFmt := pcapTranslatorFmts[*format]
-	translator, err := newTranslator(iface, pcapFmt)
+	translator, err := newTranslator(ctx, iface, pcapFmt)
 	if err != nil {
 		return nil, err
 	}
