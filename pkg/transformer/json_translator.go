@@ -31,15 +31,6 @@ import (
 )
 
 type (
-	TracedFlow struct {
-		ts        *traceAndSpan
-		unblocker *time.Timer
-		isActive  *atomic.Bool
-	}
-	STTFM  = *skipmap.Uint32Map[*TracedFlow] // SequenceToTracedFlowMap
-	FTSM   = *haxmap.Map[uint32, STTFM]      // FlowToStreamMap
-	FTSTSM = *haxmap.Map[uint64, FTSM]       // FlowToStreamToSequenceMap
-
 	TracedFlowProvider   = func(*uint32) (*TracedFlow, bool)
 	TraceAndSpanProvider = func(*uint32) (*traceAndSpan, bool)
 
@@ -58,6 +49,9 @@ type (
 	}
 
 	UnlockWithTraceAndSpan = func(
+		context.Context,
+		*uint8, /* TCP flags */
+		bool, /* isHTTP2 */
 		[]uint32, []uint32,
 		map[uint32]*traceAndSpan,
 		map[uint32]*traceAndSpan,
@@ -72,6 +66,7 @@ type (
 	}
 
 	flowLock struct {
+		IsHTTP2                func() bool
 		Unlock                 func() bool
 		UnlockAndRelease       func() bool
 		UnlockWithTCPFlags     UnlockWithTCPFlags
@@ -79,15 +74,28 @@ type (
 	}
 
 	flowLockCarrier struct {
+		flowID         *uint64
 		mu             *sync.Mutex
 		wg             *sync.WaitGroup
-		rr             chan *TracedFlow
 		released       *atomic.Bool
 		createdAt      *time.Time
 		lastLockedAt   *time.Time
 		lastUnlockedAt *time.Time
+		isHTTP2        bool
 		activeRequests *atomic.Int64
 	}
+
+	TracedFlow struct {
+		flowID    *uint64
+		lock      *flowLockCarrier
+		ts        *traceAndSpan
+		isActive  *atomic.Bool
+		unblocker *time.Timer
+	}
+
+	STTFM  = *skipmap.Uint32Map[*TracedFlow] // SequenceToTracedFlowMap
+	FTSM   = *haxmap.Map[uint32, STTFM]      // FlowToStreamMap
+	FTSTSM = *haxmap.Map[uint64, FTSM]       // FlowToStreamToSequenceMap
 )
 
 const (
@@ -97,8 +105,8 @@ const (
 	jsonTranslationSummaryTCP       = jsonTranslationSummaryUDP + " | [{tcpFlags}] | seq/ack:{tcpSeq}/{tcpAck}"
 	jsonTranslationFlowTemplate     = "{0}/iface/{1}/flow/{2}:{3}"
 
-	carrierDeadline  = 10 * time.Second
-	trackingDeadline = 300 * time.Second
+	carrierDeadline  = 600 * time.Second /* 10m */
+	trackingDeadline = 15 * time.Second  /* 10s */
 )
 
 // [ToDo]: move `FlowMutex` into its own package/file
@@ -161,6 +169,7 @@ func (fm *flowMutex) getTracedFlow(
 		return func(_ *uint32) (*TracedFlow, bool) { return nil, false }, false
 	}
 
+	// [ToDo]: memoize streame to trace mapping
 	return func(stream *uint32) (*TracedFlow, bool) {
 		// an HTTP/1.1 request with a `traceID` has already been seen for this `flowID`
 		var tracedFlow, lastTracedFlow *TracedFlow = nil, nil
@@ -186,6 +195,7 @@ func (fm *flowMutex) getTracedFlow(
 			if tracedFlow == nil {
 				tracedFlow = lastTracedFlow
 			}
+
 			return tracedFlow, true
 		}
 		return nil, false
@@ -195,7 +205,6 @@ func (fm *flowMutex) getTracedFlow(
 func (fm *flowMutex) trackConnection(
 	lock *flowLockCarrier,
 	flowID *uint64,
-	tcpFlags *uint8,
 	sequence *uint32,
 	ts *traceAndSpan,
 ) (*TracedFlow, bool) {
@@ -205,21 +214,22 @@ func (fm *flowMutex) trackConnection(
 	var isActive atomic.Bool
 
 	tf := &TracedFlow{
+		flowID:   flowID,
+		lock:     lock,
 		ts:       ts,
 		isActive: &isActive,
 	}
 	isActive.Store(true)
-
 	tf.unblocker = time.AfterFunc(trackingDeadline, func() {
-		// unlock orphaned trace-tracked streams: allow termination events to continue
+		// allow termination events to continue
 		if !isActive.CompareAndSwap(true, false) {
 			return
 		}
 		lock.mu.Lock()
 		defer lock.mu.Unlock()
-		lock.activeRequests.Add(-1)
-		lock.wg.Done()
-		io.WriteString(os.Stderr, fmt.Sprintf("unblocked flow: %d\n", *flowID))
+		if lock.activeRequests.Add(-1) >= 0 {
+			lock.wg.Done()
+		}
 	})
 
 	sequenceToTraceAndSpanMapProvider := func(streamToSequenceMap FTSM) STTFM {
@@ -275,7 +285,7 @@ func (fm *flowMutex) isConnectionTermination(tcpFlags *uint8) bool {
 	return *tcpFlags == tcpFinAck || *tcpFlags == tcpRstAck || *tcpFlags == tcpRst
 }
 
-func (fm *flowMutex) newFlowLockCarrier() *flowLockCarrier {
+func (fm *flowMutex) newFlowLockCarrier(flowID *uint64) *flowLockCarrier {
 	var activeRequests atomic.Int64
 	var released atomic.Bool
 
@@ -284,9 +294,9 @@ func (fm *flowMutex) newFlowLockCarrier() *flowLockCarrier {
 	createdAt := time.Now()
 
 	return &flowLockCarrier{
+		flowID:         flowID,
 		mu:             new(sync.Mutex),
 		wg:             new(sync.WaitGroup),
-		rr:             make(chan *TracedFlow, 1),
 		released:       &released,
 		createdAt:      &createdAt,
 		activeRequests: &activeRequests,
@@ -305,7 +315,7 @@ func (fm *flowMutex) Lock(
 	carrier, _ := fm.MutexMap.
 		GetOrCompute(*flowID,
 			func() *flowLockCarrier {
-				return fm.newFlowLockCarrier()
+				return fm.newFlowLockCarrier(flowID)
 			})
 
 	mu := carrier.mu
@@ -346,9 +356,10 @@ func (fm *flowMutex) Lock(
 		// then both will release the lock, but just 1 must yield connection untracking.
 		if carrier.activeRequests.Load() == 0 &&
 			carrier.released.CompareAndSwap(false, true) {
-			fm.MutexMap.Del(*flowID)
-			// termination packets will clean the info available for each flow
-			time.AfterFunc(10*time.Second, func() {
+			// termination packets will clean the info available for each flow:
+			//   - give some margin for all other packets to access flow state, and then flush it.
+			time.AfterFunc(trackingDeadline, func() {
+				fm.MutexMap.Del(*flowID)
 				fm.untrackConnection(flowID)
 			})
 		}
@@ -374,6 +385,7 @@ func (fm *flowMutex) Lock(
 
 	// these are the only methods for consumers to interact with the lock
 	lock := &flowLock{
+		IsHTTP2:            func() bool { return carrier.isHTTP2 },
 		Unlock:             UnlockFn,
 		UnlockAndRelease:   UnlockAndReleaseFN,
 		UnlockWithTCPFlags: UnlockWithTCPFlagsFN,
@@ -393,12 +405,17 @@ func (fm *flowMutex) Lock(
 		//   - prevent trace tracking information removal by connection termination packets
 		//   - store trace tracking information for HTTP requests: that will be used to link to HTTP responses
 		lock.UnlockWithTraceAndSpan = func(
+			_ context.Context,
+			tcpFlags *uint8,
+			isHTTP2 bool,
 			requestStreams []uint32,
 			responseStreams []uint32,
 			requestTS map[uint32]*traceAndSpan,
 			responseTS map[uint32]*traceAndSpan,
 		) *int64 {
 			defer UnlockWithTCPFlagsFN(tcpFlags)
+
+			carrier.isHTTP2 = isHTTP2
 
 			sizeOfRequestStreams := len(requestStreams)
 			sizeOfRequestTraceAndSpans := len(requestTS)
@@ -412,7 +429,9 @@ func (fm *flowMutex) Lock(
 				for _, stream := range requestStreams {
 					activeRequests = carrier.activeRequests.Add(1)
 					if ts, ok := requestTS[stream]; ok {
-						if tf, ok := fm.trackConnection(carrier, flowID, tcpFlags, sequence, ts); ok {
+						// tracking connections allows for HTTP responses without trace headers
+						// to be correlated with the request that brought them to existence.
+						if tf, ok := fm.trackConnection(carrier, flowID, sequence, ts); ok {
 							if activeRequests > 0 {
 								// if HTTP more responses are seen before the currently observed requests:
 								//   - do block `FIN+ACK` from making progress;
@@ -431,7 +450,7 @@ func (fm *flowMutex) Lock(
 			if sizeOfResponseTraceAndSpans > 0 || sizeOfResponseStreams > 0 {
 				for _, stream := range responseStreams {
 					activeRequests = carrier.activeRequests.Add(-1)
-					if ts, ok := responseTS[stream]; ok {
+					if ts, ok := responseTS[stream]; activeRequests >= 0 && ok {
 						if tf, ok := tracedFlowProvider(ts.streamID); ok {
 							if *tf.ts.traceID == *ts.traceID &&
 								tf.isActive.CompareAndSwap(true, false) {
@@ -449,9 +468,11 @@ func (fm *flowMutex) Lock(
 		activeRequests := carrier.activeRequests.Load()
 		// do not provide trace tracking for non TCP `PSH+ACK`
 		lock.UnlockWithTraceAndSpan = func(
-			[]uint32, []uint32,
-			map[uint32]*traceAndSpan,
-			map[uint32]*traceAndSpan,
+			_ context.Context,
+			tcpFlags *uint8, _ bool,
+			_ []uint32, _ []uint32,
+			_ map[uint32]*traceAndSpan,
+			_ map[uint32]*traceAndSpan,
 		) *int64 {
 			// fallback to unlock by TCP flags
 			UnlockWithTCPFlagsFN(tcpFlags)
@@ -461,7 +482,7 @@ func (fm *flowMutex) Lock(
 
 	return lock, func(streamID *uint32) (*traceAndSpan, bool) {
 		if tf, ok := tracedFlowProvider(streamID); ok {
-			return tf.ts, true
+			return tf.ts, ok
 		}
 		return nil, false
 	}
@@ -963,6 +984,15 @@ func (t *JSONPcapTranslator) finalize(
 		return t.addAppLayerData(ctx, lock, p, &setFlags, &appLayer, &flowID, &seq, json, &message, traceAndSpanProvider)
 	}
 
+	if !lock.IsHTTP2() {
+		// most ingress traffic is HTTP/1.1 , so:
+		//   - try to get trace tracking information using h1 stream id
+		streamID := http11StreamID
+		if ts, ok := traceAndSpanProvider(&streamID); ok {
+			t.setTraceAndSpan(json, ts)
+		}
+	}
+
 	// packet is not carrying any data, unlock using TCP flags
 	defer lock.UnlockWithTCPFlags(&setFlags)
 
@@ -1105,10 +1135,13 @@ func (t *JSONPcapTranslator) trySetHTTP(
 	requestStreams := mapset.NewThreadUnsafeSet[uint32]()
 	responseStreams := mapset.NewThreadUnsafeSet[uint32]()
 
+	isHTTP2 := (frame != nil)
+
 	defer func() {
 		if requestStreams.Cardinality() > 0 ||
 			responseStreams.Cardinality() > 0 {
 			lock.UnlockWithTraceAndSpan(
+				ctx, tcpFlags, isHTTP2,
 				requestStreams.ToSlice(),
 				responseStreams.ToSlice(),
 				requestTS, responseTS,
@@ -1119,7 +1152,7 @@ func (t *JSONPcapTranslator) trySetHTTP(
 	}()
 
 	// handle h2c traffic
-	if frame != nil {
+	if isHTTP2 {
 		L7.Set("h2c", "proto")
 		streamsJSON, _ := L7.Object("streams")
 
