@@ -129,25 +129,44 @@ func newFlowMutex(
 }
 
 func (fm *flowMutex) log(
+	ctx context.Context,
 	flowID *uint64,
 	tcpFlags *uint8,
 	sequence *uint32,
 	timestamp *time.Time,
 	message *string,
 ) {
+	// [ToDo]: guard debug logs behind a flag
 	json := gabs.New()
+
+	id := ctx.Value(ContextID)
+	logName := ctx.Value(ContextLogName)
+
+	pcap, _ := json.Object("pcap")
+	pcap.Set(id, "id")
+	pcap.Set(logName, "ctx")
 
 	flowIDstr := strconv.FormatUint(*flowID, 10)
 	json.Set(flowIDstr, "flow")
 
-	srcJSON, _ := json.Object("src")
-	srcJSON.Set(tcpFlagsStr[*tcpFlags], "flags")
-	srcJSON.Set(*sequence, "sequence")
+	tcpJSON, _ := json.Object("tcp")
+	tcpJSON.Set(tcpFlagsStr[*tcpFlags], "flags")
+	tcpJSON.Set(*sequence, "sequence")
 
-	json.Set(*message, "message")
 	timestampJSON, _ := json.Object("timestamp")
 	timestampJSON.Set(timestamp.Unix(), "seconds")
 	timestampJSON.Set(timestamp.Nanosecond(), "nanos")
+
+	labels, _ := json.Object("logging.googleapis.com/labels")
+	labels.Set("pcap", "tools.chux.dev/tool")
+	labels.Set(id, "tools.chux.dev/pcap/id")
+	labels.Set(logName, "tools.chux.dev/pcap/name")
+
+	operation, _ := json.Object("logging.googleapis.com/operation")
+	operation.Set(logName, "producer")
+	operation.Set(stringFormatter.Format("{0}/flow/{1}/debug", id, flowIDstr), "id")
+
+	json.Set(*message, "message")
 
 	io.WriteString(os.Stderr, json.String()+"\n")
 }
@@ -229,6 +248,7 @@ func (fm *flowMutex) getTracedFlow(
 }
 
 func (fm *flowMutex) trackConnection(
+	ctx context.Context,
 	lock *flowLockCarrier,
 	flowID *uint64,
 	tcpFlags *uint8,
@@ -256,12 +276,12 @@ func (fm *flowMutex) trackConnection(
 		defer lock.mu.Unlock()
 		timestamp := time.Now()
 		message := "unblocking"
-		go fm.log(flowID, tcpFlags, sequence, &timestamp, &message)
+		go fm.log(ctx, flowID, tcpFlags, sequence, &timestamp, &message)
 		if lock.activeRequests.Add(-1) >= 0 {
 			lock.wg.Done()
 			timestamp := time.Now()
 			message := "unblocked"
-			go fm.log(flowID, tcpFlags, sequence, &timestamp, &message)
+			go fm.log(ctx, flowID, tcpFlags, sequence, &timestamp, &message)
 		}
 	})
 
@@ -362,14 +382,14 @@ func (fm *flowMutex) Lock(
 	if fm.isConnectionTermination(tcpFlags) {
 		timestampBeforeWaiting := time.Now()
 		messageBeforeWaiting := "waiting"
-		go fm.log(flowID, tcpFlags, sequence, &timestampBeforeWaiting, &messageBeforeWaiting)
+		go fm.log(ctx, flowID, tcpFlags, sequence, &timestampBeforeWaiting, &messageBeforeWaiting)
 		// Connection termination events must wait
 		// for the flow to stop being trace-tracked.
 		// If this flow is not trace-tracked `Wait()` won't block.
 		wg.Wait()
 		timestamp := time.Now()
 		message := "continue"
-		go fm.log(flowID, tcpFlags, sequence, &timestamp, &message)
+		go fm.log(ctx, flowID, tcpFlags, sequence, &timestamp, &message)
 	}
 	// it is possible that all packets for this flow arrive to `Lock` at almost the same time:
 	//   - which means that termination could delete the reference to `FlowLock` from `MutexMap` while non terminating ones are waiting for the lock
@@ -405,7 +425,7 @@ func (fm *flowMutex) Lock(
 				time.Sleep(trackingDeadline / (2 * time.Second))
 				timestamp := time.Now()
 				message := "untracking"
-				go fm.log(flowID, tcpFlags, sequence, &timestamp, &message)
+				go fm.log(ctx, flowID, tcpFlags, sequence, &timestamp, &message)
 				fm.untrackConnection(flowID)
 			})
 			return true
@@ -481,7 +501,7 @@ func (fm *flowMutex) Lock(
 					if ts, tsAvailable := requestTS[stream]; tsAvailable {
 						// tracking connections allows for HTTP responses without trace headers
 						// to be correlated with the request that brought them to existence.
-						if tf, tracked := fm.trackConnection(carrier, flowID, tcpFlags, sequence, ts); tracked {
+						if tf, tracked := fm.trackConnection(ctx, carrier, flowID, tcpFlags, sequence, ts); tracked {
 							if activeRequests > 0 {
 								// if HTTP more responses are seen before the currently observed requests:
 								//   - do block `FIN+ACK` from making progress;
@@ -571,10 +591,7 @@ func (t *JSONPcapTranslator) next(ctx context.Context, serial *uint64, packet *g
 	meta.Set(info.Length, "len")
 	meta.Set(info.CaptureLength, "cap_len")
 	meta.Set(flowIDstr, "flow")
-
-	metaTimestamp, _ := meta.Object("timestamp")
-	metaTimestamp.Set(info.Timestamp.String(), "str")
-	metaTimestamp.Set(info.Timestamp.UnixNano())
+	meta.Set(info.Timestamp.Format(time.RFC3339Nano), "timestamp")
 
 	timestamp, _ := json.Object("timestamp")
 	timestamp.Set(info.Timestamp.Unix(), "seconds")
@@ -626,8 +643,8 @@ func (t *JSONPcapTranslator) translateIPv4Layer(ctx context.Context, ip *layers.
 	L3.Set(ip.TTL, "ttl")
 	L3.Set(ip.TOS, "tos")
 	L3.Set(ip.Length, "len")
-	L3.Set(ip.FragOffset, "frag_offset")
-	L3.Set(ip.Checksum, "checksum")
+	L3.Set(ip.FragOffset, "foff")
+	L3.Set(ip.Checksum, "xsum")
 
 	opts, _ := L3.ArrayOfSize(len(ip.Options), "opts")
 	for i, opt := range ip.Options {
@@ -661,9 +678,9 @@ func (t *JSONPcapTranslator) translateIPv6Layer(ctx context.Context, ip *layers.
 	L3.Set(ip.SrcIP, "src")
 	L3.Set(ip.DstIP, "dst")
 	L3.Set(ip.Length, "len")
-	L3.Set(ip.TrafficClass, "traffic_class")
-	L3.Set(ip.FlowLabel, "flow_label")
-	L3.Set(ip.HopLimit, "hop_limit")
+	L3.Set(ip.TrafficClass, "tclass")
+	L3.Set(ip.FlowLabel, "flabel")
+	L3.Set(ip.HopLimit, "hlimit")
 
 	proto, _ := L3.Object("proto")
 	proto.Set(ip.NextHeader, "num")
@@ -686,7 +703,7 @@ func (t *JSONPcapTranslator) translateUDPLayer(ctx context.Context, udp *layers.
 
 	L4, _ := json.Object("L4")
 
-	L4.Set(udp.Checksum, "checksum")
+	L4.Set(udp.Checksum, "xsum")
 	L4.Set(udp.Length, "len")
 
 	L4.Set(udp.SrcPort, "src")
@@ -718,7 +735,7 @@ func (t *JSONPcapTranslator) translateTCPLayer(ctx context.Context, tcp *layers.
 	L4.Set(tcp.Ack, "ack")
 	L4.Set(tcp.DataOffset, "off")
 	L4.Set(tcp.Window, "win")
-	L4.Set(tcp.Checksum, "checksum")
+	L4.Set(tcp.Checksum, "xsum")
 	L4.Set(tcp.Urgent, "urg")
 
 	var setFlags uint8 = 0
