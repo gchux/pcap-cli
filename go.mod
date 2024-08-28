@@ -7,12 +7,12 @@ retract v1.0.0-dev
 require (
 	dario.cat/mergo v1.0.0
 	github.com/Jeffail/gabs/v2 v2.7.0
+	github.com/alphadose/haxmap v1.4.0
 	github.com/deckarep/golang-set/v2 v2.6.0
 	github.com/easyCZ/logrotate v0.3.0
 	github.com/google/gopacket v1.1.19
 	github.com/google/uuid v1.6.0
 	github.com/itchyny/timefmt-go v0.1.6
-	github.com/mhmtszr/concurrent-swiss-map v1.0.8
 	github.com/mitchellh/go-ps v1.0.0
 	github.com/panjf2000/ants/v2 v2.10.0
 	github.com/pkg/errors v0.9.1
@@ -38,6 +38,7 @@ require (
 	github.com/rivo/uniseg v0.4.4 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
 	github.com/zhangyunhao116/fastrand v0.3.0 // indirect
+	golang.org/x/exp v0.0.0-20221031165847-c99f073a8326 // indirect
 	golang.org/x/sync v0.3.0 // indirect
 	golang.org/x/sys v0.16.0 // indirect
 	golang.org/x/term v0.16.0 // indirect

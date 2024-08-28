@@ -95,10 +95,12 @@ const (
 	http11LineSeparator           = "\r\n"
 	http2RawFrameRegexStr         = `^\[FrameHeader\s(.+?)\]`
 	httpContentLengthHeader       = "Content-Length"
-	cloudTraceContextHeader       = "X-Cloud-Trace-Context"
-	traceAndSpanRegexStr          = `^(?P<trace>.+?)/(?P<span>.+?)(?:;o=.*)?$`
+	cloudTraceContextHeader       = "x-cloud-trace-context"
+	traceparentHeader             = "traceparent"
 
-	http11StreamID = uint32(0)
+	// keeping it in sync with `h2`:
+	//   - A stream identifier of zero (0x00) is used for connection control messages
+	http11StreamID = uint32(1)
 )
 
 var (
@@ -179,9 +181,18 @@ var (
 	http11HeaderSeparator        = []byte(":")
 	httpContentLengthHeaderBytes = []byte(httpContentLengthHeader)
 	cloudTraceContextHeaderBytes = []byte(cloudTraceContextHeader)
-	traceAndSpanRegex            = regexp.MustCompile(traceAndSpanRegexStr)
+	traceparentHeaderBytes       = []byte(traceparentHeader)
 	cloudProjectID               = os.Getenv(projectIdEnvVarName)
 	cloudTracePrefix             = "projects/" + cloudProjectID + "/traces/"
+
+	traceAndSpanRegexStr = map[string]string{
+		cloudTraceContextHeader: `^(?P<trace>.+?)/(?P<span>.+?)(?:;o=.*)?$`,
+		traceparentHeader:       `^.+?-(?P<trace>.+?)-(?P<span>.+?)(?:-.+)?$`,
+	}
+	traceAndSpanRegex = map[string]*regexp.Regexp{
+		cloudTraceContextHeader: regexp.MustCompile(traceAndSpanRegexStr[cloudTraceContextHeader]),
+		traceparentHeader:       regexp.MustCompile(traceAndSpanRegexStr[traceparentHeader]),
+	}
 )
 
 func (t *PcapTransformer) writeTranslation(ctx context.Context, task *pcapWriteTask) {
