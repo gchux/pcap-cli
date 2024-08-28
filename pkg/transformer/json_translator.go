@@ -128,6 +128,30 @@ func newFlowMutex(
 	return fm
 }
 
+func (fm *flowMutex) log(
+	flowID *uint64,
+	tcpFlags *uint8,
+	sequence *uint32,
+	timestamp *time.Time,
+	message *string,
+) {
+	json := gabs.New()
+
+	flowIDstr := strconv.FormatUint(*flowID, 10)
+	json.Set(flowIDstr, "flow")
+
+	srcJSON, _ := json.Object("src")
+	srcJSON.Set(tcpFlagsStr[*tcpFlags], "flags")
+	srcJSON.Set(*sequence, "sequence")
+
+	json.Set(*message, "message")
+	timestampJSON, _ := json.Object("timestamp")
+	timestampJSON.Set(timestamp.Unix(), "seconds")
+	timestampJSON.Set(timestamp.Nanosecond(), "nanos")
+
+	io.WriteString(os.Stderr, json.String()+"\n")
+}
+
 func (fm *flowMutex) startReaper(ctx context.Context) {
 	// reaping is necessary as packets translations order is not guaranteed:
 	// so if all `FIN+ACK`/`RST+*` are seen before other non-termination combinations within the same flow:
@@ -207,6 +231,7 @@ func (fm *flowMutex) getTracedFlow(
 func (fm *flowMutex) trackConnection(
 	lock *flowLockCarrier,
 	flowID *uint64,
+	tcpFlags *uint8,
 	sequence *uint32,
 	ts *traceAndSpan,
 ) (*TracedFlow, bool) {
@@ -229,8 +254,14 @@ func (fm *flowMutex) trackConnection(
 		}
 		lock.mu.Lock()
 		defer lock.mu.Unlock()
+		timestamp := time.Now()
+		message := "unblocking"
+		go fm.log(flowID, tcpFlags, sequence, &timestamp, &message)
 		if lock.activeRequests.Add(-1) >= 0 {
 			lock.wg.Done()
+			timestamp := time.Now()
+			message := "unblocked"
+			go fm.log(flowID, tcpFlags, sequence, &timestamp, &message)
 		}
 	})
 
@@ -329,10 +360,16 @@ func (fm *flowMutex) Lock(
 
 	// changing the order of `Wait` and `Lock` causes a deadlock
 	if fm.isConnectionTermination(tcpFlags) {
+		timestampBeforeWaiting := time.Now()
+		messageBeforeWaiting := "waiting"
+		go fm.log(flowID, tcpFlags, sequence, &timestampBeforeWaiting, &messageBeforeWaiting)
 		// Connection termination events must wait
 		// for the flow to stop being trace-tracked.
 		// If this flow is not trace-tracked `Wait()` won't block.
 		wg.Wait()
+		timestamp := time.Now()
+		message := "continue"
+		go fm.log(flowID, tcpFlags, sequence, &timestamp, &message)
 	}
 	// it is possible that all packets for this flow arrive to `Lock` at almost the same time:
 	//   - which means that termination could delete the reference to `FlowLock` from `MutexMap` while non terminating ones are waiting for the lock
@@ -366,6 +403,9 @@ func (fm *flowMutex) Lock(
 			//   - give some margin for all other packets to access flow state, and then flush it.
 			time.AfterFunc(trackingDeadline, func() {
 				time.Sleep(trackingDeadline / (2 * time.Second))
+				timestamp := time.Now()
+				message := "untracking"
+				go fm.log(flowID, tcpFlags, sequence, &timestamp, &message)
 				fm.untrackConnection(flowID)
 			})
 			return true
@@ -441,7 +481,7 @@ func (fm *flowMutex) Lock(
 					if ts, tsAvailable := requestTS[stream]; tsAvailable {
 						// tracking connections allows for HTTP responses without trace headers
 						// to be correlated with the request that brought them to existence.
-						if tf, tracked := fm.trackConnection(carrier, flowID, sequence, ts); tracked {
+						if tf, tracked := fm.trackConnection(carrier, flowID, tcpFlags, sequence, ts); tracked {
 							if activeRequests > 0 {
 								// if HTTP more responses are seen before the currently observed requests:
 								//   - do block `FIN+ACK` from making progress;
