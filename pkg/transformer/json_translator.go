@@ -166,7 +166,7 @@ func (fm *flowMutex) log(
 	operation.Set(logName, "producer")
 	operation.Set(stringFormatter.Format("{0}/flow/{1}/debug", id, flowIDstr), "id")
 
-	json.Set(*message, "message")
+	json.Set(stringFormatter.Format("flow:{0} | {1}", flowIDstr, *message), "message")
 
 	io.WriteString(os.Stderr, json.String()+"\n")
 }
@@ -629,66 +629,66 @@ func (t *JSONPcapTranslator) translateEthernetLayer(ctx context.Context, eth *la
 	return json
 }
 
-func (t *JSONPcapTranslator) translateIPv4Layer(ctx context.Context, ip *layers.IPv4) fmt.Stringer {
+func (t *JSONPcapTranslator) translateIPv4Layer(ctx context.Context, ip4 *layers.IPv4) fmt.Stringer {
 	json := gabs.New()
 
 	// https://github.com/google/gopacket/blob/master/layers/ip4.go#L43
 
 	L3, _ := json.Object("L3")
-	L3.Set(ip.Version, "v")
-	L3.Set(ip.SrcIP, "src")
-	L3.Set(ip.DstIP, "dst")
-	L3.Set(ip.Id, "id")
-	L3.Set(ip.IHL, "ihl")
-	L3.Set(ip.TTL, "ttl")
-	L3.Set(ip.TOS, "tos")
-	L3.Set(ip.Length, "len")
-	L3.Set(ip.FragOffset, "foff")
-	L3.Set(ip.Checksum, "xsum")
+	L3.Set(ip4.Version, "v")
+	L3.Set(ip4.SrcIP, "src")
+	L3.Set(ip4.DstIP, "dst")
+	L3.Set(ip4.Id, "id")
+	L3.Set(ip4.IHL, "ihl")
+	L3.Set(ip4.TTL, "ttl")
+	L3.Set(ip4.TOS, "tos")
+	L3.Set(ip4.Length, "len")
+	L3.Set(ip4.FragOffset, "foff")
+	L3.Set(ip4.Checksum, "xsum")
 
-	opts, _ := L3.ArrayOfSize(len(ip.Options), "opts")
-	for i, opt := range ip.Options {
+	opts, _ := L3.ArrayOfSize(len(ip4.Options), "opts")
+	for i, opt := range ip4.Options {
 		o, _ := opts.ObjectI(i)
 		o.Set(string(opt.OptionData), "data")
 		o.Set(opt.OptionType, "type")
 	}
 
 	proto, _ := L3.Object("proto")
-	proto.Set(ip.Protocol, "num")
-	proto.Set(ip.Protocol.String(), "name")
+	proto.Set(ip4.Protocol, "num")
+	proto.Set(ip4.Protocol.String(), "name")
 	// https://github.com/google/gopacket/blob/master/layers/ip4.go#L28-L40
-	L3.SetP(strings.Split(ip.Flags.String(), "|"), "flags")
+	L3.SetP(strings.Split(ip4.Flags.String(), "|"), "flags")
 
 	// hashing bytes yields `uint64`, and addition is commutatie:
 	//   - so hashing the IP byte array representations and then adding then resulting `uint64`s is a commutative operation as well.
-	flowID := fnv1a.HashUint64(uint64(4) + fnv1a.HashBytes64(ip.SrcIP.To4()) + fnv1a.HashBytes64(ip.DstIP.To4()))
+	flowID := fnv1a.HashUint64(uint64(4) + fnv1a.HashBytes64(ip4.SrcIP.To4()) + fnv1a.HashBytes64(ip4.DstIP.To4()))
 	flowIDstr := strconv.FormatUint(flowID, 10)
 	L3.Set(flowIDstr, "flow") // IPv4(4) (0x04)
 
 	return json
 }
 
-func (t *JSONPcapTranslator) translateIPv6Layer(ctx context.Context, ip *layers.IPv6) fmt.Stringer {
+func (t *JSONPcapTranslator) translateIPv6Layer(ctx context.Context, ip6 *layers.IPv6) fmt.Stringer {
 	json := gabs.New()
 
 	// https://github.com/google/gopacket/blob/master/layers/ip6.go#L28-L43
 
 	L3, _ := json.Object("L3")
-	L3.Set(ip.Version, "v")
-	L3.Set(ip.SrcIP, "src")
-	L3.Set(ip.DstIP, "dst")
-	L3.Set(ip.Length, "len")
-	L3.Set(ip.TrafficClass, "tclass")
-	L3.Set(ip.FlowLabel, "flabel")
-	L3.Set(ip.HopLimit, "hlimit")
+	L3.Set(ip6.Version, "v")
+	L3.Set(ip6.SrcIP, "src")
+	L3.Set(ip6.DstIP, "dst")
+	L3.Set(ip6.Length, "len")
+	L3.Set(ip6.TrafficClass, "tclass")
+	L3.Set(ip6.FlowLabel, "flabel")
+	L3.Set(ip6.HopLimit, "hlimit")
 
 	proto, _ := L3.Object("proto")
-	proto.Set(ip.NextHeader, "num")
-	proto.Set(ip.NextHeader.String(), "name")
+	proto.Set(ip6.NextHeader, "num")
+	proto.Set(ip6.NextHeader.String(), "name")
 
 	// hashing bytes yields `uint64`, and addition is commutatie:
 	//   - so hashing the IP byte array representations and then adding then resulting `uint64`s is a commutative operation as well.
-	flowID := fnv1a.HashUint64(uint64(41) + fnv1a.HashBytes64(ip.SrcIP.To16()) + fnv1a.HashBytes64(ip.DstIP.To16()))
+	flowID := fnv1a.HashUint64(uint64(41) + fnv1a.HashBytes64(ip6.SrcIP.To16()) + fnv1a.HashBytes64(ip6.DstIP.To16()))
 	flowIDstr := strconv.FormatUint(flowID, 10)
 	L3.Set(flowIDstr, "flow") // IPv6(41) (0x29)
 
