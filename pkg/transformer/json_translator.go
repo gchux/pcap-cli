@@ -333,7 +333,6 @@ func (fm *flowMutex) Lock(
 		// for the flow to stop being trace-tracked.
 		// If this flow is not trace-tracked `Wait()` won't block.
 		wg.Wait()
-		time.Sleep(trackingDeadline)
 	}
 	// it is possible that all packets for this flow arrive to `Lock` at almost the same time:
 	//   - which means that termination could delete the reference to `FlowLock` from `MutexMap` while non terminating ones are waiting for the lock
@@ -366,8 +365,10 @@ func (fm *flowMutex) Lock(
 			// termination packets will clean the info available for each flow:
 			//   - give some margin for all other packets to access flow state, and then flush it.
 			time.AfterFunc(trackingDeadline, func() {
+				time.Sleep(trackingDeadline / (2 * time.Second))
 				fm.untrackConnection(flowID)
 			})
+			return true
 		}
 		return false
 	}
