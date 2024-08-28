@@ -465,7 +465,7 @@ func (fm *flowMutex) Lock(
 		UnlockWithTCPFlags: UnlockWithTCPFlagsFN,
 	}
 
-	if *tcpFlags == tcpPshAck {
+	if *tcpFlags == tcpPshAck || *tcpFlags == tcpAck || *tcpFlags == tcpPsh {
 		// provide trace tracking only for TCP `PSH+ACK`.
 		// For HTTP/2 multiple streams are delivered over the same TCP connection, so:
 		//   - it is possible to observe multiple requests and responses in the same TCP segment,
