@@ -56,8 +56,11 @@ type (
 		map[uint32]*traceAndSpan,
 		map[uint32]*traceAndSpan,
 	) *int64
-	UnlockWithTCPFlags = func(*uint8 /* TCP flags */) bool
-	NextStreamID       = func() uint32
+	UnlockWithTCPFlags = func(
+		context.Context,
+		*uint8, /* TCP flags */
+	) bool
+	NextStreamID = func() uint32
 
 	flowMutex struct {
 		MutexMap                  *haxmap.Map[uint64, *flowLockCarrier]
@@ -67,8 +70,8 @@ type (
 
 	flowLock struct {
 		IsHTTP2                func() bool
-		Unlock                 func() bool
-		UnlockAndRelease       func() bool
+		Unlock                 func(context.Context) bool
+		UnlockAndRelease       func(context.Context) bool
 		UnlockWithTCPFlags     UnlockWithTCPFlags
 		UnlockWithTraceAndSpan UnlockWithTraceAndSpan
 	}
@@ -106,7 +109,7 @@ const (
 	jsonTranslationFlowTemplate     = "{0}/iface/{1}/flow/{2}:{3}"
 
 	carrierDeadline  = 600 * time.Second /* 10m */
-	trackingDeadline = 15 * time.Second  /* 10s */
+	trackingDeadline = 10 * time.Second  /* 10s */
 )
 
 // [ToDo]: move `FlowMutex` into its own package/file
@@ -121,7 +124,7 @@ func newFlowMutex(
 		traceToHttpRequestMap:     traceToHttpRequestMap,
 	}
 	// reap orphaned `flowLockCarrier`s
-	go fm.startReaper(ctx)
+	go fm.startReaper(ctx) // don't fear the reaper
 	return fm
 }
 
@@ -148,10 +151,9 @@ func (fm *flowMutex) startReaper(ctx context.Context) {
 					defer carrier.mu.Unlock()
 					lastUnlocked := time.Since(*carrier.lastUnlockedAt)
 					if lastUnlocked >= carrierDeadline {
-						fm.MutexMap.Del(flowID)
 						fm.untrackConnection(&flowID)
-						io.WriteString(os.Stderr,
-							fmt.Sprintf("reaped flow '%d' after %v\n", flowID, lastUnlocked))
+						fm.MutexMap.Del(flowID)
+						io.WriteString(os.Stderr, fmt.Sprintf("reaped flow '%d' after %v\n", flowID, lastUnlocked))
 					}
 					return true
 				})
@@ -263,6 +265,9 @@ func (fm *flowMutex) untrackConnection(flowID *uint64) {
 			sequenceIndex := 0
 			sttsm.Range(func(sequence uint32, tf *TracedFlow) bool {
 				sequences[sequenceIndex] = sequence
+				if tf.isActive.CompareAndSwap(true, false) {
+					tf.unblocker.Stop()
+				}
 				// remove orphaned `traceID`s:
 				fm.traceToHttpRequestMap.Del(*tf.ts.traceID)
 				sequenceIndex += 1
@@ -279,10 +284,11 @@ func (fm *flowMutex) untrackConnection(flowID *uint64) {
 		}
 		fm.flowToStreamToSequenceMap.Del(*flowID)
 	}
+	fm.MutexMap.Del(*flowID)
 }
 
 func (fm *flowMutex) isConnectionTermination(tcpFlags *uint8) bool {
-	return *tcpFlags == tcpFinAck || *tcpFlags == tcpRstAck || *tcpFlags == tcpRst
+	return *tcpFlags == tcpFin || *tcpFlags == tcpFinAck || *tcpFlags == tcpRst || *tcpFlags == tcpRstAck
 }
 
 func (fm *flowMutex) newFlowLockCarrier(flowID *uint64) *flowLockCarrier {
@@ -321,12 +327,13 @@ func (fm *flowMutex) Lock(
 	mu := carrier.mu
 	wg := carrier.wg
 
-	// changing the order os `Wait` and `Lock` causes a deadlock
+	// changing the order of `Wait` and `Lock` causes a deadlock
 	if fm.isConnectionTermination(tcpFlags) {
 		// Connection termination events must wait
 		// for the flow to stop being trace-tracked.
 		// If this flow is not trace-tracked `Wait()` won't block.
 		wg.Wait()
+		time.Sleep(trackingDeadline)
 	}
 	// it is possible that all packets for this flow arrive to `Lock` at almost the same time:
 	//   - which means that termination could delete the reference to `FlowLock` from `MutexMap` while non terminating ones are waiting for the lock
@@ -349,7 +356,7 @@ func (fm *flowMutex) Lock(
 		carrier.lastLockedAt = &lastUnlockedAt
 	}
 
-	UnlockAndReleaseFN := func() bool {
+	UnlockAndReleaseFN := func(ctx context.Context) bool {
 		defer _unlock()
 		// many translations within the same flow may be waiting to acquire the lock;
 		// if multiple translations try to release, i/e: 2*`FIN+ACK`,
@@ -359,24 +366,30 @@ func (fm *flowMutex) Lock(
 			// termination packets will clean the info available for each flow:
 			//   - give some margin for all other packets to access flow state, and then flush it.
 			time.AfterFunc(trackingDeadline, func() {
-				fm.MutexMap.Del(*flowID)
 				fm.untrackConnection(flowID)
 			})
 		}
 		return false
 	}
 
-	UnlockWithTCPFlagsFN := func(tcpFlags *uint8) bool {
+	UnlockWithTCPFlagsFN := func(
+		ctx context.Context,
+		tcpFlags *uint8,
+	) bool {
 		if fm.isConnectionTermination(tcpFlags) {
-			return UnlockAndReleaseFN()
+			return UnlockAndReleaseFN(ctx)
 		}
-		_unlock()
+		defer _unlock()
 		return false
 	}
 
-	UnlockFn := func() bool {
-		return UnlockWithTCPFlagsFN(tcpFlags)
+	// this is just an alias of `UnlockWithTCPFlagsFN`,
+	//   - but it uses the same `tcpFlags` used to acquire the `lock`
+	UnlockFn := func(ctx context.Context) bool {
+		return UnlockWithTCPFlagsFN(ctx, tcpFlags)
 	}
+
+	IsHTTP2FN := func() bool { return carrier.isHTTP2 }
 
 	// since all TCP data is known:
 	//   - it is possible to return a `traceID`
@@ -385,7 +398,7 @@ func (fm *flowMutex) Lock(
 
 	// these are the only methods for consumers to interact with the lock
 	lock := &flowLock{
-		IsHTTP2:            func() bool { return carrier.isHTTP2 },
+		IsHTTP2:            IsHTTP2FN,
 		Unlock:             UnlockFn,
 		UnlockAndRelease:   UnlockAndReleaseFN,
 		UnlockWithTCPFlags: UnlockWithTCPFlagsFN,
@@ -394,7 +407,7 @@ func (fm *flowMutex) Lock(
 	if *tcpFlags == tcpPshAck {
 		// provide trace tracking only for TCP `PSH+ACK`.
 		// For HTTP/2 multiple streams are delivered over the same TCP connection, so:
-		//   - it is possible to observe mulriple requests and responses in the same TCP segment,
+		//   - it is possible to observe multiple requests and responses in the same TCP segment,
 		//   - `unlock` must handle the scenario where the same TCP segment contains both requests and responses.
 		// It is possible to receive requests/responses without `traceID`, so:
 		//   - both must be accounted to accurately calculate the total number of `activeRequests`:
@@ -405,7 +418,7 @@ func (fm *flowMutex) Lock(
 		//   - prevent trace tracking information removal by connection termination packets
 		//   - store trace tracking information for HTTP requests: that will be used to link to HTTP responses
 		lock.UnlockWithTraceAndSpan = func(
-			_ context.Context,
+			ctx context.Context,
 			tcpFlags *uint8,
 			isHTTP2 bool,
 			requestStreams []uint32,
@@ -413,25 +426,21 @@ func (fm *flowMutex) Lock(
 			requestTS map[uint32]*traceAndSpan,
 			responseTS map[uint32]*traceAndSpan,
 		) *int64 {
-			defer UnlockWithTCPFlagsFN(tcpFlags)
+			defer UnlockWithTCPFlagsFN(ctx, tcpFlags)
 
-			carrier.isHTTP2 = isHTTP2
+			activeRequests := carrier.activeRequests.Load()
 
 			sizeOfRequestStreams := len(requestStreams)
 			sizeOfRequestTraceAndSpans := len(requestTS)
-			sizeOfResponseStreams := len(responseStreams)
-			sizeOfResponseTraceAndSpans := len(responseTS)
-
-			activeRequests := carrier.activeRequests.Load()
 
 			// handle flow `unlock` for requests
 			if sizeOfRequestTraceAndSpans > 0 || sizeOfRequestStreams > 0 {
 				for _, stream := range requestStreams {
 					activeRequests = carrier.activeRequests.Add(1)
-					if ts, ok := requestTS[stream]; ok {
+					if ts, tsAvailable := requestTS[stream]; tsAvailable {
 						// tracking connections allows for HTTP responses without trace headers
 						// to be correlated with the request that brought them to existence.
-						if tf, ok := fm.trackConnection(carrier, flowID, sequence, ts); ok {
+						if tf, tracked := fm.trackConnection(carrier, flowID, sequence, ts); tracked {
 							if activeRequests > 0 {
 								// if HTTP more responses are seen before the currently observed requests:
 								//   - do block `FIN+ACK` from making progress;
@@ -446,13 +455,17 @@ func (fm *flowMutex) Lock(
 				}
 			}
 
+			sizeOfResponseStreams := len(responseStreams)
+			sizeOfResponseTraceAndSpans := len(responseTS)
+
 			// handle flow `unlock` for responses
 			if sizeOfResponseTraceAndSpans > 0 || sizeOfResponseStreams > 0 {
 				for _, stream := range responseStreams {
 					activeRequests = carrier.activeRequests.Add(-1)
-					if ts, ok := responseTS[stream]; activeRequests >= 0 && ok {
-						if tf, ok := tracedFlowProvider(ts.streamID); ok {
-							if *tf.ts.traceID == *ts.traceID &&
+					if ts, tsAvailable := responseTS[stream]; tsAvailable {
+						if tf, traceFound := tracedFlowProvider(ts.streamID); traceFound {
+							if activeRequests >= 0 &&
+								*tf.ts.traceID == *ts.traceID &&
 								tf.isActive.CompareAndSwap(true, false) {
 								tf.unblocker.Stop()
 								wg.Done()
@@ -462,20 +475,22 @@ func (fm *flowMutex) Lock(
 				}
 			}
 
+			carrier.isHTTP2 = isHTTP2
+
 			return &activeRequests
 		}
 	} else {
 		activeRequests := carrier.activeRequests.Load()
 		// do not provide trace tracking for non TCP `PSH+ACK`
 		lock.UnlockWithTraceAndSpan = func(
-			_ context.Context,
+			ctx context.Context,
 			tcpFlags *uint8, _ bool,
 			_ []uint32, _ []uint32,
 			_ map[uint32]*traceAndSpan,
 			_ map[uint32]*traceAndSpan,
 		) *int64 {
 			// fallback to unlock by TCP flags
-			UnlockWithTCPFlagsFN(tcpFlags)
+			defer UnlockWithTCPFlagsFN(ctx, tcpFlags)
 			return &activeRequests
 		}
 	}
@@ -966,6 +981,8 @@ func (t *JSONPcapTranslator) finalize(
 
 	operation.Set(stringFormatter.Format(jsonTranslationFlowTemplate, id, t.iface.Name, "tcp", flowIDstr), "id")
 
+	message := stringFormatter.FormatComplex(jsonTranslationSummaryTCP, data)
+
 	// `finalize` is invoked from a `worker` via a go-routine `pool`:
 	//   - there are no guarantees about which packet will get `finalize`d 1st
 	//   - there are no guarantees about about which packet will get the `lock` next
@@ -977,10 +994,8 @@ func (t *JSONPcapTranslator) finalize(
 		t.analyzeConnection(p, &flowID, &setFlags, json)
 	}
 
-	message := stringFormatter.FormatComplex(jsonTranslationSummaryTCP, data)
-
 	appLayer := (*p).ApplicationLayer()
-	if setFlags == tcpPshAck && appLayer != nil {
+	if (setFlags == tcpAck || setFlags == tcpPsh || setFlags == tcpPshAck) && appLayer != nil {
 		return t.addAppLayerData(ctx, lock, p, &setFlags, &appLayer, &flowID, &seq, json, &message, traceAndSpanProvider)
 	}
 
@@ -994,7 +1009,7 @@ func (t *JSONPcapTranslator) finalize(
 	}
 
 	// packet is not carrying any data, unlock using TCP flags
-	defer lock.UnlockWithTCPFlags(&setFlags)
+	defer lock.UnlockWithTCPFlags(ctx, &setFlags)
 
 	json.Set(message, "message")
 
@@ -1069,7 +1084,7 @@ func (t *JSONPcapTranslator) addAppLayerData(
 
 	sizeOfAppLayerData := len(appLayerData)
 	if sizeOfAppLayerData == 0 {
-		defer lock.UnlockWithTCPFlags(tcpFlags)
+		defer lock.UnlockWithTCPFlags(ctx, tcpFlags)
 		return json, errors.New("AppLayer is empty")
 	}
 
@@ -1082,7 +1097,7 @@ func (t *JSONPcapTranslator) addAppLayerData(
 		return json, nil
 	}
 
-	defer lock.UnlockWithTCPFlags(tcpFlags)
+	defer lock.UnlockWithTCPFlags(ctx, tcpFlags)
 
 	// best-effort to add some information about L7
 	json.Set(stringFormatter.Format("{0} | size:{1}",
@@ -1129,11 +1144,12 @@ func (t *JSONPcapTranslator) trySetHTTP(
 	//     which is not always the case when fragmentation occurs
 	L7, _ := json.Object("HTTP")
 
+	// SETs are used to avoid duplicates
 	streams := mapset.NewThreadUnsafeSet[uint32]()
-	requestTS := make(map[uint32]*traceAndSpan)
-	responseTS := make(map[uint32]*traceAndSpan)
 	requestStreams := mapset.NewThreadUnsafeSet[uint32]()
 	responseStreams := mapset.NewThreadUnsafeSet[uint32]()
+	requestTS := make(map[uint32]*traceAndSpan)
+	responseTS := make(map[uint32]*traceAndSpan)
 
 	isHTTP2 := (frame != nil)
 
@@ -1147,7 +1163,7 @@ func (t *JSONPcapTranslator) trySetHTTP(
 				requestTS, responseTS,
 			)
 		} else {
-			lock.UnlockWithTCPFlags(tcpFlags)
+			lock.UnlockWithTCPFlags(ctx, tcpFlags)
 		}
 	}()
 
@@ -1406,7 +1422,7 @@ func (t *JSONPcapTranslator) trySetHTTP(
 	// `parts[0]` contains the HTTP line
 	line := string(parts[0])
 	L7.Set(line, "line")
-	json.Set(stringFormatter.Format("{0} | {1}", *message, line), "message")
+	json.Set(stringFormatter.Format("{0} | {1} *", *message, line), "message")
 
 	if isHTTP11Request {
 		requestStreams.Add(StreamID)
