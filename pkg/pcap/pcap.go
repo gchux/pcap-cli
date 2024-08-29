@@ -12,6 +12,7 @@ import (
 
 type (
 	PcapConfig struct {
+		Debug     bool
 		Promisc   bool
 		Iface     string
 		Snaplen   int

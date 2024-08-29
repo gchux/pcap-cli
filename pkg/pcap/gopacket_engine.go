@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -82,6 +83,7 @@ func (p *Pcap) Start(ctx context.Context, writers []PcapWriter) error {
 	p.activeHandle = handle
 
 	cfg := *p.config
+	debug := cfg.Debug
 
 	// set packet capture filter; i/e: `tcp port 443`
 	filter := cfg.Filter
@@ -117,11 +119,11 @@ func (p *Pcap) Start(ctx context.Context, writers []PcapWriter) error {
 	// create new transformer for the specified output format
 	var fn transformer.IPcapTransformer
 	if cfg.Ordered {
-		fn, err = transformer.NewOrderedTransformer(ctx, iface, ioWriters, &format)
+		fn, err = transformer.NewOrderedTransformer(ctx, iface, ioWriters, &format, debug)
 	} else if cfg.ConnTrack {
-		fn, err = transformer.NewConnTrackTransformer(ctx, iface, ioWriters, &format)
+		fn, err = transformer.NewConnTrackTransformer(ctx, iface, ioWriters, &format, debug)
 	} else {
-		fn, err = transformer.NewTransformer(ctx, iface, ioWriters, &format)
+		fn, err = transformer.NewTransformer(ctx, iface, ioWriters, &format, debug)
 	}
 	if err != nil {
 		return fmt.Errorf("invalid format: %s", err)
@@ -157,6 +159,12 @@ func (p *Pcap) Start(ctx context.Context, writers []PcapWriter) error {
 func NewPcap(config *PcapConfig) (PcapEngine, error) {
 	var isActive atomic.Bool
 	isActive.Store(false)
+
+	debug := config.Debug
+	if debugEnvVar, err := strconv.ParseBool(os.Getenv("PCAP_DEBUG")); err == nil {
+		config.Debug = debug || debugEnvVar
+	}
+
 	pcap := Pcap{config: config, isActive: &isActive}
 
 	devices, err := FindDevicesByName(&config.Iface)

@@ -276,10 +276,15 @@ func (t *PcapTransformer) writeTranslationFn(ctx context.Context, task interface
 	t.writeTranslation(ctx, task.(*pcapWriteTask))
 }
 
-func newTranslator(ctx context.Context, iface *PcapIface, format PcapTranslatorFmt) (PcapTranslator, error) {
+func newTranslator(
+	ctx context.Context,
+	debug bool,
+	iface *PcapIface,
+	format PcapTranslatorFmt,
+) (PcapTranslator, error) {
 	switch format {
 	case JSON:
-		return newJSONPcapTranslator(ctx, iface), nil
+		return newJSONPcapTranslator(ctx, debug, iface), nil
 	case TEXT:
 		return newTextPcapTranslator(iface), nil
 	case PROTO:
@@ -370,9 +375,17 @@ func provideStrategy(transformer *PcapTransformer, preserveOrder, connTracking b
 }
 
 // transformers get instances of `io.Writer` instead of `pcap.PcapWriter` to prevent closing.
-func newTransformer(ctx context.Context, iface *PcapIface, writers []io.Writer, format *string, preserveOrder, connTracking bool) (IPcapTransformer, error) {
+func newTransformer(
+	ctx context.Context,
+	iface *PcapIface,
+	writers []io.Writer,
+	format *string,
+	preserveOrder,
+	connTracking bool,
+	debug bool,
+) (IPcapTransformer, error) {
 	pcapFmt := pcapTranslatorFmts[*format]
-	translator, err := newTranslator(ctx, iface, pcapFmt)
+	translator, err := newTranslator(ctx, debug, iface, pcapFmt)
 	if err != nil {
 		return nil, err
 	}
@@ -419,14 +432,18 @@ func newTransformer(ctx context.Context, iface *PcapIface, writers []io.Writer, 
 	return transformer, nil
 }
 
-func NewOrderedTransformer(ctx context.Context, iface *PcapIface, writers []io.Writer, format *string) (IPcapTransformer, error) {
-	return newTransformer(ctx, iface, writers, format, true /* preserveOrder */, false /* connTracking */)
+func NewOrderedTransformer(ctx context.Context, iface *PcapIface, writers []io.Writer, format *string, debug bool) (IPcapTransformer, error) {
+	return newTransformer(ctx, iface, writers, format, true /* preserveOrder */, false /* connTracking */, debug)
 }
 
-func NewConnTrackTransformer(ctx context.Context, iface *PcapIface, writers []io.Writer, format *string) (IPcapTransformer, error) {
-	return newTransformer(ctx, iface, writers, format, true /* preserveOrder */, true /* connTracking */)
+func NewConnTrackTransformer(ctx context.Context, iface *PcapIface, writers []io.Writer, format *string, debug bool) (IPcapTransformer, error) {
+	return newTransformer(ctx, iface, writers, format, true /* preserveOrder */, true /* connTracking */, debug)
 }
 
-func NewTransformer(ctx context.Context, iface *PcapIface, writers []io.Writer, format *string) (IPcapTransformer, error) {
-	return newTransformer(ctx, iface, writers, format, false /* preserveOrder */, false /* connTracking */)
+func NewDebugTransformer(ctx context.Context, iface *PcapIface, writers []io.Writer, format *string) (IPcapTransformer, error) {
+	return newTransformer(ctx, iface, writers, format, false /* preserveOrder */, false /* connTracking */, true /* debug */)
+}
+
+func NewTransformer(ctx context.Context, iface *PcapIface, writers []io.Writer, format *string, debug bool) (IPcapTransformer, error) {
+	return newTransformer(ctx, iface, writers, format, false /* preserveOrder */, false /* connTracking */, debug)
 }

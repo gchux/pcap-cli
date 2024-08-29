@@ -63,6 +63,7 @@ type (
 	NextStreamID = func() uint32
 
 	flowMutex struct {
+		Debug                     bool
 		MutexMap                  *haxmap.Map[uint64, *flowLockCarrier]
 		traceToHttpRequestMap     *haxmap.Map[string, *httpRequest]
 		flowToStreamToSequenceMap FTSTSM
@@ -117,10 +118,12 @@ const (
 // [ToDo]: move `FlowMutex` into its own package/file
 func newFlowMutex(
 	ctx context.Context,
+	debug bool,
 	flowToStreamToSequenceMap FTSTSM,
 	traceToHttpRequestMap *haxmap.Map[string, *httpRequest],
 ) *flowMutex {
 	fm := &flowMutex{
+		Debug:                     debug,
 		MutexMap:                  haxmap.New[uint64, *flowLockCarrier](),
 		flowToStreamToSequenceMap: flowToStreamToSequenceMap,
 		traceToHttpRequestMap:     traceToHttpRequestMap,
@@ -139,6 +142,10 @@ func (fm *flowMutex) log(
 	timestamp *time.Time,
 	message *string,
 ) {
+	if !fm.Debug {
+		return
+	}
+
 	// [ToDo]: guard debug logs behind a flag
 	json := gabs.New()
 
@@ -1649,7 +1656,7 @@ func (t *JSONPcapTranslator) write(ctx context.Context, writer io.Writer, packet
 	return writtenBytes, nil
 }
 
-func newJSONPcapTranslator(ctx context.Context, iface *PcapIface) *JSONPcapTranslator {
+func newJSONPcapTranslator(ctx context.Context, debug bool, iface *PcapIface) *JSONPcapTranslator {
 	// connection tracking data-structures
 	flowToTimestamp := haxmap.New[uint64, *time.Time]()
 	halfOpenFlows := mapset.NewSet[uint64]()
@@ -1658,7 +1665,7 @@ func newJSONPcapTranslator(ctx context.Context, iface *PcapIface) *JSONPcapTrans
 
 	flowToStreamToSequenceMap := haxmap.New[uint64, FTSM]()
 	traceToHttpRequestMap := haxmap.New[string, *httpRequest]()
-	flowMutex := newFlowMutex(ctx, flowToStreamToSequenceMap, traceToHttpRequestMap)
+	flowMutex := newFlowMutex(ctx, debug, flowToStreamToSequenceMap, traceToHttpRequestMap)
 
 	return &JSONPcapTranslator{
 		fm:                        flowMutex,
