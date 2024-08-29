@@ -1413,7 +1413,9 @@ func (t *JSONPcapTranslator) trySetHTTP(
 			json.Set(stringFormatter.Format("{0} | {1} {2} {3}", *message, request.Proto, request.Method, url), "message")
 			return L7, true
 		}
-		L7.Set("maldofrmed HTTP/1.1 request", "error")
+		errorJSON, _ := L7.Object("error")
+		errorJSON.Set("INVALID_HTTP11_REQUEST", "code")
+		errorJSON.Set(err.Error(), "info")
 		return L7, true
 	}
 
@@ -1449,7 +1451,9 @@ func (t *JSONPcapTranslator) trySetHTTP(
 				*message, response.Proto, response.Status), "message")
 			return L7, true
 		}
-		L7.Set("maldofrmed HTTP/1.1 response", "error")
+		errorJSON, _ := L7.Object("error")
+		errorJSON.Set("INVALID_HTTP11_RESPONSE", "code")
+		errorJSON.Set(err.Error(), "info")
 		return L7, true
 	}
 
