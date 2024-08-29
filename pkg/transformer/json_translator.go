@@ -1220,11 +1220,6 @@ func (t *JSONPcapTranslator) trySetHTTP(
 		return json, false
 	}
 
-	// making at least 1 big assumption:
-	//   HTTP request/status line and headers fit in 1 packet
-	//     which is not always the case when fragmentation occurs
-	L7, _ := json.Object("HTTP")
-
 	// SETs are used to avoid duplicates
 	streams := mapset.NewThreadUnsafeSet[uint32]()
 	requestStreams := mapset.NewThreadUnsafeSet[uint32]()
@@ -1246,15 +1241,23 @@ func (t *JSONPcapTranslator) trySetHTTP(
 		}
 	}()
 
+	// making at least 1 big assumption:
+	//   HTTP request/status line and headers fit in 1 packet
+	//     which is not always the case when fragmentation occurs
+	L7, _ := json.Object("HTTP")
+
 	if isHTTP2 {
-		appLayerData = http2PrefaceRegex.ReplaceAll(appLayerData, nil)
-		if len(appLayerData) == 0 {
+		L7.Set(true, "preface")
+		h2cData := http2PrefaceRegex.ReplaceAll(appLayerData, nil)
+		if len(h2cData) == 0 {
 			L7.Set("h2c", "proto")
+			L7.Set(string(appLayerData), "raw")
 			return L7, true
 		}
-		framer = http2.NewFramer(io.Discard, bytes.NewReader(appLayerData))
+		framer = http2.NewFramer(io.Discard, bytes.NewReader(h2cData))
 		frame, frameErr = framer.ReadFrame()
 	}
+
 	isHTTP2 = (isHTTP2 || frame != nil)
 
 	// handle h2c traffic
