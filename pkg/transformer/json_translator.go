@@ -1393,29 +1393,31 @@ func (t *JSONPcapTranslator) trySetHTTP(
 	if isHTTP11Request {
 		requestStreams.Add(StreamID)
 		request, err := http.ReadRequest(httpDataReader)
-		if err == nil {
-			L7.Set("request", "kind")
-			url := request.URL.String()
-			L7.Set(url, "url")
-			L7.Set(request.Proto, "proto")
-			L7.Set(request.Method, "method")
-			if _ts := t.addHTTPHeaders(L7, &request.Header); _ts != nil {
-				_ts.streamID = &StreamID
-				requestTS[StreamID] = _ts
-				// include trace and span id for traceability
-				t.setTraceAndSpan(json, _ts)
-				t.recordHTTP11Request(packet, flowID, sequence, _ts, &request.Method, &request.Host, &url)
-			}
-			sizeOfBody := t.addHTTPBodyDetails(L7, &request.ContentLength, request.Body)
-			if cl, clErr := strconv.ParseUint(request.Header.Get(httpContentLengthHeader), 10, 64); clErr == nil {
-				fragmented = cl > sizeOfBody
-			}
-			json.Set(stringFormatter.Format("{0} | {1} {2} {3}", *message, request.Proto, request.Method, url), "message")
+		if err != nil {
+			errorJSON, _ := L7.Object("error")
+			errorJSON.Set("INVALID_HTTP11_RESPONSE", "code")
+			errorJSON.Set(err.Error(), "info")
+			json.Set(stringFormatter.Format("{0} | {1}: {2}",
+				*message, "INVALID_HTTP11_REQUEST", err.Error()), "message")
 			return L7, true
 		}
-		errorJSON, _ := L7.Object("error")
-		errorJSON.Set("INVALID_HTTP11_REQUEST", "code")
-		errorJSON.Set(err.Error(), "info")
+		L7.Set("request", "kind")
+		url := request.URL.String()
+		L7.Set(url, "url")
+		L7.Set(request.Proto, "proto")
+		L7.Set(request.Method, "method")
+		if _ts := t.addHTTPHeaders(L7, &request.Header); _ts != nil {
+			_ts.streamID = &StreamID
+			requestTS[StreamID] = _ts
+			// include trace and span id for traceability
+			t.setTraceAndSpan(json, _ts)
+			t.recordHTTP11Request(packet, flowID, sequence, _ts, &request.Method, &request.Host, &url)
+		}
+		sizeOfBody := t.addHTTPBodyDetails(L7, &request.ContentLength, request.Body)
+		if cl, clErr := strconv.ParseUint(request.Header.Get(httpContentLengthHeader), 10, 64); clErr == nil {
+			fragmented = cl > sizeOfBody
+		}
+		json.Set(stringFormatter.Format("{0} | {1} {2} {3}", *message, request.Proto, request.Method, url), "message")
 		return L7, true
 	}
 
@@ -1423,37 +1425,39 @@ func (t *JSONPcapTranslator) trySetHTTP(
 	if isHTTP11Response {
 		responseStreams.Add(StreamID)
 		response, err := http.ReadResponse(httpDataReader, nil)
-		if err == nil {
-			L7.Set("response", "kind")
-			L7.Set(response.Proto, "proto")
-			L7.Set(response.StatusCode, "code")
-			L7.Set(response.Status, "status")
-			if _ts := t.addHTTPHeaders(L7, &response.Header); _ts != nil {
-				_ts.streamID = &StreamID
-				responseTS[StreamID] = _ts
-				// include trace and span id for traceability
-				t.setTraceAndSpan(json, _ts)
-				if linkErr := t.linkHTTP11ResponseToRequest(packet, flowID, L7, _ts); linkErr != nil {
-					io.WriteString(os.Stderr, linkErr.Error()+"\n")
-				}
-			} else if traced {
-				responseTS[StreamID] = ts
-				t.setTraceAndSpan(json, ts)
-				t.linkHTTP11ResponseToRequest(packet, flowID, L7, ts)
-			}
-			sizeOfBody := t.addHTTPBodyDetails(L7, &response.ContentLength, response.Body)
-			if cl, clErr := strconv.ParseUint(response.Header.Get(httpContentLengthHeader), 10, 64); clErr == nil {
-				// if content-length is greater than the size of body:
-				//   - this HTTP message is fragmented and so there's more to come
-				fragmented = cl > sizeOfBody
-			}
-			json.Set(stringFormatter.Format("{0} | {1} {2}",
-				*message, response.Proto, response.Status), "message")
+		if err != nil {
+			errorJSON, _ := L7.Object("error")
+			errorJSON.Set("INVALID_HTTP11_RESPONSE", "code")
+			errorJSON.Set(err.Error(), "info")
+			json.Set(stringFormatter.Format("{0} | {1}: {2}",
+				*message, "INVALID_HTTP11_RESPONSE", err.Error()), "message")
 			return L7, true
 		}
-		errorJSON, _ := L7.Object("error")
-		errorJSON.Set("INVALID_HTTP11_RESPONSE", "code")
-		errorJSON.Set(err.Error(), "info")
+		L7.Set("response", "kind")
+		L7.Set(response.Proto, "proto")
+		L7.Set(response.StatusCode, "code")
+		L7.Set(response.Status, "status")
+		if _ts := t.addHTTPHeaders(L7, &response.Header); _ts != nil {
+			_ts.streamID = &StreamID
+			responseTS[StreamID] = _ts
+			// include trace and span id for traceability
+			t.setTraceAndSpan(json, _ts)
+			if linkErr := t.linkHTTP11ResponseToRequest(packet, flowID, L7, _ts); linkErr != nil {
+				io.WriteString(os.Stderr, linkErr.Error()+"\n")
+			}
+		} else if traced {
+			responseTS[StreamID] = ts
+			t.setTraceAndSpan(json, ts)
+			t.linkHTTP11ResponseToRequest(packet, flowID, L7, ts)
+		}
+		sizeOfBody := t.addHTTPBodyDetails(L7, &response.ContentLength, response.Body)
+		if cl, clErr := strconv.ParseUint(response.Header.Get(httpContentLengthHeader), 10, 64); clErr == nil {
+			// if content-length is greater than the size of body:
+			//   - this HTTP message is fragmented and so there's more to come
+			fragmented = cl > sizeOfBody
+		}
+		json.Set(stringFormatter.Format("{0} | {1} {2}",
+			*message, response.Proto, response.Status), "message")
 		return L7, true
 	}
 
