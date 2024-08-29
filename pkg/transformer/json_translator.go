@@ -77,6 +77,7 @@ type (
 	}
 
 	flowLockCarrier struct {
+		serial         *uint64
 		flowID         *uint64
 		mu             *sync.Mutex
 		wg             *sync.WaitGroup
@@ -89,6 +90,7 @@ type (
 	}
 
 	TracedFlow struct {
+		serial    *uint64
 		flowID    *uint64
 		lock      *flowLockCarrier
 		ts        *traceAndSpan
@@ -130,6 +132,7 @@ func newFlowMutex(
 
 func (fm *flowMutex) log(
 	ctx context.Context,
+	serial *uint64,
 	flowID *uint64,
 	tcpFlags *uint8,
 	sequence *uint32,
@@ -145,6 +148,9 @@ func (fm *flowMutex) log(
 	pcap, _ := json.Object("pcap")
 	pcap.Set(id, "id")
 	pcap.Set(logName, "ctx")
+
+	serialStr := strconv.FormatUint(*serial, 10)
+	pcap.Set(serialStr, "num")
 
 	flowIDstr := strconv.FormatUint(*flowID, 10)
 	json.Set(flowIDstr, "flow")
@@ -250,6 +256,7 @@ func (fm *flowMutex) getTracedFlow(
 func (fm *flowMutex) trackConnection(
 	ctx context.Context,
 	lock *flowLockCarrier,
+	serial *uint64,
 	flowID *uint64,
 	tcpFlags *uint8,
 	sequence *uint32,
@@ -261,6 +268,7 @@ func (fm *flowMutex) trackConnection(
 	var isActive atomic.Bool
 
 	tf := &TracedFlow{
+		serial:   serial,
 		flowID:   flowID,
 		lock:     lock,
 		ts:       ts,
@@ -276,12 +284,12 @@ func (fm *flowMutex) trackConnection(
 		defer lock.mu.Unlock()
 		timestamp := time.Now()
 		message := "unblocking"
-		go fm.log(ctx, flowID, tcpFlags, sequence, &timestamp, &message)
+		go fm.log(ctx, serial, flowID, tcpFlags, sequence, &timestamp, &message)
 		if lock.activeRequests.Add(-1) >= 0 {
 			lock.wg.Done()
 			timestamp := time.Now()
 			message := "unblocked"
-			go fm.log(ctx, flowID, tcpFlags, sequence, &timestamp, &message)
+			go fm.log(ctx, serial, flowID, tcpFlags, sequence, &timestamp, &message)
 		}
 	})
 
@@ -342,7 +350,7 @@ func (fm *flowMutex) isConnectionTermination(tcpFlags *uint8) bool {
 	return *tcpFlags == tcpFin || *tcpFlags == tcpFinAck || *tcpFlags == tcpRst || *tcpFlags == tcpRstAck
 }
 
-func (fm *flowMutex) newFlowLockCarrier(flowID *uint64) *flowLockCarrier {
+func (fm *flowMutex) newFlowLockCarrier(serial, flowID *uint64) *flowLockCarrier {
 	var activeRequests atomic.Int64
 	var released atomic.Bool
 
@@ -351,6 +359,7 @@ func (fm *flowMutex) newFlowLockCarrier(flowID *uint64) *flowLockCarrier {
 	createdAt := time.Now()
 
 	return &flowLockCarrier{
+		serial:         serial,
 		flowID:         flowID,
 		mu:             new(sync.Mutex),
 		wg:             new(sync.WaitGroup),
@@ -362,6 +371,7 @@ func (fm *flowMutex) newFlowLockCarrier(flowID *uint64) *flowLockCarrier {
 
 func (fm *flowMutex) Lock(
 	ctx context.Context,
+	serial *uint64,
 	flowID *uint64,
 	tcpFlags *uint8,
 	sequence, ack *uint32,
@@ -372,7 +382,7 @@ func (fm *flowMutex) Lock(
 	carrier, _ := fm.MutexMap.
 		GetOrCompute(*flowID,
 			func() *flowLockCarrier {
-				return fm.newFlowLockCarrier(flowID)
+				return fm.newFlowLockCarrier(serial, flowID)
 			})
 
 	mu := carrier.mu
@@ -382,14 +392,14 @@ func (fm *flowMutex) Lock(
 	if fm.isConnectionTermination(tcpFlags) {
 		timestampBeforeWaiting := time.Now()
 		messageBeforeWaiting := "waiting"
-		go fm.log(ctx, flowID, tcpFlags, sequence, &timestampBeforeWaiting, &messageBeforeWaiting)
+		go fm.log(ctx, serial, flowID, tcpFlags, sequence, &timestampBeforeWaiting, &messageBeforeWaiting)
 		// Connection termination events must wait
 		// for the flow to stop being trace-tracked.
 		// If this flow is not trace-tracked `Wait()` won't block.
 		wg.Wait()
 		timestamp := time.Now()
 		message := "continue"
-		go fm.log(ctx, flowID, tcpFlags, sequence, &timestamp, &message)
+		go fm.log(ctx, serial, flowID, tcpFlags, sequence, &timestamp, &message)
 	}
 	// it is possible that all packets for this flow arrive to `Lock` at almost the same time:
 	//   - which means that termination could delete the reference to `FlowLock` from `MutexMap` while non terminating ones are waiting for the lock
@@ -425,7 +435,7 @@ func (fm *flowMutex) Lock(
 				time.Sleep(trackingDeadline / (2 * time.Second))
 				timestamp := time.Now()
 				message := "untracking"
-				go fm.log(ctx, flowID, tcpFlags, sequence, &timestamp, &message)
+				go fm.log(ctx, serial, flowID, tcpFlags, sequence, &timestamp, &message)
 				fm.untrackConnection(flowID)
 			})
 			return true
@@ -501,7 +511,7 @@ func (fm *flowMutex) Lock(
 					if ts, tsAvailable := requestTS[stream]; tsAvailable {
 						// tracking connections allows for HTTP responses without trace headers
 						// to be correlated with the request that brought them to existence.
-						if tf, tracked := fm.trackConnection(ctx, carrier, flowID, tcpFlags, sequence, ts); tracked {
+						if tf, tracked := fm.trackConnection(ctx, carrier, serial, flowID, tcpFlags, sequence, ts); tracked {
 							if activeRequests > 0 {
 								// if HTTP more responses are seen before the currently observed requests:
 								//   - do block `FIN+ACK` from making progress;
@@ -581,7 +591,9 @@ func (t *JSONPcapTranslator) next(ctx context.Context, serial *uint64, packet *g
 	pcap, _ := json.Object("pcap")
 	pcap.Set(id, "id")
 	pcap.Set(logName, "ctx")
-	pcap.Set(*serial, "num")
+
+	serialStr := strconv.FormatUint(*serial, 10)
+	pcap.Set(serialStr, "num")
 
 	metadata := (*packet).Metadata()
 	info := metadata.CaptureInfo
@@ -1046,7 +1058,7 @@ func (t *JSONPcapTranslator) finalize(
 	//   - there are no guarantees about about which packet will get the `lock` next
 	// minimize locking: lock per-flow instead of across-flows.
 	// Locking is done in the name of throubleshoot-ability, so some contention at the flow level should be acceptable...
-	lock, traceAndSpanProvider := t.fm.Lock(ctx, &flowID, &setFlags, &seq, &ack)
+	lock, traceAndSpanProvider := t.fm.Lock(ctx, serial, &flowID, &setFlags, &seq, &ack)
 
 	if conntrack {
 		t.analyzeConnection(p, &flowID, &setFlags, json)
@@ -1054,7 +1066,7 @@ func (t *JSONPcapTranslator) finalize(
 
 	appLayer := (*p).ApplicationLayer()
 	if (setFlags == tcpAck || setFlags == tcpPsh || setFlags == tcpPshAck) && appLayer != nil {
-		return t.addAppLayerData(ctx, lock, p, &setFlags, &appLayer, &flowID, &seq, json, &message, traceAndSpanProvider)
+		return t.addAppLayerData(ctx, p, lock, &flowID, &setFlags, &seq, &appLayer, json, &message, traceAndSpanProvider)
 	}
 
 	if !lock.IsHTTP2() {
@@ -1128,12 +1140,12 @@ func (t *JSONPcapTranslator) analyzeConnection(
 
 func (t *JSONPcapTranslator) addAppLayerData(
 	ctx context.Context,
-	lock *flowLock,
 	packet *gopacket.Packet,
-	tcpFlags *uint8,
-	appLayer *gopacket.ApplicationLayer,
+	lock *flowLock,
 	flowID *uint64,
+	tcpFlags *uint8,
 	sequence *uint32,
+	appLayer *gopacket.ApplicationLayer,
 	json *gabs.Container,
 	message *string,
 	tsp TraceAndSpanProvider,
@@ -1146,8 +1158,8 @@ func (t *JSONPcapTranslator) addAppLayerData(
 		return json, errors.New("AppLayer is empty")
 	}
 
-	if L7, ok := t.trySetHTTP(ctx, lock, packet, tcpFlags,
-		appLayerData, flowID, sequence, json, message, tsp); ok {
+	if L7, ok := t.trySetHTTP(ctx, packet, lock, flowID,
+		tcpFlags, sequence, appLayerData, json, message, tsp); ok {
 		// this `size` is not the same as `length`:
 		//   - `size` includes everything, not only the HTTP `payload`
 		L7.Set(sizeOfAppLayerData, "size")
@@ -1175,12 +1187,12 @@ func (t *JSONPcapTranslator) addAppLayerData(
 
 func (t *JSONPcapTranslator) trySetHTTP(
 	ctx context.Context,
-	lock *flowLock,
 	packet *gopacket.Packet,
-	tcpFlags *uint8,
-	appLayerData []byte,
+	lock *flowLock,
 	flowID *uint64,
+	tcpFlags *uint8,
 	sequence *uint32,
+	appLayerData []byte,
 	json *gabs.Container,
 	message *string,
 	tsp TraceAndSpanProvider,
@@ -1384,7 +1396,10 @@ func (t *JSONPcapTranslator) trySetHTTP(
 				t.setTraceAndSpan(json, _ts)
 				t.recordHTTP11Request(packet, flowID, sequence, _ts, &request.Method, &request.Host, &url)
 			}
-			t.addHTTPBodyDetails(L7, &request.ContentLength, request.Body)
+			sizeOfBody := t.addHTTPBodyDetails(L7, &request.ContentLength, request.Body)
+			if cl, err := strconv.ParseUint(request.Header.Get(httpContentLengthHeader), 10, 64); err == nil {
+				fragmented = cl > sizeOfBody
+			}
 			json.Set(stringFormatter.Format("{0} | {1} {2} {3}", *message, request.Proto, request.Method, url), "message")
 			return L7, true
 		}
