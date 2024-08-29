@@ -172,7 +172,7 @@ func (fm *flowMutex) log(
 	operation.Set(logName, "producer")
 	operation.Set(stringFormatter.Format("{0}/flow/{1}/debug", id, flowIDstr), "id")
 
-	json.Set(stringFormatter.Format("flow:{0} | {1}", flowIDstr, *message), "message")
+	json.Set(stringFormatter.Format("#:{0} | flow:{1} | {2}", serialStr, flowIDstr, *message), "message")
 
 	io.WriteString(os.Stderr, json.String()+"\n")
 }
