@@ -1170,6 +1170,11 @@ func (t *JSONPcapTranslator) addAppLayerData(
 		// this `size` is not the same as `length`:
 		//   - `size` includes everything, not only the HTTP `payload`
 		L7.Set(sizeOfAppLayerData, "size")
+		if !lock.IsHTTP2() && sizeOfAppLayerData > 512 {
+			L7.Set(string(appLayerData[:512-3])+"...", "raw")
+		} else if !lock.IsHTTP2() {
+			L7.Set(string(appLayerData), "raw")
+		}
 		// `trySetHTTP11()` unlocks if data is HTTP
 		return json, nil
 	}
