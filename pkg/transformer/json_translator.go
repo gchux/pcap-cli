@@ -1175,7 +1175,6 @@ func (t *JSONPcapTranslator) addAppLayerData(
 		} else if !lock.IsHTTP2() {
 			L7.Set(string(appLayerData), "raw")
 		}
-		// `trySetHTTP11()` unlocks if data is HTTP
 		return json, nil
 	}
 
@@ -1217,8 +1216,7 @@ func (t *JSONPcapTranslator) trySetHTTP(
 
 	// if content is not HTTP in clear text, abort
 	if !isHTTP11Request && !isHTTP11Response && frame == nil {
-		json.Set(*message, "message")
-		return nil, false
+		return json, false
 	}
 
 	// making at least 1 big assumption:
@@ -1415,6 +1413,8 @@ func (t *JSONPcapTranslator) trySetHTTP(
 			json.Set(stringFormatter.Format("{0} | {1} {2} {3}", *message, request.Proto, request.Method, url), "message")
 			return L7, true
 		}
+		L7.Set("maldofrmed HTTP/1.1 request", "error")
+		return L7, true
 	}
 
 	// attempt to parse HTTP/1.1 response
@@ -1449,6 +1449,8 @@ func (t *JSONPcapTranslator) trySetHTTP(
 				*message, response.Proto, response.Status), "message")
 			return L7, true
 		}
+		L7.Set("maldofrmed HTTP/1.1 response", "error")
+		return L7, true
 	}
 
 	// fallback to a minimal (naive) attempt to parse HTTP/1.1
