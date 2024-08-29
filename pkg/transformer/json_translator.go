@@ -1211,11 +1211,12 @@ func (t *JSONPcapTranslator) trySetHTTP(
 	isHTTP11Request := http11RequestPayloadRegex.Match(appLayerData)
 	isHTTP11Response := !isHTTP11Request && http11ResponsePayloadRegex.Match(appLayerData)
 
+	isHTTP2 := !isHTTP11Request && !isHTTP11Response && http2PrefaceRegex.Match(appLayerData)
 	framer := http2.NewFramer(io.Discard, bytes.NewReader(appLayerData))
 	frame, frameErr := framer.ReadFrame()
 
 	// if content is not HTTP in clear text, abort
-	if !isHTTP11Request && !isHTTP11Response && frame == nil {
+	if !isHTTP11Request && !isHTTP11Response && !isHTTP2 && frame == nil {
 		return json, false
 	}
 
@@ -1231,8 +1232,6 @@ func (t *JSONPcapTranslator) trySetHTTP(
 	requestTS := make(map[uint32]*traceAndSpan)
 	responseTS := make(map[uint32]*traceAndSpan)
 
-	isHTTP2 := (frame != nil)
-
 	defer func() {
 		if requestStreams.Cardinality() > 0 ||
 			responseStreams.Cardinality() > 0 {
@@ -1247,13 +1246,24 @@ func (t *JSONPcapTranslator) trySetHTTP(
 		}
 	}()
 
+	if isHTTP2 {
+		appLayerData = http2PrefaceRegex.ReplaceAll(appLayerData, nil)
+		if len(appLayerData) == 0 {
+			L7.Set("h2c", "proto")
+			return L7, true
+		}
+		framer = http2.NewFramer(io.Discard, bytes.NewReader(appLayerData))
+		frame, frameErr = framer.ReadFrame()
+	}
+	isHTTP2 = (isHTTP2 || frame != nil)
+
 	// handle h2c traffic
-	if isHTTP2 && frameErr == nil {
+	if isHTTP2 {
 		L7.Set("h2c", "proto")
 		streamsJSON, _ := L7.Object("streams")
 
 		// multple h2 frames ( from multiple streams ) may be delivered by the same packet
-		for frame != nil && frameErr == nil {
+		for frame != nil {
 
 			isRequest := false
 			isResponse := false
@@ -1364,7 +1374,7 @@ func (t *JSONPcapTranslator) trySetHTTP(
 			frame, frameErr = framer.ReadFrame()
 		}
 
-		if frameErr != nil {
+		if frameErr != nil && frameErr != io.EOF {
 			errorJSON, _ := L7.Object("error")
 			errorJSON.Set("INVALID_HTTP2_FRAME", "code")
 			errorJSON.Set(frameErr.Error(), "info")

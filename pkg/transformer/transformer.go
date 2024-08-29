@@ -92,6 +92,7 @@ const (
 	tcpOptionsRegex               = `^TCPOption\((?P<opt>.*?)\)$`
 	http11RequestPayloadRegexStr  = `^(?P<method>.+?)\s(?P<url>.+?)\sHTTP/1\.1(?:\r?\n)?.*`
 	http11ResponsePayloadRegexStr = `^HTTP/1\.1\s(?P<code>\d{3})\s(?P<status>.+?)(?:\r?\n)?.*`
+	http2PrefaceRegexStr          = `^PRI.*?HTTP/2\.0\r?\n\r?\nSM\r?\n\r?\n`
 	http11LineSeparator           = "\r\n"
 	http2RawFrameRegexStr         = `^\[FrameHeader\s(.+?)\]`
 	httpContentLengthHeader       = "Content-Length"
@@ -175,6 +176,7 @@ var (
 	tcpOptionRgx                 = regexp.MustCompile(tcpOptionsRegex)
 	http11RequestPayloadRegex    = regexp.MustCompile(http11RequestPayloadRegexStr)
 	http11ResponsePayloadRegex   = regexp.MustCompile(http11ResponsePayloadRegexStr)
+	http2PrefaceRegex            = regexp.MustCompile(http2PrefaceRegexStr)
 	http2RawFrameRegex           = regexp.MustCompile(http2RawFrameRegexStr)
 	http11Separator              = []byte(http11LineSeparator)
 	http11BodySeparator          = []byte(http11LineSeparator + http11LineSeparator)
