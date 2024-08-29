@@ -1407,7 +1407,7 @@ func (t *JSONPcapTranslator) trySetHTTP(
 				t.recordHTTP11Request(packet, flowID, sequence, _ts, &request.Method, &request.Host, &url)
 			}
 			sizeOfBody := t.addHTTPBodyDetails(L7, &request.ContentLength, request.Body)
-			if cl, err := strconv.ParseUint(request.Header.Get(httpContentLengthHeader), 10, 64); err == nil {
+			if cl, clErr := strconv.ParseUint(request.Header.Get(httpContentLengthHeader), 10, 64); clErr == nil {
 				fragmented = cl > sizeOfBody
 			}
 			json.Set(stringFormatter.Format("{0} | {1} {2} {3}", *message, request.Proto, request.Method, url), "message")
@@ -1433,8 +1433,8 @@ func (t *JSONPcapTranslator) trySetHTTP(
 				responseTS[StreamID] = _ts
 				// include trace and span id for traceability
 				t.setTraceAndSpan(json, _ts)
-				if err := t.linkHTTP11ResponseToRequest(packet, flowID, L7, _ts); err != nil {
-					io.WriteString(os.Stderr, err.Error()+"\n")
+				if linkErr := t.linkHTTP11ResponseToRequest(packet, flowID, L7, _ts); linkErr != nil {
+					io.WriteString(os.Stderr, linkErr.Error()+"\n")
 				}
 			} else if traced {
 				responseTS[StreamID] = ts
@@ -1442,7 +1442,7 @@ func (t *JSONPcapTranslator) trySetHTTP(
 				t.linkHTTP11ResponseToRequest(packet, flowID, L7, ts)
 			}
 			sizeOfBody := t.addHTTPBodyDetails(L7, &response.ContentLength, response.Body)
-			if cl, err := strconv.ParseUint(response.Header.Get(httpContentLengthHeader), 10, 64); err == nil {
+			if cl, clErr := strconv.ParseUint(response.Header.Get(httpContentLengthHeader), 10, 64); clErr == nil {
 				// if content-length is greater than the size of body:
 				//   - this HTTP message is fragmented and so there's more to come
 				fragmented = cl > sizeOfBody
