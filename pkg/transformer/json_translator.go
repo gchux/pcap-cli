@@ -1212,7 +1212,7 @@ func (t *JSONPcapTranslator) trySetHTTP(
 	isHTTP11Response := !isHTTP11Request && http11ResponsePayloadRegex.Match(appLayerData)
 
 	framer := http2.NewFramer(io.Discard, bytes.NewReader(appLayerData))
-	frame, _ := framer.ReadFrame()
+	frame, frameErr := framer.ReadFrame()
 
 	// if content is not HTTP in clear text, abort
 	if !isHTTP11Request && !isHTTP11Response && frame == nil {
@@ -1248,12 +1248,12 @@ func (t *JSONPcapTranslator) trySetHTTP(
 	}()
 
 	// handle h2c traffic
-	if isHTTP2 {
+	if isHTTP2 && frameErr == nil {
 		L7.Set("h2c", "proto")
 		streamsJSON, _ := L7.Object("streams")
 
 		// multple h2 frames ( from multiple streams ) may be delivered by the same packet
-		for frame != nil {
+		for frame != nil && frameErr == nil {
 
 			isRequest := false
 			isResponse := false
@@ -1361,14 +1361,20 @@ func (t *JSONPcapTranslator) trySetHTTP(
 			}
 
 			// read next frame
-			frame, _ = framer.ReadFrame()
+			frame, frameErr = framer.ReadFrame()
+		}
+
+		if frameErr != nil {
+			errorJSON, _ := L7.Object("error")
+			errorJSON.Set("INVALID_HTTP2_FRAME", "code")
+			errorJSON.Set(frameErr.Error(), "info")
 		}
 
 		L7.Set(streams.ToSlice(), "includes")
 
 		json.Set(stringFormatter.Format("{0} | {1}", *message, "h2c"), "message")
 
-		return json, true
+		return L7, true
 	}
 
 	// HTTP/1.1 is not multiplexed, so `StreamID` is always `1`
