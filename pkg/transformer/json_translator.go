@@ -1165,15 +1165,15 @@ func (t *JSONPcapTranslator) addAppLayerData(
 		return json, errors.New("AppLayer is empty")
 	}
 
-	if L7, ok := t.trySetHTTP(ctx, packet, lock, flowID,
-		tcpFlags, sequence, appLayerData, json, message, tsp); ok {
+	if L7, handled, isHTTP2 := t.trySetHTTP(ctx, packet, lock, flowID,
+		tcpFlags, sequence, appLayerData, json, message, tsp); handled {
 		// this `size` is not the same as `length`:
 		//   - `size` includes everything, not only the HTTP `payload`
 		L7.Set(sizeOfAppLayerData, "size")
 		// HTTP/2.0 is binary so not showing it raw
-		if !lock.IsHTTP2() && sizeOfAppLayerData > 512 {
+		if !isHTTP2 && sizeOfAppLayerData > 512 {
 			L7.Set(string(appLayerData[:512-3])+"...", "raw")
-		} else if !lock.IsHTTP2() {
+		} else if !isHTTP2 {
 			L7.Set(string(appLayerData), "raw")
 		}
 		return json, nil
@@ -1188,8 +1188,8 @@ func (t *JSONPcapTranslator) addAppLayerData(
 	L7, _ := json.Object("L7")
 	L7.Set(sizeOfAppLayerData, "length")
 
-	if sizeOfAppLayerData > 512 {
-		L7.Set(string(appLayerData[:512-3])+"...", "sample")
+	if sizeOfAppLayerData > 256 {
+		L7.Set(string(appLayerData[:256-3])+"...", "sample")
 	} else {
 		L7.Set(string(appLayerData), "content")
 	}
@@ -1208,7 +1208,7 @@ func (t *JSONPcapTranslator) trySetHTTP(
 	json *gabs.Container,
 	message *string,
 	tsp TraceAndSpanProvider,
-) (*gabs.Container, bool) {
+) (*gabs.Container, bool /* handled */, bool /* isHTTP2 */) {
 	isHTTP11Request := http11RequestPayloadRegex.Match(appLayerData)
 	isHTTP11Response := !isHTTP11Request && http11ResponsePayloadRegex.Match(appLayerData)
 
@@ -1218,7 +1218,7 @@ func (t *JSONPcapTranslator) trySetHTTP(
 
 	// if content is not HTTP in clear text, abort
 	if !isHTTP11Request && !isHTTP11Response && !isHTTP2 && frame == nil {
-		return json, false
+		return json, false, false
 	}
 
 	// SETs are used to avoid duplicates
@@ -1254,7 +1254,7 @@ func (t *JSONPcapTranslator) trySetHTTP(
 		if len(h2cData) == 0 {
 			L7.Set("h2c", "proto")
 			L7.Set(string(appLayerData), "raw")
-			return L7, true
+			return L7, true, true
 		}
 		framer = http2.NewFramer(io.Discard, bytes.NewReader(h2cData))
 		frame, frameErr = framer.ReadFrame()
@@ -1393,20 +1393,15 @@ func (t *JSONPcapTranslator) trySetHTTP(
 			L7.Set(streams.ToSlice(), "includes")
 		}
 
-		if streams.Cardinality() == 1 && streams.Contains(0) {
+		sizeOfStreams := streams.Cardinality()
+		if (sizeOfStreams == 1 && streams.Contains(0)) || sizeOfStreams > 10 {
 			json.Set(stringFormatter.Format("{0} | {1}", *message, "h2c"), "message")
 		} else {
-			json.Set(stringFormatter.
-				Format("{0} | {1} | streams:{2} | req/res/data:{3}/{4}/{5}",
-					*message, "h2c",
-					streams.ToSlice(),
-					requestStreams.ToSlice(),
-					responseStreams.ToSlice(),
-					dataStreams.ToSlice()),
-				"message")
+			json.Set(stringFormatter.Format("{0} | {1} | streams:{2} | req:{3} | res:{4} | data:{5}", *message, "h2c",
+				streams.ToSlice(), requestStreams.ToSlice(), responseStreams.ToSlice(), dataStreams.ToSlice()), "message")
 		}
 
-		return L7, true
+		return L7, true, true
 	}
 
 	// HTTP/1.1 is not multiplexed, so `StreamID` is always `1`
@@ -1437,7 +1432,7 @@ func (t *JSONPcapTranslator) trySetHTTP(
 			errorJSON.Set(err.Error(), "info")
 			json.Set(stringFormatter.Format("{0} | {1}: {2}",
 				*message, "INVALID_HTTP11_REQUEST", err.Error()), "message")
-			return L7, true
+			return L7, true, false
 		}
 		L7.Set("request", "kind")
 		url := request.URL.String()
@@ -1454,9 +1449,12 @@ func (t *JSONPcapTranslator) trySetHTTP(
 		sizeOfBody := t.addHTTPBodyDetails(L7, &request.ContentLength, request.Body)
 		if cl, clErr := strconv.ParseUint(request.Header.Get(httpContentLengthHeader), 10, 64); clErr == nil {
 			fragmented = cl > sizeOfBody
+			if sizeOfBody > 0 {
+				dataStreams.Add(StreamID)
+			}
 		}
 		json.Set(stringFormatter.Format("{0} | {1} {2} {3}", *message, request.Proto, request.Method, url), "message")
-		return L7, true
+		return L7, true, false
 	}
 
 	// attempt to parse HTTP/1.1 response
@@ -1469,7 +1467,7 @@ func (t *JSONPcapTranslator) trySetHTTP(
 			errorJSON.Set(err.Error(), "info")
 			json.Set(stringFormatter.Format("{0} | {1}: {2}",
 				*message, "INVALID_HTTP11_RESPONSE", err.Error()), "message")
-			return L7, true
+			return L7, true, false
 		}
 		L7.Set("response", "kind")
 		L7.Set(response.Proto, "proto")
@@ -1493,10 +1491,13 @@ func (t *JSONPcapTranslator) trySetHTTP(
 			// if content-length is greater than the size of body:
 			//   - this HTTP message is fragmented and so there's more to come
 			fragmented = cl > sizeOfBody
+			if sizeOfBody > 0 {
+				dataStreams.Add(StreamID)
+			}
 		}
 		json.Set(stringFormatter.Format("{0} | {1} {2}",
 			*message, response.Proto, response.Status), "message")
-		return L7, true
+		return L7, true, false
 	}
 
 	// fallback to a minimal (naive) attempt to parse HTTP/1.1
@@ -1540,7 +1541,7 @@ func (t *JSONPcapTranslator) trySetHTTP(
 
 	// [ToDo]: legacy code, deprecated and due for removal
 	if len(dataBytes) == 1 {
-		return L7, false
+		return L7, true, false
 	}
 
 	bodyJSON, _ := L7.Object("body")
@@ -1568,7 +1569,7 @@ func (t *JSONPcapTranslator) trySetHTTP(
 			requestTS[StreamID] = _ts
 			t.recordHTTP11Request(packet, flowID, sequence, _ts, &requestParts[1], &host, &requestParts[2])
 		}
-		return L7, true
+		return L7, true, false
 	}
 
 	// isHTTP11Response
@@ -1590,7 +1591,7 @@ func (t *JSONPcapTranslator) trySetHTTP(
 		t.setTraceAndSpan(json, ts)
 		t.linkHTTP11ResponseToRequest(packet, flowID, L7, ts)
 	}
-	return L7, true
+	return L7, true, false
 }
 
 func (t *JSONPcapTranslator) addHTTPBodyDetails(L7 *gabs.Container, contentLength *int64, body io.Reader) uint64 {
