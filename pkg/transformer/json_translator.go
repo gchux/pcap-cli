@@ -1386,14 +1386,25 @@ func (t *JSONPcapTranslator) trySetHTTP(
 			errorJSON.Set(frameErr.Error(), "info")
 		}
 
-		L7.Set(streams.ToSlice(), "includes")
+		streamsJSONbytes, err := streams.MarshalJSON()
+		if err == nil {
+			L7.Set(string(streamsJSONbytes), "includes")
+		} else {
+			L7.Set(streams.ToSlice(), "includes")
+		}
 
-		json.Set(stringFormatter.
-			Format("{0} | {1} | streams:{2} | req/res/data:{3}/{4}/{5}",
-				*message, "h2c", streams.String(),
-				requestStreams.Cardinality(),
-				responseStreams.Cardinality(),
-				dataStreams.Cardinality()), "message")
+		if streams.Cardinality() == 1 && streams.Contains(0) {
+			json.Set(stringFormatter.Format("{0} | {1}", *message, "h2c"), "message")
+		} else {
+			json.Set(stringFormatter.
+				Format("{0} | {1} | streams:{2} | req/res/data:{3}/{4}/{5}",
+					*message, "h2c",
+					streams.ToSlice(),
+					requestStreams.ToSlice(),
+					responseStreams.ToSlice(),
+					dataStreams.ToSlice()),
+				"message")
+		}
 
 		return L7, true
 	}
