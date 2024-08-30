@@ -1170,6 +1170,7 @@ func (t *JSONPcapTranslator) addAppLayerData(
 		// this `size` is not the same as `length`:
 		//   - `size` includes everything, not only the HTTP `payload`
 		L7.Set(sizeOfAppLayerData, "size")
+		// HTTP/2.0 is binary so not showing it raw
 		if !lock.IsHTTP2() && sizeOfAppLayerData > 512 {
 			L7.Set(string(appLayerData[:512-3])+"...", "raw")
 		} else if !lock.IsHTTP2() {
@@ -1224,6 +1225,7 @@ func (t *JSONPcapTranslator) trySetHTTP(
 	streams := mapset.NewThreadUnsafeSet[uint32]()
 	requestStreams := mapset.NewThreadUnsafeSet[uint32]()
 	responseStreams := mapset.NewThreadUnsafeSet[uint32]()
+	dataStreams := mapset.NewThreadUnsafeSet[uint32]()
 	requestTS := make(map[uint32]*traceAndSpan)
 	responseTS := make(map[uint32]*traceAndSpan)
 
@@ -1361,6 +1363,7 @@ func (t *JSONPcapTranslator) trySetHTTP(
 				}
 
 			case *http2.DataFrame:
+				dataStreams.Add(StreamID)
 				frameJSON.Set("data", "type")
 				data := frame.Data()
 				sizeOfData := int64(sizeOfFrame)
@@ -1385,7 +1388,12 @@ func (t *JSONPcapTranslator) trySetHTTP(
 
 		L7.Set(streams.ToSlice(), "includes")
 
-		json.Set(stringFormatter.Format("{0} | {1}", *message, "h2c"), "message")
+		json.Set(stringFormatter.
+			Format("{0} | {1} | streams:{2} | req/res/data:{3}/{4}/{5}",
+				*message, "h2c", streams.String(),
+				requestStreams.Cardinality(),
+				responseStreams.Cardinality(),
+				dataStreams.Cardinality()), "message")
 
 		return L7, true
 	}
@@ -1519,6 +1527,7 @@ func (t *JSONPcapTranslator) trySetHTTP(
 		}
 	}
 
+	// [ToDo]: legacy code, deprecated and due for removal
 	if len(dataBytes) == 1 {
 		return L7, false
 	}
