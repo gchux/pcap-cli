@@ -146,7 +146,6 @@ func (fm *flowMutex) log(
 		return
 	}
 
-	// [ToDo]: guard debug logs behind a flag
 	json := gabs.New()
 
 	id := ctx.Value(ContextID)
@@ -207,7 +206,7 @@ func (fm *flowMutex) startReaper(ctx context.Context) {
 					defer carrier.mu.Unlock()
 					lastUnlocked := time.Since(*carrier.lastUnlockedAt)
 					if lastUnlocked >= carrierDeadline {
-						fm.untrackConnection(&flowID)
+						fm.untrackConnection(&flowID, carrier)
 						fm.MutexMap.Del(flowID)
 						io.WriteString(os.Stderr, fmt.Sprintf("reaped flow '%d' after %v\n", flowID, lastUnlocked))
 					}
@@ -321,7 +320,10 @@ func (fm *flowMutex) trackConnection(
 	return tf, true
 }
 
-func (fm *flowMutex) untrackConnection(flowID *uint64) {
+func (fm *flowMutex) untrackConnection(
+	flowID *uint64,
+	lock *flowLockCarrier,
+) {
 	if ftsm, ok := fm.flowToStreamToSequenceMap.Get(*flowID); ok {
 		streams := make([]uint32, ftsm.Len())
 		streamIndex := 0
@@ -350,6 +352,7 @@ func (fm *flowMutex) untrackConnection(flowID *uint64) {
 		}
 		fm.flowToStreamToSequenceMap.Del(*flowID)
 	}
+	// [ToDo]: check if time since last unlock is greater than `trackingDeadline`
 	fm.MutexMap.Del(*flowID)
 }
 
@@ -439,11 +442,10 @@ func (fm *flowMutex) Lock(
 			// termination packets will clean the info available for each flow:
 			//   - give some margin for all other packets to access flow state, and then flush it.
 			time.AfterFunc(trackingDeadline, func() {
-				time.Sleep(trackingDeadline / (2 * time.Second))
 				timestamp := time.Now()
 				message := "untracking"
 				go fm.log(ctx, serial, flowID, tcpFlags, sequence, &timestamp, &message)
-				fm.untrackConnection(flowID)
+				fm.untrackConnection(flowID, carrier)
 			})
 			return true
 		}
@@ -1311,6 +1313,8 @@ func (t *JSONPcapTranslator) trySetHTTP(
 			// see: https://pkg.go.dev/golang.org/x/net/http2#Flags
 			frameJSON.Set("0b"+strconv.FormatUint(uint64(frameHeader.Flags /* uint8 */), 2), "flags")
 
+			var _ts *traceAndSpan = nil
+
 			switch frame := frame.(type) {
 			case *http2.PingFrame:
 				frameJSON.Set("ping", "type")
@@ -1340,19 +1344,19 @@ func (t *JSONPcapTranslator) trySetHTTP(
 					headers.Add(header.Name, header.Value)
 				}
 				decoder.Close()
-				if _ts := t.addHTTPHeaders(frameJSON, &headers); _ts != nil {
+				if _ts = t.addHTTPHeaders(frameJSON, &headers); _ts != nil {
 					_ts.streamID = &StreamID
 					if isRequest {
+						requestStreams.Add(StreamID)
 						requestTS[StreamID] = _ts
 						frameJSON.Set("request", "kind")
 					} else if isResponse {
+						responseStreams.Add(StreamID)
 						responseTS[StreamID] = _ts
 						frameJSON.Set("response", "kind")
 					}
-					t.setTraceAndSpan(json, _ts)
 				} else if traced && isResponse {
 					responseTS[StreamID] = ts
-					t.setTraceAndSpan(json, ts)
 				}
 
 			case *http2.MetaHeadersFrame:
@@ -1370,10 +1374,14 @@ func (t *JSONPcapTranslator) trySetHTTP(
 				t.addHTTPBodyDetails(frameJSON, &sizeOfData, bytes.NewReader(data))
 			}
 
-			if isRequest {
-				requestStreams.Add(StreamID)
-			} else if isResponse {
-				responseStreams.Add(StreamID)
+			// multiple streams with frames for req/res
+			// might arrive within the same TCP segment
+			if _ts != nil {
+				frameJSON.Set(_ts.traceID, "trace")
+				frameJSON.Set(_ts.spanID, "span")
+			} else if traced {
+				frameJSON.Set(ts.traceID, "trace")
+				frameJSON.Set(ts.spanID, "span")
 			}
 
 			// read next frame
@@ -1419,6 +1427,32 @@ func (t *JSONPcapTranslator) trySetHTTP(
 		//       - which means that the HTTP Response is not fragmented.
 		L7.Set(fragmented, "fragmented")
 	}()
+
+	// L7 is a quasi-RAW representation of the HTTP message.
+	// see: https://www.rfc-editor.org/rfc/rfc7540#section-8.1.3
+	dataBytes := bytes.SplitN(appLayerData, http11BodySeparator, 2)
+	// `parts` is everything before HTTP payload separator (`2*line-break`)
+	//   - it includes: the HTTP line, and HTTP headers
+	parts := bytes.Split(dataBytes[0], http11Separator)
+	meta, _ := json.Object("L7") // `parts[0]` is the HTTP/1.1 preface
+	meta.Set("HTTP", "proto")
+	meta.Set(string(parts[0]), "preface")
+	metaHeaders, _ := meta.ArrayOfSize(len(parts)-1, "headers")
+	// HTTP headers starts at `parts[1]`
+	for i, header := range parts[1:] {
+		metaHeaders.SetIndex(string(header), i)
+	}
+	if len(dataBytes) > 1 {
+		parts = bytes.Split(dataBytes[1], http11Separator)
+		body, _ := meta.ArrayOfSize(len(parts), "body")
+		for i, part := range parts {
+			if len(part) > 128 {
+				body.SetIndex(string(part[:128-3])+"...", i)
+			} else {
+				body.SetIndex(string(part), i)
+			}
+		}
+	}
 
 	httpDataReader := bufio.NewReaderSize(bytes.NewReader(appLayerData), len(appLayerData))
 
@@ -1500,98 +1534,7 @@ func (t *JSONPcapTranslator) trySetHTTP(
 		return L7, true, false
 	}
 
-	// fallback to a minimal (naive) attempt to parse HTTP/1.1
-	// see: https://www.rfc-editor.org/rfc/rfc7540#section-8.1.3
-	dataBytes := bytes.SplitN(appLayerData, http11BodySeparator, 2)
-	// `parts` is everything before HTTP payload separator (`2*line-break`)
-	//   - it includes: the HTTP line, and HTTP headers
-	parts := bytes.Split(dataBytes[0], http11Separator)
-
-	contentLength := uint64(0)
-
-	var _ts *traceAndSpan = nil
-
-	headers, _ := L7.Object("headers")
-	// HTTP headers starts at `parts[1]`
-	for _, header := range parts[1:] {
-		headerParts := bytes.SplitN(header, http11HeaderSeparator, 2)
-		nameBytes := bytes.TrimSpace(headerParts[0])
-		value := string(bytes.TrimSpace(headerParts[1]))
-		headers.Set(value, string(nameBytes))
-		// include trace and span id for traceability
-		switch {
-		case bytes.EqualFold(nameBytes, traceparentHeaderBytes):
-			if _ts = t.getTraceAndSpan(traceAndSpanRegex[traceparentHeader], &value); _ts != nil {
-				_ts.streamID = &StreamID
-				t.setTraceAndSpan(json, _ts)
-			}
-
-		case bytes.EqualFold(nameBytes, cloudTraceContextHeaderBytes):
-			if _ts = t.getTraceAndSpan(traceAndSpanRegex[cloudTraceContextHeader], &value); _ts != nil {
-				_ts.streamID = &StreamID
-				t.setTraceAndSpan(json, _ts)
-			}
-
-		case bytes.EqualFold(nameBytes, httpContentLengthHeaderBytes):
-			if cl, err := strconv.ParseUint(value, 10, 64); err == nil {
-				contentLength = cl
-			}
-		}
-	}
-
-	// [ToDo]: legacy code, deprecated and due for removal
-	if len(dataBytes) == 1 {
-		return L7, true, false
-	}
-
-	bodyJSON, _ := L7.Object("body")
-	sizeOfBody := uint64(0)
-	sizeOfBody = uint64(len(dataBytes[1]))
-	if sizeOfBody > 0 {
-		bodyJSON.Set(string(dataBytes[1]), "data")
-	}
-	bodyJSON.Set(sizeOfBody, "length")
-
-	fragmented = contentLength > sizeOfBody
-
-	// `parts[0]` contains the HTTP line
-	line := string(parts[0])
-	L7.Set(line, "line")
-	json.Set(stringFormatter.Format("{0} | {1} *", *message, line), "message")
-
-	if isHTTP11Request {
-		requestStreams.Add(StreamID)
-		requestParts := http11RequestPayloadRegex.FindStringSubmatch(line)
-		L7.Set(requestParts[1], "method")
-		L7.Set(requestParts[2], "url")
-		host := "0"
-		if _ts != nil {
-			requestTS[StreamID] = _ts
-			t.recordHTTP11Request(packet, flowID, sequence, _ts, &requestParts[1], &host, &requestParts[2])
-		}
-		return L7, true, false
-	}
-
-	// isHTTP11Response
-	responseStreams.Add(StreamID)
-	responseParts := http11ResponsePayloadRegex.FindStringSubmatch(line)
-	if code, err := strconv.Atoi(responseParts[1]); err == nil {
-		L7.Set(code, "code")
-	} else {
-		L7.Set(responseParts[1], "code")
-	}
-	L7.Set(responseParts[2], "status")
-	if _ts != nil {
-		responseTS[StreamID] = _ts
-		if err := t.linkHTTP11ResponseToRequest(packet, flowID, L7, _ts); err != nil {
-			io.WriteString(os.Stderr, err.Error()+"\n")
-		}
-	} else if traced {
-		responseTS[StreamID] = ts
-		t.setTraceAndSpan(json, ts)
-		t.linkHTTP11ResponseToRequest(packet, flowID, L7, ts)
-	}
-	return L7, true, false
+	return json, true, false
 }
 
 func (t *JSONPcapTranslator) addHTTPBodyDetails(L7 *gabs.Container, contentLength *int64, body io.Reader) uint64 {
