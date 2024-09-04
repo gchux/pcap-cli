@@ -198,10 +198,10 @@ var (
 )
 
 func (t *PcapTransformer) writeTranslation(ctx context.Context, task *pcapWriteTask) {
+	defer t.wg.Done()
 	// consume translations – flush them into writers
-	// io.WriteString(task.writer, (*task.translation).String()+"\n")
-	t.translator.write(ctx, t.writers[*task.writer], task.translation)
-	t.wg.Done()
+	// do not wait for IO to be done: release this go-routine ASAP.
+	go t.translator.write(ctx, t.writers[*task.writer], task.translation)
 }
 
 func (t *PcapTransformer) publishTranslation(ctx context.Context, translation *fmt.Stringer) {

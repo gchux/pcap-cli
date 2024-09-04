@@ -55,12 +55,12 @@ type (
 		[]uint32, []uint32,
 		map[uint32]*traceAndSpan,
 		map[uint32]*traceAndSpan,
-	) *int64
+	) (*int64, *time.Duration)
 	UnlockWithTCPFlags = func(
 		context.Context,
 		*uint8, /* TCP flags */
-	) bool
-	NextStreamID = func() uint32
+	) (bool, *time.Duration)
+	Unlock = func(context.Context) (bool, *time.Duration)
 
 	flowMutex struct {
 		Debug                     bool
@@ -71,8 +71,8 @@ type (
 
 	flowLock struct {
 		IsHTTP2                func() bool
-		Unlock                 func(context.Context) bool
-		UnlockAndRelease       func(context.Context) bool
+		Unlock                 Unlock
+		UnlockAndRelease       Unlock
 		UnlockWithTCPFlags     UnlockWithTCPFlags
 		UnlockWithTraceAndSpan UnlockWithTraceAndSpan
 	}
@@ -226,7 +226,7 @@ func (fm *flowMutex) getTracedFlow(
 		return func(_ *uint32) (*TracedFlow, bool) { return nil, false }, false
 	}
 
-	// [ToDo]: memoize streame to trace mapping
+	// [ToDo]: memoize stream to trace mapping
 	return func(stream *uint32) (*TracedFlow, bool) {
 		// an HTTP/1.1 request with a `traceID` has already been seen for this `flowID`
 		var tracedFlow, lastTracedFlow *TracedFlow = nil, nil
@@ -403,9 +403,19 @@ func (fm *flowMutex) Lock(
 		timestampBeforeWaiting := time.Now()
 		messageBeforeWaiting := "waiting"
 		go fm.log(ctx, serial, flowID, tcpFlags, sequence, &timestampBeforeWaiting, &messageBeforeWaiting)
-		// Connection termination events must wait
-		// for the flow to stop being trace-tracked.
-		// If this flow is not trace-tracked `Wait()` won't block.
+		// Connection termination events must wait for the flow to stop being trace-tracked.
+		// some important considerations:
+		//   - If this flow is not trace-tracked ( meaning this termination event acquires the lock ahead of any other TCP segment carrying an HTTP message with trace information ) `Wait()` won't block:
+		//       - this could happen because not only packet processing but also layers processing are done concurrently in order to complete packet translations as fast as possible.
+		//           - the side effect of this high level of concurrency is that order of execution is not guaranteed and so trace tracking is currently done as best-effort.
+		//           - in practice, the common scenario is for connection termination events to arrive at `lock` after TCP segments container tracing information.
+		//       - this is currently by design: doing it differently would require to store TCP events in memory which is not great to keep memory footprint small.
+		//           - currently the only state stored in memory is: a Map from TCP flow to HTTP stream to TCP sequence that points to its corresponding trace information.
+		//   - This is `true` also for TCP segments carrying HTTP responses if those acquire the lock before the ones carrying HTTP requests, but these won't clear/release trace-tracking information.
+		// How to do it differently?: we'd need to store semaphores in a table indexable by `FlowID` and have termination events wait on them until the TCP segments carrying tracing information are seen.
+		//   - this, however, is a wild assumption, as TCP segments carrying tracing information might never arrive and so the termination events will be locked for no reason.
+		//     - if this a price we'd like to pay, then this scenario could be handled by having a watchdog running periodically to unblock termination events after a deadline, but this approach feels clumsy at the moment.
+		//     - why we would not want to do this?: waiting on some non-deterministical event to happen means that a go-routine from the packet processing pool will be hijacked maybe for no good reason.
 		wg.Wait()
 		timestamp := time.Now()
 		message := "continue"
@@ -415,8 +425,8 @@ func (fm *flowMutex) Lock(
 	//   - which means that termination could delete the reference to `FlowLock` from `MutexMap` while non terminating ones are waiting for the lock
 	mu.Lock()
 
-	lastLockedAt := time.Now()
-	carrier.lastLockedAt = &lastLockedAt
+	lockAcquiredTS := time.Now()
+	carrier.lastLockedAt = &lockAcquiredTS
 
 	tracedFlowProvider, _ := fm.getTracedFlow(flowID, sequence)
 
@@ -428,18 +438,18 @@ func (fm *flowMutex) Lock(
 			}
 		}(mu)
 		defer mu.Unlock()
-		lastUnlockedAt := time.Now()
-		carrier.lastLockedAt = &lastUnlockedAt
+		lastUnlockedTS := time.Now()
+		carrier.lastLockedAt = &lastUnlockedTS
 	}
 
-	UnlockAndReleaseFN := func(ctx context.Context) bool {
+	UnlockAndReleaseFN := func(ctx context.Context) (bool, *time.Duration) {
 		defer _unlock()
 		// many translations within the same flow may be waiting to acquire the lock;
 		// if multiple translations try to release, i/e: 2*`FIN+ACK`,
 		// then both will release the lock, but just 1 must yield connection untracking.
 		if carrier.activeRequests.Load() == 0 &&
 			carrier.released.CompareAndSwap(false, true) {
-			// termination packets will clean the info available for each flow:
+			// termination packets will clean the tracing info available for each flow:
 			//   - give some margin for all other packets to access flow state, and then flush it.
 			time.AfterFunc(trackingDeadline, func() {
 				timestamp := time.Now()
@@ -447,25 +457,28 @@ func (fm *flowMutex) Lock(
 				go fm.log(ctx, serial, flowID, tcpFlags, sequence, &timestamp, &message)
 				fm.untrackConnection(flowID, carrier)
 			})
-			return true
+			lockLatency := time.Since(lockAcquiredTS)
+			return true, &lockLatency
 		}
-		return false
+		lockLatency := time.Since(lockAcquiredTS)
+		return false, &lockLatency
 	}
 
 	UnlockWithTCPFlagsFN := func(
 		ctx context.Context,
 		tcpFlags *uint8,
-	) bool {
+	) (bool, *time.Duration) {
 		if fm.isConnectionTermination(tcpFlags) {
 			return UnlockAndReleaseFN(ctx)
 		}
 		defer _unlock()
-		return false
+		lockLatency := time.Since(lockAcquiredTS)
+		return false, &lockLatency
 	}
 
 	// this is just an alias of `UnlockWithTCPFlagsFN`,
 	//   - but it uses the same `tcpFlags` used to acquire the `lock`
-	UnlockFn := func(ctx context.Context) bool {
+	UnlockFn := func(ctx context.Context) (bool, *time.Duration) {
 		return UnlockWithTCPFlagsFN(ctx, tcpFlags)
 	}
 
@@ -505,9 +518,7 @@ func (fm *flowMutex) Lock(
 			responseStreams []uint32,
 			requestTS map[uint32]*traceAndSpan,
 			responseTS map[uint32]*traceAndSpan,
-		) *int64 {
-			defer UnlockWithTCPFlagsFN(ctx, tcpFlags)
-
+		) (*int64, *time.Duration) {
 			activeRequests := carrier.activeRequests.Load()
 
 			sizeOfRequestStreams := len(requestStreams)
@@ -557,7 +568,9 @@ func (fm *flowMutex) Lock(
 
 			carrier.isHTTP2 = isHTTP2
 
-			return &activeRequests
+			_, lockLatency := UnlockWithTCPFlagsFN(ctx, tcpFlags)
+
+			return &activeRequests, lockLatency
 		}
 	} else {
 		activeRequests := carrier.activeRequests.Load()
@@ -568,10 +581,10 @@ func (fm *flowMutex) Lock(
 			_ []uint32, _ []uint32,
 			_ map[uint32]*traceAndSpan,
 			_ map[uint32]*traceAndSpan,
-		) *int64 {
+		) (*int64, *time.Duration) {
 			// fallback to unlock by TCP flags
-			defer UnlockWithTCPFlagsFN(ctx, tcpFlags)
-			return &activeRequests
+			_, lockLatency := UnlockWithTCPFlagsFN(ctx, tcpFlags)
+			return &activeRequests, lockLatency
 		}
 	}
 
@@ -1087,10 +1100,11 @@ func (t *JSONPcapTranslator) finalize(
 		}
 	}
 
-	// packet is not carrying any data, unlock using TCP flags
-	defer lock.UnlockWithTCPFlags(ctx, &setFlags)
-
 	json.Set(message, "message")
+
+	// packet is not carrying any data, unlock using TCP flags
+	_, lockLatency := lock.UnlockWithTCPFlags(ctx, &setFlags)
+	json.Set(lockLatency.String(), "ll")
 
 	return json, nil
 }
@@ -1163,7 +1177,8 @@ func (t *JSONPcapTranslator) addAppLayerData(
 
 	sizeOfAppLayerData := len(appLayerData)
 	if sizeOfAppLayerData == 0 {
-		defer lock.UnlockWithTCPFlags(ctx, tcpFlags)
+		_, lockLatency := lock.UnlockWithTCPFlags(ctx, tcpFlags)
+		json.Set(lockLatency.String(), "ll")
 		return json, errors.New("AppLayer is empty")
 	}
 
@@ -1181,8 +1196,6 @@ func (t *JSONPcapTranslator) addAppLayerData(
 		return json, nil
 	}
 
-	defer lock.UnlockWithTCPFlags(ctx, tcpFlags)
-
 	// best-effort to add some information about L7
 	json.Set(stringFormatter.Format("{0} | size:{1}",
 		*message, sizeOfAppLayerData), "message")
@@ -1195,6 +1208,9 @@ func (t *JSONPcapTranslator) addAppLayerData(
 	} else {
 		L7.Set(string(appLayerData), "content")
 	}
+
+	_, lockLatency := lock.UnlockWithTCPFlags(ctx, tcpFlags)
+	json.Set(lockLatency.String(), "ll")
 
 	return json, nil
 }
@@ -1231,24 +1247,24 @@ func (t *JSONPcapTranslator) trySetHTTP(
 	requestTS := make(map[uint32]*traceAndSpan)
 	responseTS := make(map[uint32]*traceAndSpan)
 
-	defer func() {
-		if requestStreams.Cardinality() > 0 ||
-			responseStreams.Cardinality() > 0 {
-			lock.UnlockWithTraceAndSpan(
-				ctx, tcpFlags, isHTTP2,
-				requestStreams.ToSlice(),
-				responseStreams.ToSlice(),
-				requestTS, responseTS,
-			)
-		} else {
-			lock.UnlockWithTCPFlags(ctx, tcpFlags)
-		}
-	}()
-
 	// making at least 1 big assumption:
 	//   HTTP request/status line and headers fit in 1 packet
 	//     which is not always the case when fragmentation occurs
 	L7, _ := json.Object("HTTP")
+
+	defer func() {
+		var lockLatency *time.Duration = nil
+		if requestStreams.Cardinality() > 0 ||
+			responseStreams.Cardinality() > 0 {
+			_, lockLatency = lock.UnlockWithTraceAndSpan(
+				ctx, tcpFlags, isHTTP2, requestStreams.ToSlice(),
+				responseStreams.ToSlice(), requestTS, responseTS,
+			)
+		} else {
+			_, lockLatency = lock.UnlockWithTCPFlags(ctx, tcpFlags)
+		}
+		json.Set(lockLatency.String(), "ll")
+	}()
 
 	if isHTTP2 {
 		L7.Set(true, "preface")
@@ -1377,11 +1393,9 @@ func (t *JSONPcapTranslator) trySetHTTP(
 			// multiple streams with frames for req/res
 			// might arrive within the same TCP segment
 			if _ts != nil {
-				frameJSON.Set(_ts.traceID, "trace")
-				frameJSON.Set(_ts.spanID, "span")
-			} else if traced {
-				frameJSON.Set(ts.traceID, "trace")
-				frameJSON.Set(ts.spanID, "span")
+				t.setTraceAndSpan(frameJSON, _ts)
+			} else if traced && ts != nil {
+				t.setTraceAndSpan(frameJSON, ts)
 			}
 
 			// read next frame
@@ -1494,6 +1508,8 @@ func (t *JSONPcapTranslator) trySetHTTP(
 	// attempt to parse HTTP/1.1 response
 	if isHTTP11Response {
 		responseStreams.Add(StreamID)
+		// Go's `http` implementation may miss the `Transfer-Encoding` header
+		//   - see: https://github.com/golang/go/issues/27061
 		response, err := http.ReadResponse(httpDataReader, nil)
 		if err != nil {
 			errorJSON, _ := L7.Object("error")
@@ -1559,7 +1575,13 @@ func (t *JSONPcapTranslator) addHTTPBodyDetails(L7 *gabs.Container, contentLengt
 	return sizeOfBody
 }
 
-func (t *JSONPcapTranslator) recordHTTP11Request(packet *gopacket.Packet, flowID *uint64, sequence *uint32, ts *traceAndSpan, method, host, url *string) {
+func (t *JSONPcapTranslator) recordHTTP11Request(
+	packet *gopacket.Packet,
+	_ *uint64, /* flowID */
+	_ *uint32, /* TCP sequence */
+	ts *traceAndSpan,
+	method, host, url *string,
+) {
 	fullURL := stringFormatter.Format("{0}{1}", *host, *url)
 	_httpRequest := &httpRequest{
 		timestamp: &(*packet).Metadata().Timestamp,
@@ -1569,7 +1591,12 @@ func (t *JSONPcapTranslator) recordHTTP11Request(packet *gopacket.Packet, flowID
 	t.traceToHttpRequestMap.Set(*ts.traceID, _httpRequest)
 }
 
-func (t *JSONPcapTranslator) linkHTTP11ResponseToRequest(packet *gopacket.Packet, flowID *uint64, response *gabs.Container, ts *traceAndSpan) error {
+func (t *JSONPcapTranslator) linkHTTP11ResponseToRequest(
+	packet *gopacket.Packet,
+	_ *uint64, /* flowID */
+	response *gabs.Container,
+	ts *traceAndSpan,
+) error {
 	jsonTranslatorRequest, ok := t.traceToHttpRequestMap.Get(*ts.traceID)
 	if !ok {
 		return errors.New(stringFormatter.Format("no request found for trace-id: {0}", *ts.traceID))

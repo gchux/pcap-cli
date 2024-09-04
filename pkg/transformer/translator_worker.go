@@ -164,7 +164,7 @@ func (w *pcapTranslatorWorker) Run(ctx context.Context) interface{} {
 
 	for _, translators := range packetLayerTranslators {
 		// translate layers concurrently:
-		//   - layers should know nothing about each other
+		//   - layers must know nothing about each other
 		go func(translators []packetLayerTranslator) {
 			for _, translator := range translators {
 				if t := translator(ctx, w); t != nil {
