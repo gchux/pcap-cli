@@ -143,7 +143,8 @@ func (p *Pcap) Start(ctx context.Context, writers []PcapWriter) error {
 			for _, writer := range pcapWriters {
 				writer.rotate()
 			}
-			gopacketLogger.Printf("total packets: %d\n", packetsCounter.Load())
+			gopacketLogger.Printf("total packets for iface '%d/%s': %d\n",
+				device.NetInterface.Index, device.Name, packetsCounter.Load())
 			p.isActive.Store(false)
 			return ctx.Err()
 
