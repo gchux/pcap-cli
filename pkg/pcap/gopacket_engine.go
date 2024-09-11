@@ -144,7 +144,7 @@ func (p *Pcap) Start(ctx context.Context, writers []PcapWriter) error {
 			handle.Close()
 			fn.WaitDone()
 			// do not close engine's writers until `stop` is called
-			// if the context is done, simply rotate the curren Pcap file
+			// if the context is done, simply rotate the current PCAP file
 			// PCAP file rotation includes: flush and sync
 			for _, writer := range pcapWriters {
 				writer.rotate()
