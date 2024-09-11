@@ -133,12 +133,6 @@ func (p *Pcap) Start(ctx context.Context, writers []PcapWriter) error {
 	var packetsCounter atomic.Uint64
 	for {
 		select {
-		case packet := <-source.Packets():
-			serial := packetsCounter.Add(1)
-			// non-blocking operation
-			if err := fn.Apply(ctx, &packet, &serial); err != nil {
-				gopacketLogger.Fatalf("[%d] – failed to translate: %s\n", serial, packet)
-			}
 		case <-ctx.Done():
 			inactiveHandle.CleanUp()
 			handle.Close()
@@ -152,6 +146,13 @@ func (p *Pcap) Start(ctx context.Context, writers []PcapWriter) error {
 			gopacketLogger.Printf("total packets: %d\n", packetsCounter.Load())
 			p.isActive.Store(false)
 			return ctx.Err()
+
+		case packet := <-source.Packets():
+			serial := packetsCounter.Add(1)
+			// non-blocking operation
+			if err := fn.Apply(ctx, &packet, &serial); err != nil {
+				gopacketLogger.Fatalf("[%d] – failed to translate: %s\n", serial, packet)
+			}
 		}
 	}
 }
