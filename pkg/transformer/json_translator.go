@@ -1474,7 +1474,7 @@ func (t *JSONPcapTranslator) trySetHTTP(
 	if isHTTP11Request {
 		requestStreams.Add(StreamID)
 		request, err := http.ReadRequest(httpDataReader)
-		if err != nil {
+		if err != nil && err != io.EOF {
 			errorJSON, _ := L7.Object("error")
 			errorJSON.Set("INVALID_HTTP11_RESPONSE", "code")
 			errorJSON.Set(err.Error(), "info")
@@ -1495,11 +1495,11 @@ func (t *JSONPcapTranslator) trySetHTTP(
 			t.recordHTTP11Request(packet, flowID, sequence, _ts, &request.Method, &request.Host, &url)
 		}
 		sizeOfBody := t.addHTTPBodyDetails(L7, &request.ContentLength, request.Body)
+		if sizeOfBody > 0 {
+			dataStreams.Add(StreamID)
+		}
 		if cl, clErr := strconv.ParseUint(request.Header.Get(httpContentLengthHeader), 10, 64); clErr == nil {
 			fragmented = cl > sizeOfBody
-			if sizeOfBody > 0 {
-				dataStreams.Add(StreamID)
-			}
 		}
 		json.Set(stringFormatter.Format("{0} | {1} {2} {3}", *message, request.Proto, request.Method, url), "message")
 		return L7, true, false
@@ -1511,7 +1511,7 @@ func (t *JSONPcapTranslator) trySetHTTP(
 		// Go's `http` implementation may miss the `Transfer-Encoding` header
 		//   - see: https://github.com/golang/go/issues/27061
 		response, err := http.ReadResponse(httpDataReader, nil)
-		if err != nil {
+		if err != nil && err != io.EOF {
 			errorJSON, _ := L7.Object("error")
 			errorJSON.Set("INVALID_HTTP11_RESPONSE", "code")
 			errorJSON.Set(err.Error(), "info")
@@ -1537,13 +1537,13 @@ func (t *JSONPcapTranslator) trySetHTTP(
 			t.linkHTTP11ResponseToRequest(packet, flowID, L7, ts)
 		}
 		sizeOfBody := t.addHTTPBodyDetails(L7, &response.ContentLength, response.Body)
+		if sizeOfBody > 0 {
+			dataStreams.Add(StreamID)
+		}
 		if cl, clErr := strconv.ParseUint(response.Header.Get(httpContentLengthHeader), 10, 64); clErr == nil {
 			// if content-length is greater than the size of body:
 			//   - this HTTP message is fragmented and so there's more to come
 			fragmented = cl > sizeOfBody
-			if sizeOfBody > 0 {
-				dataStreams.Add(StreamID)
-			}
 		}
 		json.Set(stringFormatter.Format("{0} | {1} {2}",
 			*message, response.Proto, response.Status), "message")
@@ -1563,12 +1563,12 @@ func (t *JSONPcapTranslator) addHTTPBodyDetails(L7 *gabs.Container, contentLengt
 
 	sizeOfBody := uint64(len(bodyBytes))
 	bodyLengthJSON, _ := bodyJSON.ArrayOfSize(2, "length")
-	bodyLengthJSON.SetIndex(sizeOfBody, 0)
-	bodyLengthJSON.SetIndex(*contentLength, 1)
+	bodyLengthJSON.SetIndex(strconv.FormatUint(sizeOfBody, 10), 0)
+	bodyLengthJSON.SetIndex(strconv.FormatInt(*contentLength, 10), 1)
 
 	if sizeOfBody > 512 {
 		bodyJSON.Set(string(bodyBytes[:512-3])+"...", "sample")
-	} else {
+	} else if sizeOfBody > 0 {
 		bodyJSON.Set(string(bodyBytes), "data")
 	}
 
