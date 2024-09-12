@@ -260,11 +260,10 @@ func (t *PcapTransformer) WaitDone(ctx context.Context, timeout time.Duration) {
 
 	go func() {
 		if !t.preserveOrder && !t.connTracking {
-			// boost worker pools capacity
-			t.translatorPool.Tune(100)
-			t.writerPool.Tune(100)
 			transformerLogger.Printf("[%d/%s] – waiting for packets to be written | %d/%d | %d/%d | deadline: %v\n", t.iface.Index, t.iface.Name,
 				t.translatorPool.Running(), t.translatorPool.Waiting(), t.writerPool.Running(), t.writerPool.Waiting(), timeout)
+		} else {
+			transformerLogger.Printf("[%d/%s] – waiting for packets to be written | deadline: %v\n", t.iface.Index, t.iface.Name, timeout)
 		}
 		t.wg.Wait() // wait for all translations to be written
 		close(writeDoneChan)

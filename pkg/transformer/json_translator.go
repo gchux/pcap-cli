@@ -425,6 +425,7 @@ func (fm *flowMutex) Lock(
 		for {
 			select {
 			case <-ctx.Done():
+				// if execution is done: do not throttle termination packets processing
 				break wait_done_loop
 			case <-waitDone:
 				timestamp := time.Now()
@@ -464,12 +465,18 @@ func (fm *flowMutex) Lock(
 			carrier.released.CompareAndSwap(false, true) {
 			// termination packets will clean the tracing info available for each flow:
 			//   - give some margin for all other packets to access flow state, and then flush it.
-			time.AfterFunc(trackingDeadline, func() {
-				timestamp := time.Now()
-				message := "untracking"
-				go fm.log(ctx, serial, flowID, tcpFlags, sequence, &timestamp, &message)
+			select {
+			case <-ctx.Done():
+				// untrack connection immediately if the context is done
 				fm.untrackConnection(flowID, carrier)
-			})
+			default:
+				time.AfterFunc(trackingDeadline, func() {
+					timestamp := time.Now()
+					message := "untracking"
+					go fm.log(ctx, serial, flowID, tcpFlags, sequence, &timestamp, &message)
+					fm.untrackConnection(flowID, carrier)
+				})
+			}
 			lockLatency := time.Since(lockAcquiredTS)
 			return true, &lockLatency
 		}
