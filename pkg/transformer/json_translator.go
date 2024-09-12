@@ -1363,13 +1363,9 @@ func (t *JSONPcapTranslator) trySetHTTP(
 				if _ts = t.addHTTPHeaders(frameJSON, &headers); _ts != nil {
 					_ts.streamID = &StreamID
 					if isRequest {
-						requestStreams.Add(StreamID)
 						requestTS[StreamID] = _ts
-						frameJSON.Set("request", "kind")
 					} else if isResponse {
-						responseStreams.Add(StreamID)
 						responseTS[StreamID] = _ts
-						frameJSON.Set("response", "kind")
 					}
 				} else if traced && isResponse {
 					responseTS[StreamID] = ts
@@ -1390,11 +1386,19 @@ func (t *JSONPcapTranslator) trySetHTTP(
 				t.addHTTPBodyDetails(frameJSON, &sizeOfData, bytes.NewReader(data))
 			}
 
+			if isRequest {
+				requestStreams.Add(StreamID)
+				frameJSON.Set("request", "kind")
+			} else if isResponse {
+				responseStreams.Add(StreamID)
+				frameJSON.Set("response", "kind")
+			}
+
 			// multiple streams with frames for req/res
 			// might arrive within the same TCP segment
 			if _ts != nil {
 				t.setTraceAndSpan(frameJSON, _ts)
-			} else if traced && ts != nil {
+			} else if traced {
 				t.setTraceAndSpan(frameJSON, ts)
 			}
 
@@ -1474,6 +1478,7 @@ func (t *JSONPcapTranslator) trySetHTTP(
 	if isHTTP11Request {
 		requestStreams.Add(StreamID)
 		request, err := http.ReadRequest(httpDataReader)
+
 		if err != nil && err != io.EOF {
 			errorJSON, _ := L7.Object("error")
 			errorJSON.Set("INVALID_HTTP11_RESPONSE", "code")
@@ -1482,6 +1487,7 @@ func (t *JSONPcapTranslator) trySetHTTP(
 				*message, "INVALID_HTTP11_REQUEST", err.Error()), "message")
 			return L7, true, false
 		}
+
 		L7.Set("request", "kind")
 		url := request.URL.String()
 		L7.Set(url, "url")
@@ -1511,6 +1517,7 @@ func (t *JSONPcapTranslator) trySetHTTP(
 		// Go's `http` implementation may miss the `Transfer-Encoding` header
 		//   - see: https://github.com/golang/go/issues/27061
 		response, err := http.ReadResponse(httpDataReader, nil)
+
 		if err != nil && err != io.EOF {
 			errorJSON, _ := L7.Object("error")
 			errorJSON.Set("INVALID_HTTP11_RESPONSE", "code")
@@ -1519,6 +1526,7 @@ func (t *JSONPcapTranslator) trySetHTTP(
 				*message, "INVALID_HTTP11_RESPONSE", err.Error()), "message")
 			return L7, true, false
 		}
+
 		L7.Set("response", "kind")
 		L7.Set(response.Proto, "proto")
 		L7.Set(response.StatusCode, "code")

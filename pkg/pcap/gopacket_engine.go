@@ -134,16 +134,18 @@ func (p *Pcap) Start(ctx context.Context, writers []PcapWriter) error {
 	for {
 		select {
 		case <-ctx.Done():
+			gopacketLogger.Printf("[%d/%s] – stopping packet capture\n", device.NetInterface.Index, device.Name)
 			inactiveHandle.CleanUp()
 			handle.Close()
-			fn.WaitDone()
+			gopacketLogger.Printf("[%d/%s] – raw sockets closed\n", device.NetInterface.Index, device.Name)
+			fn.WaitDone(ctx, 3*time.Second)
 			// do not close engine's writers until `stop` is called
 			// if the context is done, simply rotate the current PCAP file
 			// PCAP file rotation includes: flush and sync
 			for _, writer := range pcapWriters {
 				writer.rotate()
 			}
-			gopacketLogger.Printf("total packets for iface '%d/%s': %d\n",
+			gopacketLogger.Printf("[%d/%s] – total packets: %d\n",
 				device.NetInterface.Index, device.Name, packetsCounter.Load())
 			p.isActive.Store(false)
 			return ctx.Err()

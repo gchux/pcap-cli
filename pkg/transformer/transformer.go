@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"regexp"
 	"sync"
@@ -15,6 +16,8 @@ import (
 	"github.com/panjf2000/ants/v2"
 	concurrently "github.com/tejzpr/ordered-concurrently/v3"
 )
+
+var transformerLogger = log.New(os.Stderr, "[transformer] - ", log.LstdFlags)
 
 type (
 	PcapTranslatorFmt uint8
@@ -50,7 +53,7 @@ type (
 	}
 
 	IPcapTransformer interface {
-		WaitDone()
+		WaitDone(context.Context, time.Duration)
 		Apply(context.Context, *gopacket.Packet, *uint64) error
 	}
 
@@ -200,8 +203,7 @@ var (
 func (t *PcapTransformer) writeTranslation(ctx context.Context, task *pcapWriteTask) {
 	defer t.wg.Done()
 	// consume translations – flush them into writers
-	// do not wait for IO to be done: release this go-routine ASAP.
-	go t.translator.write(ctx, t.writers[*task.writer], task.translation)
+	t.translator.write(ctx, t.writers[*task.writer], task.translation)
 }
 
 func (t *PcapTransformer) publishTranslation(ctx context.Context, translation *fmt.Stringer) {
@@ -250,16 +252,53 @@ func (t *PcapTransformer) waitForContextDone(ctx context.Context) {
 }
 
 // returns when all packets have been transformed and written
-func (t *PcapTransformer) WaitDone() {
-	t.wg.Wait() // wait for all translations to be written
-	for _, writeQueue := range t.writeQueues {
-		close(writeQueue) // close writer channels
+func (t *PcapTransformer) WaitDone(ctx context.Context, timeout time.Duration) {
+	ts := time.Now()
+
+	timer := time.NewTimer(timeout)
+	writeDoneChan := make(chan struct{})
+
+	go func() {
+		transformerLogger.Printf("[%d/%s] – waiting for packets to be written | deadline: %v\n", t.iface.Index, t.iface.Name, timeout)
+		t.wg.Wait() // wait for all translations to be written
+		close(writeDoneChan)
+	}()
+
+write_wait_loop:
+	for {
+		select {
+		case <-timer.C:
+			transformerLogger.Fatalf("[%d/%s] – timed out waiting for packets to be written\n", t.iface.Index, t.iface.Name)
+			return
+
+		case <-writeDoneChan:
+			for _, writeQueue := range t.writeQueues {
+				close(writeQueue) // close writer channels
+			}
+			transformerLogger.Printf("[%d/%s] – all packets were written\n", t.iface.Index, t.iface.Name)
+			break write_wait_loop
+		}
 	}
+
+	_timeout := timeout - time.Since(ts)
 	// if order is not enforced: there are 2 worker pools to be stopped
-	if !t.preserveOrder {
-		t.translatorPool.Release()
-		t.writerPool.ReleaseTimeout(5 * time.Second)
+	if _timeout > 0 && !t.preserveOrder {
+		transformerLogger.Printf("[%d/%s] – releasing worker pools | deadline: %v\n", t.iface.Index, t.iface.Name, _timeout)
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			t.translatorPool.ReleaseTimeout(_timeout)
+			wg.Done()
+		}()
+		go func() {
+			t.writerPool.ReleaseTimeout(_timeout)
+			wg.Done()
+		}()
+		wg.Wait()
+		transformerLogger.Printf("[%d/%s] – released worker pools\n", t.iface.Index, t.iface.Name)
 	}
+
+	transformerLogger.Printf("[%d/%s] – STOPPED | latency: %v\n", t.iface.Index, t.iface.Name, time.Since(ts))
 }
 
 func (t *PcapTransformer) Apply(ctx context.Context, packet *gopacket.Packet, serial *uint64) error {
@@ -322,7 +361,7 @@ func provideWorkerPools(ctx context.Context, transformer *PcapTransformer, numWr
 	}
 
 	// I/O ( writing ) is slow; so there will be more writers than translator routines
-	writerPool, _ := ants.NewMultiPoolWithFunc(numWriters, poolSize, writerPoolFn, ants.LeastTasks, poolOpt)
+	writerPool, _ := ants.NewMultiPoolWithFunc(numWriters, 20, writerPoolFn, ants.LeastTasks, poolOpt)
 	transformer.writerPool = writerPool
 }
 
@@ -396,7 +435,7 @@ func newTransformer(
 	// not using `io.MultiWriter` as it writes to all writers sequentially
 	writeQueues := make([]chan *fmt.Stringer, numWriters)
 	for i := range writers {
-		writeQueues[i] = make(chan *fmt.Stringer, 10*numWriters)
+		writeQueues[i] = make(chan *fmt.Stringer, 100)
 	}
 
 	// same transformer, multiple strategies
@@ -430,6 +469,8 @@ func newTransformer(
 		index := uint8(i)
 		go transformer.consumeTranslations(ctx, &index)
 	}
+
+	transformerLogger.Printf("[%d/%s] – CREATED\n", iface.Index, iface.Name)
 
 	return transformer, nil
 }
