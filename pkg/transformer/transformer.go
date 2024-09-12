@@ -259,10 +259,13 @@ func (t *PcapTransformer) WaitDone(ctx context.Context, timeout time.Duration) {
 	writeDoneChan := make(chan struct{})
 
 	go func() {
-		t.translatorPool.Tune(100)
-		t.writerPool.Tune(100)
-		transformerLogger.Printf("[%d/%s] – waiting for packets to be written | %d/%d | %d/%d | deadline: %v\n", t.iface.Index, t.iface.Name,
-			t.translatorPool.Running(), t.translatorPool.Waiting(), t.writerPool.Running(), t.writerPool.Waiting(), timeout)
+		if !t.preserveOrder && !t.connTracking {
+			// boost worker pools capacity
+			t.translatorPool.Tune(100)
+			t.writerPool.Tune(100)
+			transformerLogger.Printf("[%d/%s] – waiting for packets to be written | %d/%d | %d/%d | deadline: %v\n", t.iface.Index, t.iface.Name,
+				t.translatorPool.Running(), t.translatorPool.Waiting(), t.writerPool.Running(), t.writerPool.Waiting(), timeout)
+		}
 		t.wg.Wait() // wait for all translations to be written
 		close(writeDoneChan)
 	}()
@@ -285,7 +288,7 @@ write_wait_loop:
 
 	_timeout := timeout - time.Since(ts)
 	// if order is not enforced: there are 2 worker pools to be stopped
-	if _timeout > 0 && !t.preserveOrder {
+	if _timeout > 0 && !t.preserveOrder && !t.connTracking {
 		transformerLogger.Printf("[%d/%s] – releasing worker pools | deadline: %v\n", t.iface.Index, t.iface.Name, _timeout)
 		var wg sync.WaitGroup
 		wg.Add(2)
