@@ -274,7 +274,8 @@ write_wait_loop:
 	for {
 		select {
 		case <-timer.C:
-			transformerLogger.Fatalf("[%d/%s] – timed out waiting for packets to be written\n", t.iface.Index, t.iface.Name)
+			transformerLogger.Fatalf("[%d/%s] – timed out waiting for packets to be written | %d/%d | %d/%d\n", t.iface.Index, t.iface.Name,
+				t.translatorPool.Running(), t.translatorPool.Waiting(), t.writerPool.Running(), t.writerPool.Waiting())
 			return
 
 		case <-writeDoneChan:
