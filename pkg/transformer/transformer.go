@@ -356,7 +356,7 @@ func provideWorkerPools(ctx context.Context, transformer *PcapTransformer, numWr
 	}
 	poolOpt := ants.WithOptions(poolOpts)
 
-	poolSize := 20 * numWriters
+	poolSize := 25 * numWriters
 
 	translatorPoolFn := func(i interface{}) {
 		transformer.translatePacketFn(ctx, i)
@@ -369,7 +369,7 @@ func provideWorkerPools(ctx context.Context, transformer *PcapTransformer, numWr
 	}
 
 	// I/O ( writing ) is slow; so there will be more writers than translator routines
-	writerPool, _ := ants.NewMultiPoolWithFunc(numWriters, 20, writerPoolFn, ants.LeastTasks, poolOpt)
+	writerPool, _ := ants.NewMultiPoolWithFunc(numWriters, 25, writerPoolFn, ants.LeastTasks, poolOpt)
 	transformer.writerPool = writerPool
 }
 
