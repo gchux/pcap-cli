@@ -416,10 +416,23 @@ func (fm *flowMutex) Lock(
 		//   - this, however, is a wild assumption, as TCP segments carrying tracing information might never arrive and so the termination events will be locked for no reason.
 		//     - if this a price we'd like to pay, then this scenario could be handled by having a watchdog running periodically to unblock termination events after a deadline, but this approach feels clumsy at the moment.
 		//     - why we would not want to do this?: waiting on some non-deterministical event to happen means that a go-routine from the packet processing pool will be hijacked maybe for no good reason.
-		wg.Wait()
-		timestamp := time.Now()
-		message := "continue"
-		go fm.log(ctx, serial, flowID, tcpFlags, sequence, &timestamp, &message)
+		waitDone := make(chan struct{})
+		go func(wg *sync.WaitGroup) {
+			wg.Wait()
+			close(waitDone)
+		}(wg)
+	wait_done_loop:
+		for {
+			select {
+			case <-ctx.Done():
+				break wait_done_loop
+			case <-waitDone:
+				timestamp := time.Now()
+				message := "continue"
+				go fm.log(ctx, serial, flowID, tcpFlags, sequence, &timestamp, &message)
+				break wait_done_loop
+			}
+		}
 	}
 	// it is possible that all packets for this flow arrive to `Lock` at almost the same time:
 	//   - which means that termination could delete the reference to `FlowLock` from `MutexMap` while non terminating ones are waiting for the lock
@@ -1203,8 +1216,8 @@ func (t *JSONPcapTranslator) addAppLayerData(
 	L7, _ := json.Object("L7")
 	L7.Set(sizeOfAppLayerData, "length")
 
-	if sizeOfAppLayerData > 256 {
-		L7.Set(string(appLayerData[:256-3])+"...", "sample")
+	if sizeOfAppLayerData > 128 {
+		L7.Set(string(appLayerData[:128-3])+"...", "sample")
 	} else {
 		L7.Set(string(appLayerData), "content")
 	}

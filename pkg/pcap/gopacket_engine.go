@@ -117,18 +117,16 @@ func (p *Pcap) Start(ctx context.Context, writers []PcapWriter) error {
 	format := cfg.Format
 
 	// create new transformer for the specified output format
-	var fn transformer.IPcapTransformer
 	if cfg.Ordered {
-		fn, err = transformer.NewOrderedTransformer(ctx, iface, ioWriters, &format, debug)
+		p.fn, err = transformer.NewOrderedTransformer(ctx, iface, ioWriters, &format, debug)
 	} else if cfg.ConnTrack {
-		fn, err = transformer.NewConnTrackTransformer(ctx, iface, ioWriters, &format, debug)
+		p.fn, err = transformer.NewConnTrackTransformer(ctx, iface, ioWriters, &format, debug)
 	} else {
-		fn, err = transformer.NewTransformer(ctx, iface, ioWriters, &format, debug)
+		p.fn, err = transformer.NewTransformer(ctx, iface, ioWriters, &format, debug)
 	}
 	if err != nil {
 		return fmt.Errorf("invalid format: %s", err)
 	}
-	p.fn = fn
 
 	var packetsCounter atomic.Uint64
 	for {
@@ -138,7 +136,7 @@ func (p *Pcap) Start(ctx context.Context, writers []PcapWriter) error {
 			inactiveHandle.CleanUp()
 			handle.Close()
 			gopacketLogger.Printf("[%d/%s] – raw sockets closed\n", device.NetInterface.Index, device.Name)
-			fn.WaitDone(ctx, 2*time.Second)
+			p.fn.WaitDone(ctx, 2*time.Second)
 			// do not close engine's writers until `stop` is called
 			// if the context is done, simply rotate the current PCAP file
 			// PCAP file rotation includes: flush and sync
@@ -147,13 +145,14 @@ func (p *Pcap) Start(ctx context.Context, writers []PcapWriter) error {
 			}
 			gopacketLogger.Printf("[%d/%s] – total packets: %d\n",
 				device.NetInterface.Index, device.Name, packetsCounter.Load())
+			p.fn = nil
 			p.isActive.Store(false)
 			return ctx.Err()
 
 		case packet := <-source.Packets():
 			serial := packetsCounter.Add(1)
 			// non-blocking operation
-			if err := fn.Apply(ctx, &packet, &serial); err != nil {
+			if err := p.fn.Apply(ctx, &packet, &serial); err != nil {
 				gopacketLogger.Fatalf("[%d] – failed to translate: %s\n", serial, packet)
 			}
 		}
