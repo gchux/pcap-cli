@@ -136,7 +136,7 @@ func (p *Pcap) Start(ctx context.Context, writers []PcapWriter) error {
 			inactiveHandle.CleanUp()
 			handle.Close()
 			gopacketLogger.Printf("[%d/%s] – raw sockets closed\n", device.NetInterface.Index, device.Name)
-			p.fn.WaitDone(ctx, 2*time.Second)
+			p.fn.WaitDone(ctx, 2500*time.Millisecond)
 			// do not close engine's writers until `stop` is called
 			// if the context is done, simply rotate the current PCAP file
 			// PCAP file rotation includes: flush and sync

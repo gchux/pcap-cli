@@ -290,6 +290,7 @@ func (fm *flowMutex) untrackConnection(
 			transformerLogger.Fatalln("PANIC@untrackConnection: ", r)
 		}
 	}()
+
 	if ftsm, ok := fm.flowToStreamToSequenceMap.Get(*flowID); ok {
 		streams := make([]uint32, ftsm.Len())
 		streamIndex := 0
@@ -318,11 +319,13 @@ func (fm *flowMutex) untrackConnection(
 		}
 		fm.flowToStreamToSequenceMap.Del(*flowID)
 	}
-	fm.MutexMap.Del(*flowID)
+
 	for lock.activeRequests.Load() > 0 {
 		lock.wg.Done()
 		lock.activeRequests.Add(-1)
 	}
+
+	fm.MutexMap.Del(*flowID)
 }
 
 func (fm *flowMutex) isConnectionTermination(tcpFlags *uint8) bool {
@@ -338,8 +341,8 @@ func (fm *flowMutex) newFlowLockCarrier(serial, flowID *uint64) *flowLockCarrier
 	createdAt := time.Now()
 
 	return &flowLockCarrier{
-		serial:         serial,
-		flowID:         flowID,
+		serial:         serial, // packet that created this lock
+		flowID:         flowID, // flow that created this lock
 		mu:             new(sync.Mutex),
 		wg:             new(sync.WaitGroup),
 		released:       &released,

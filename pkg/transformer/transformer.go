@@ -201,20 +201,21 @@ var (
 	}
 )
 
-func (t *PcapTransformer) writeTranslation(ctx context.Context, task *pcapWriteTask) {
+func (t *PcapTransformer) writeTranslation(ctx context.Context, task *pcapWriteTask) error {
 	defer t.wg.Done()
 	select {
 	case <-ctx.Done():
-		return
+		return ctx.Err()
 	default:
 		t.translator.write(ctx, t.writers[*task.writer], task.translation)
 	}
+	return nil
 }
 
-func (t *PcapTransformer) publishTranslation(ctx context.Context, translation *fmt.Stringer) {
+func (t *PcapTransformer) publishTranslation(ctx context.Context, translation *fmt.Stringer) error {
 	select {
 	case <-ctx.Done():
-		return
+		return ctx.Err()
 	default:
 		for _, translations := range t.writeQueues {
 			// if any of the consumers' buffers is full,
@@ -223,6 +224,7 @@ func (t *PcapTransformer) publishTranslation(ctx context.Context, translation *f
 			translations <- translation
 		}
 	}
+	return nil
 }
 
 func (t *PcapTransformer) produceTranslation(ctx context.Context, task *pcapTranslatorWorker) error {
@@ -230,29 +232,28 @@ func (t *PcapTransformer) produceTranslation(ctx context.Context, task *pcapTran
 	case <-ctx.Done():
 		return ctx.Err()
 	default:
-		t.publishTranslation(ctx, task.Run(ctx).(*fmt.Stringer))
+		return t.publishTranslation(ctx, task.Run(ctx).(*fmt.Stringer))
 	}
-	return nil
 }
 
-func (t *PcapTransformer) produceTranslations(ctx context.Context) {
+func (t *PcapTransformer) produceTranslations(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return ctx.Err()
 		case translation := <-t.och:
 			// translations are made available in the enqueued order
 			// consume translations and push them into translations consumers
-			t.publishTranslation(ctx, translation.Value.(*fmt.Stringer))
+			return t.publishTranslation(ctx, translation.Value.(*fmt.Stringer))
 		}
 	}
 }
 
-func (t *PcapTransformer) consumeTranslations(ctx context.Context, index *uint8) {
+func (t *PcapTransformer) consumeTranslations(ctx context.Context, index *uint8) error {
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return ctx.Err()
 		case translation := <-t.writeQueues[*index]:
 			task := &pcapWriteTask{
 				ctx:         ctx,
@@ -270,9 +271,10 @@ func (t *PcapTransformer) consumeTranslations(ctx context.Context, index *uint8)
 	}
 }
 
-func (t *PcapTransformer) waitForContextDone(ctx context.Context) {
+func (t *PcapTransformer) waitForContextDone(ctx context.Context) error {
 	<-ctx.Done()
 	close(t.ich)
+	return ctx.Err()
 }
 
 // returns when all packets have been transformed and written
@@ -284,10 +286,10 @@ func (t *PcapTransformer) WaitDone(ctx context.Context, timeout time.Duration) {
 
 	go func() {
 		if !t.preserveOrder && !t.connTracking {
-			transformerLogger.Printf("[%d/%s] – waiting for packets to be written | %d/%d | %d/%d | deadline: %v\n", t.iface.Index, t.iface.Name,
+			transformerLogger.Printf("[%d/%s] – gracefully terminating | %d/%d | %d/%d | deadline: %v\n", t.iface.Index, t.iface.Name,
 				t.translatorPool.Running(), t.translatorPool.Waiting(), t.writerPool.Running(), t.writerPool.Waiting(), timeout)
 		} else {
-			transformerLogger.Printf("[%d/%s] – waiting for packets to be written | deadline: %v\n", t.iface.Index, t.iface.Name, timeout)
+			transformerLogger.Printf("[%d/%s] – gracefully terminating | deadline: %v\n", t.iface.Index, t.iface.Name, timeout)
 		}
 		t.wg.Wait() // wait for all translations to be written
 		close(writeDoneChan)
@@ -295,8 +297,12 @@ func (t *PcapTransformer) WaitDone(ctx context.Context, timeout time.Duration) {
 
 	select {
 	case <-timer.C:
-		transformerLogger.Fatalf("[%d/%s] – timed out waiting for packets to be written | %d/%d | %d/%d\n", t.iface.Index, t.iface.Name,
-			t.translatorPool.Running(), t.translatorPool.Waiting(), t.writerPool.Running(), t.writerPool.Waiting())
+		if !t.preserveOrder && !t.connTracking {
+			transformerLogger.Fatalf("[%d/%s] – timed out waiting for graceful termination | %d/%d | %d/%d\n", t.iface.Index, t.iface.Name,
+				t.translatorPool.Running(), t.translatorPool.Waiting(), t.writerPool.Running(), t.writerPool.Waiting())
+		} else {
+			transformerLogger.Fatalf("[%d/%s] – timed out waiting for graceful termination\n", t.iface.Index, t.iface.Name)
+		}
 		t.translator.done(ctx)
 		return
 	case <-writeDoneChan:
@@ -304,7 +310,7 @@ func (t *PcapTransformer) WaitDone(ctx context.Context, timeout time.Duration) {
 		for _, writeQueue := range t.writeQueues {
 			close(writeQueue) // close writer channels
 		}
-		transformerLogger.Printf("[%d/%s] – all packets were written\n", t.iface.Index, t.iface.Name)
+		transformerLogger.Printf("[%d/%s] – TERMINATED\n", t.iface.Index, t.iface.Name)
 	}
 
 	_timeout := timeout - time.Since(ts)
@@ -325,6 +331,7 @@ func (t *PcapTransformer) WaitDone(ctx context.Context, timeout time.Duration) {
 		transformerLogger.Printf("[%d/%s] – released worker pools\n", t.iface.Index, t.iface.Name)
 	}
 
+	// only safe to be called when nothing else is running
 	t.translator.done(ctx)
 
 	transformerLogger.Printf("[%d/%s] – STOPPED | latency: %v\n", t.iface.Index, t.iface.Name, time.Since(ts))

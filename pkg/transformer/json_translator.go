@@ -57,10 +57,12 @@ func (t *JSONPcapTranslator) done(ctx context.Context) {
 	t.fm.MutexMap.ForEach(func(flowID uint64, lock *flowLockCarrier) bool {
 		if lock.mu.TryLock() {
 			t.fm.untrackConnection(ctx, &flowID, lock)
+			transformerLogger.Printf("[%d/%s] – untracked flow: %d\n", t.iface.Index, t.iface.Name, flowID)
 			lock.mu.Unlock()
 		}
 		return true
 	})
+	t.fm.MutexMap.Clear()
 	t.flowToStreamToSequenceMap.Clear()
 	t.traceToHttpRequestMap.Clear()
 }
