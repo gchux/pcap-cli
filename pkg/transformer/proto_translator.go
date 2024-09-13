@@ -19,6 +19,10 @@ type (
 	}
 )
 
+func (t *ProtoPcapTranslator) done(_ context.Context) {
+	// not implemented
+}
+
 func (t *ProtoPcapTranslator) next(ctx context.Context, serial *uint64, packet *gopacket.Packet) fmt.Stringer {
 	// `next` returns the container to be used for merging all layers
 	p := &pb.Packet{}

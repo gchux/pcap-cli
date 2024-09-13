@@ -34,6 +34,7 @@ type (
 		merge(context.Context, fmt.Stringer, fmt.Stringer) (fmt.Stringer, error)
 		finalize(context.Context, *uint64, *gopacket.Packet, bool, fmt.Stringer) (fmt.Stringer, error)
 		write(context.Context, io.Writer, *fmt.Stringer) (int, error)
+		done(context.Context)
 	}
 
 	PcapTransformer struct {
@@ -269,21 +270,17 @@ func (t *PcapTransformer) WaitDone(ctx context.Context, timeout time.Duration) {
 		close(writeDoneChan)
 	}()
 
-write_wait_loop:
-	for {
-		select {
-		case <-timer.C:
-			transformerLogger.Fatalf("[%d/%s] – timed out waiting for packets to be written | %d/%d | %d/%d\n", t.iface.Index, t.iface.Name,
-				t.translatorPool.Running(), t.translatorPool.Waiting(), t.writerPool.Running(), t.writerPool.Waiting())
-			return
-
-		case <-writeDoneChan:
-			for _, writeQueue := range t.writeQueues {
-				close(writeQueue) // close writer channels
-			}
-			transformerLogger.Printf("[%d/%s] – all packets were written\n", t.iface.Index, t.iface.Name)
-			break write_wait_loop
+	select {
+	case <-timer.C:
+		transformerLogger.Fatalf("[%d/%s] – timed out waiting for packets to be written | %d/%d | %d/%d\n", t.iface.Index, t.iface.Name,
+			t.translatorPool.Running(), t.translatorPool.Waiting(), t.writerPool.Running(), t.writerPool.Waiting())
+		return
+	case <-writeDoneChan:
+		timer.Stop()
+		for _, writeQueue := range t.writeQueues {
+			close(writeQueue) // close writer channels
 		}
+		transformerLogger.Printf("[%d/%s] – all packets were written\n", t.iface.Index, t.iface.Name)
 	}
 
 	_timeout := timeout - time.Since(ts)

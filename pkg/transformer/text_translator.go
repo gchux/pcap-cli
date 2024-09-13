@@ -63,6 +63,10 @@ func (tt *textPcapTranslations) String() string {
 	return ""
 }
 
+func (t *TextPcapTranslator) done(_ context.Context) {
+	// not implemented
+}
+
 func (t *TextPcapTranslator) next(ctx context.Context, serial *uint64, packet *gopacket.Packet) fmt.Stringer {
 	text := new(strings.Builder)
 
