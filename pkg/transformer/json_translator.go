@@ -293,10 +293,14 @@ func (t *JSONPcapTranslator) translateTCPLayer(ctx context.Context, tcp *layers.
 
 	opts, _ := L4.ArrayOfSize(len(tcp.Options), "opts")
 	for i, opt := range tcp.Options {
-		// Regex'ing TCP options is expensive
-		// [TODO]: find a way to not use `regexp` to extract TCP options
+		// see: https://github.com/google/gopacket/blob/master/layers/tcp.go#L104C9-L128
 		if o := tcpOptionRgx.FindStringSubmatch(opt.String()); o != nil {
-			opts.SetIndex(o[1], i)
+			if o[2] == "" {
+				opts.SetIndex(o[1], i)
+			} else {
+				opt, _ := opts.ObjectI(i)
+				opt.Set(strings.Split(o[2], " "), o[1])
+			}
 		}
 	}
 

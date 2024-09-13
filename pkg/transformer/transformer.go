@@ -93,7 +93,7 @@ var pcapTranslatorFmts = map[string]PcapTranslatorFmt{
 
 const (
 	projectIdEnvVarName           = "PROJECT_ID"
-	tcpOptionsRegex               = `^TCPOption\((?P<opt>.*?)\)$`
+	tcpOptionsRegex               = `^TCPOption\((?P<name>.+?):(?P<value>.*?)\)$`
 	http11RequestPayloadRegexStr  = `^(?P<method>.+?)\s(?P<url>.+?)\sHTTP/1\.1(?:\r?\n)?.*`
 	http11ResponsePayloadRegexStr = `^HTTP/1\.1\s(?P<code>\d{3})\s(?P<status>.+?)(?:\r?\n)?.*`
 	http2PrefaceRegexStr          = `^PRI.+?HTTP/2\.0\r?\n\r?\nSM\r?\n\r?\n`
