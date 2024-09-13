@@ -203,46 +203,69 @@ var (
 
 func (t *PcapTransformer) writeTranslation(ctx context.Context, task *pcapWriteTask) {
 	defer t.wg.Done()
-	// consume translations – flush them into writers
-	t.translator.write(ctx, t.writers[*task.writer], task.translation)
+	select {
+	case <-ctx.Done():
+		return
+	default:
+		t.translator.write(ctx, t.writers[*task.writer], task.translation)
+	}
 }
 
 func (t *PcapTransformer) publishTranslation(ctx context.Context, translation *fmt.Stringer) {
-	for _, translations := range t.writeQueues {
-		// if any of the consumers' buffers is full,
-		// the saturated/slower one will block and delay iterations.
-		// Blocking is more likely when `preserveOrder` is enabled.
-		translations <- translation
+	select {
+	case <-ctx.Done():
+		return
+	default:
+		for _, translations := range t.writeQueues {
+			// if any of the consumers' buffers is full,
+			// the saturated/slower one will block and delay iterations.
+			// Blocking is more likely when `preserveOrder` is enabled.
+			translations <- translation
+		}
 	}
 }
 
 func (t *PcapTransformer) produceTranslation(ctx context.Context, task *pcapTranslatorWorker) error {
-	t.publishTranslation(ctx, task.Run(ctx).(*fmt.Stringer))
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		t.publishTranslation(ctx, task.Run(ctx).(*fmt.Stringer))
+	}
 	return nil
 }
 
 func (t *PcapTransformer) produceTranslations(ctx context.Context) {
-	// translations are made available in the enqueued order
-	for translation := range t.och {
-		// consume translations and push them into translations consumers
-		t.publishTranslation(ctx, translation.Value.(*fmt.Stringer))
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case translation := <-t.och:
+			// translations are made available in the enqueued order
+			// consume translations and push them into translations consumers
+			t.publishTranslation(ctx, translation.Value.(*fmt.Stringer))
+		}
 	}
 }
 
 func (t *PcapTransformer) consumeTranslations(ctx context.Context, index *uint8) {
-	for translation := range t.writeQueues[*index] {
-		task := &pcapWriteTask{
-			ctx:         ctx,
-			writer:      index,
-			translation: translation,
-		}
-
-		if t.preserveOrder || t.connTracking {
-			// this is mostly blocking
-			t.writeTranslation(ctx, task)
-		} else {
-			// this is mostly non-blocking
-			t.writerPool.Invoke(task)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case translation := <-t.writeQueues[*index]:
+			task := &pcapWriteTask{
+				ctx:         ctx,
+				writer:      index,
+				translation: translation,
+			}
+			if t.preserveOrder || t.connTracking {
+				// this is mostly blocking
+				t.writeTranslation(ctx, task)
+			} else {
+				// this is mostly non-blocking
+				t.writerPool.Invoke(task)
+			}
 		}
 	}
 }
@@ -274,6 +297,7 @@ func (t *PcapTransformer) WaitDone(ctx context.Context, timeout time.Duration) {
 	case <-timer.C:
 		transformerLogger.Fatalf("[%d/%s] – timed out waiting for packets to be written | %d/%d | %d/%d\n", t.iface.Index, t.iface.Name,
 			t.translatorPool.Running(), t.translatorPool.Waiting(), t.writerPool.Running(), t.writerPool.Waiting())
+		t.translator.done(ctx)
 		return
 	case <-writeDoneChan:
 		timer.Stop()
@@ -300,6 +324,8 @@ func (t *PcapTransformer) WaitDone(ctx context.Context, timeout time.Duration) {
 		wg.Wait()
 		transformerLogger.Printf("[%d/%s] – released worker pools\n", t.iface.Index, t.iface.Name)
 	}
+
+	t.translator.done(ctx)
 
 	transformerLogger.Printf("[%d/%s] – STOPPED | latency: %v\n", t.iface.Index, t.iface.Name, time.Since(ts))
 }
@@ -397,7 +423,7 @@ func provideConcurrentQueue(ctx context.Context, connTrack bool, transformer *Pc
 	transformer.och = concurrently.Process(ctx, transformer.ich, ochOpts)
 }
 
-func provideStrategy(transformer *PcapTransformer, preserveOrder, connTracking bool) {
+func provideStrategy(ctx context.Context, transformer *PcapTransformer, preserveOrder, connTracking bool) {
 	var strategy func(*pcapTranslatorWorker) error
 
 	if preserveOrder || connTracking {
@@ -407,7 +433,12 @@ func provideStrategy(transformer *PcapTransformer, preserveOrder, connTracking b
 		// The degree of contention is proportial to the Q capacity times translation latency.
 		// Order should only be used for not network intersive workloads.
 		strategy = func(worker *pcapTranslatorWorker) error {
-			transformer.ich <- worker
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+				transformer.ich <- worker
+			}
 			return nil
 		}
 	} else {
@@ -416,7 +447,12 @@ func provideStrategy(transformer *PcapTransformer, preserveOrder, connTracking b
 		// that packets will be consumed/written in non-deterministic order.
 		// `serial` is aviailable to be used for sorting PCAP files.
 		strategy = func(worker *pcapTranslatorWorker) error {
-			return transformer.translatorPool.Invoke(worker)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+				return transformer.translatorPool.Invoke(worker)
+			}
 		}
 	}
 
@@ -459,7 +495,7 @@ func newTransformer(
 		connTracking:  connTracking,
 	}
 
-	provideStrategy(transformer, preserveOrder, connTracking)
+	provideStrategy(ctx, transformer, preserveOrder, connTracking)
 
 	// `preserveOrder==true` causes writes to be sequential and blocking per `io.Writer`.
 	// `preserveOrder==true` although blocking at writting, does not cause `transformer.Apply` to block.

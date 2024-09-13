@@ -55,7 +55,10 @@ func (t *JSONPcapTranslator) translate(_ *gopacket.Packet) error {
 
 func (t *JSONPcapTranslator) done(ctx context.Context) {
 	t.fm.MutexMap.ForEach(func(flowID uint64, lock *flowLockCarrier) bool {
-		t.fm.untrackConnection(&flowID, lock)
+		if lock.mu.TryLock() {
+			t.fm.untrackConnection(ctx, &flowID, lock)
+			lock.mu.Unlock()
+		}
 		return true
 	})
 	t.flowToStreamToSequenceMap.Clear()

@@ -166,7 +166,7 @@ func (fm *flowMutex) startReaper(ctx context.Context) {
 					defer carrier.mu.Unlock()
 					lastUnlocked := time.Since(*carrier.lastUnlockedAt)
 					if lastUnlocked >= carrierDeadline {
-						fm.untrackConnection(&flowID, carrier)
+						fm.untrackConnection(ctx, &flowID, carrier)
 						fm.MutexMap.Del(flowID)
 						io.WriteString(os.Stderr, fmt.Sprintf("reaped flow '%d' after %v\n", flowID, lastUnlocked))
 					}
@@ -281,9 +281,15 @@ func (fm *flowMutex) trackConnection(
 }
 
 func (fm *flowMutex) untrackConnection(
+	_ context.Context,
 	flowID *uint64,
-	_ *flowLockCarrier,
+	lock *flowLockCarrier,
 ) {
+	defer func() {
+		if r := recover(); r != nil && fm.Debug {
+			transformerLogger.Fatalln("PANIC@untrackConnection: ", r)
+		}
+	}()
 	if ftsm, ok := fm.flowToStreamToSequenceMap.Get(*flowID); ok {
 		streams := make([]uint32, ftsm.Len())
 		streamIndex := 0
@@ -313,6 +319,10 @@ func (fm *flowMutex) untrackConnection(
 		fm.flowToStreamToSequenceMap.Del(*flowID)
 	}
 	fm.MutexMap.Del(*flowID)
+	for lock.activeRequests.Load() > 0 {
+		lock.wg.Done()
+		lock.activeRequests.Add(-1)
+	}
 }
 
 func (fm *flowMutex) isConnectionTermination(tcpFlags *uint8) bool {
@@ -431,13 +441,13 @@ func (fm *flowMutex) lock(
 			select {
 			case <-ctx.Done():
 				// untrack connection immediately if the context is done
-				fm.untrackConnection(flowID, carrier)
+				fm.untrackConnection(ctx, flowID, carrier)
 			default:
 				time.AfterFunc(trackingDeadline, func() {
 					timestamp := time.Now()
 					message := "untracking"
 					go fm.log(ctx, serial, flowID, tcpFlags, sequence, &timestamp, &message)
-					fm.untrackConnection(flowID, carrier)
+					fm.untrackConnection(ctx, flowID, carrier)
 				})
 			}
 			lockLatency := time.Since(lockAcquiredTS)
