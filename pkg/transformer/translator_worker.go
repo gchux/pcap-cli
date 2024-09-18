@@ -151,7 +151,17 @@ func (w *pcapTranslatorWorker) translateTLSLayer(ctx context.Context) fmt.String
 // The work that needs to be performed
 // The input type should implement the WorkFunction interface
 func (w *pcapTranslatorWorker) Run(ctx context.Context) interface{} {
-	buffer := w.translator.next(ctx, w.serial, w.packet)
+	var buffer fmt.Stringer = nil
+
+	// work may be already queued by the time context is done:
+	//   - if a worker is queued before context is done and executes after the fact:
+	select {
+	case <-ctx.Done():
+		// skip translation is context is already done by the time this worker runs.
+		return buffer
+	default:
+		buffer = w.translator.next(ctx, w.serial, w.packet)
+	}
 
 	translations := make(chan fmt.Stringer, packetLayerTranslatorsSize)
 	var wg sync.WaitGroup

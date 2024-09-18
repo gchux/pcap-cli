@@ -909,7 +909,7 @@ func (t *JSONPcapTranslator) trySetHTTP(
 
 		if err != nil && err != io.EOF {
 			errorJSON, _ := L7.Object("error")
-			errorJSON.Set("INVALID_HTTP11_RESPONSE", "code")
+			errorJSON.Set("INVALID_HTTP11_REQUEST", "code")
 			errorJSON.Set(err.Error(), "info")
 			json.Set(stringFormatter.Format("{0} | {1}: {2}",
 				*message, "INVALID_HTTP11_REQUEST", err.Error()), "message")

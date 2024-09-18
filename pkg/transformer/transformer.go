@@ -2,6 +2,7 @@ package transformer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -201,10 +202,13 @@ var (
 	}
 )
 
+var errUnavailableTranslation = errors.New("packet translation is unavailable")
+
 func (t *PcapTransformer) writeTranslation(ctx context.Context, task *pcapWriteTask) error {
 	defer t.wg.Done()
 	select {
 	case <-ctx.Done():
+		// reject writing translations if context is already done.
 		return ctx.Err()
 	default:
 		t.translator.write(ctx, t.writers[*task.writer], task.translation)
@@ -215,14 +219,18 @@ func (t *PcapTransformer) writeTranslation(ctx context.Context, task *pcapWriteT
 func (t *PcapTransformer) publishTranslation(ctx context.Context, translation *fmt.Stringer) error {
 	select {
 	case <-ctx.Done():
+		// reject publishing translations into writer queues if context is already done.
 		return ctx.Err()
 	default:
-		for _, translations := range t.writeQueues {
-			// if any of the consumers' buffers is full,
-			// the saturated/slower one will block and delay iterations.
-			// Blocking is more likely when `preserveOrder` is enabled.
-			translations <- translation
+		if translation == nil {
+			return errUnavailableTranslation
 		}
+	}
+	for _, translations := range t.writeQueues {
+		// if any of the consumers' buffers is full,
+		// the saturated/slower one will block and delay iterations.
+		// Blocking is more likely when `preserveOrder` is enabled.
+		translations <- translation
 	}
 	return nil
 }
@@ -230,6 +238,7 @@ func (t *PcapTransformer) publishTranslation(ctx context.Context, translation *f
 func (t *PcapTransformer) produceTranslation(ctx context.Context, task *pcapTranslatorWorker) error {
 	select {
 	case <-ctx.Done():
+		// do not perform any translations if context is already done
 		return ctx.Err()
 	default:
 		return t.publishTranslation(ctx, task.Run(ctx).(*fmt.Stringer))
@@ -253,6 +262,7 @@ func (t *PcapTransformer) consumeTranslations(ctx context.Context, index *uint8)
 	for {
 		select {
 		case <-ctx.Done():
+			// do not consume translations if context is already done
 			return ctx.Err()
 		case translation := <-t.writeQueues[*index]:
 			task := &pcapWriteTask{
@@ -340,8 +350,10 @@ func (t *PcapTransformer) WaitDone(ctx context.Context, timeout time.Duration) {
 func (t *PcapTransformer) Apply(ctx context.Context, packet *gopacket.Packet, serial *uint64) error {
 	select {
 	case <-ctx.Done():
+		// reject applying transformer if context is already done.
 		return ctx.Err()
 	default:
+		// applying transformer will write 1 translation into N>0 writers.
 		t.wg.Add(len(t.writers))
 	}
 	// It is assumed that packets will be produced faster than translations and writing operations, so:
@@ -350,12 +362,22 @@ func (t *PcapTransformer) Apply(ctx context.Context, packet *gopacket.Packet, se
 	return t.apply(worker)
 }
 
-func (t *PcapTransformer) translatePacketFn(ctx context.Context, worker interface{}) {
-	t.produceTranslation(ctx, worker.(*pcapTranslatorWorker))
+func (t *PcapTransformer) translatePacketFn(ctx context.Context, worker interface{}) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		return t.produceTranslation(ctx, worker.(*pcapTranslatorWorker))
+	}
 }
 
-func (t *PcapTransformer) writeTranslationFn(ctx context.Context, task interface{}) {
-	t.writeTranslation(ctx, task.(*pcapWriteTask))
+func (t *PcapTransformer) writeTranslationFn(ctx context.Context, task interface{}) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		return t.writeTranslation(ctx, task.(*pcapWriteTask))
+	}
 }
 
 func newTranslator(
