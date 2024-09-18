@@ -291,13 +291,13 @@ func (t *PcapTransformer) waitForContextDone(ctx context.Context) error {
 func (t *PcapTransformer) WaitDone(ctx context.Context, timeout time.Duration) {
 	ts := time.Now()
 
-	timer := time.NewTimer(timeout)
 	writeDoneChan := make(chan struct{})
+	timer := time.NewTimer(timeout)
 
 	go func() {
 		if !t.preserveOrder && !t.connTracking {
-			transformerLogger.Printf("[%d/%s] – gracefully terminating | %d/%d | %d/%d | deadline: %v\n", t.iface.Index, t.iface.Name,
-				t.translatorPool.Running(), t.translatorPool.Waiting(), t.writerPool.Running(), t.writerPool.Waiting(), timeout)
+			transformerLogger.Printf("[%d/%s] – gracefully terminating | tp: %d/%d | wp: %d/%d | deadline: %v\n",
+				t.iface.Index, t.iface.Name, t.translatorPool.Running(), t.translatorPool.Waiting(), t.writerPool.Running(), t.writerPool.Waiting(), timeout)
 		} else {
 			transformerLogger.Printf("[%d/%s] – gracefully terminating | deadline: %v\n", t.iface.Index, t.iface.Name, timeout)
 		}
@@ -308,19 +308,29 @@ func (t *PcapTransformer) WaitDone(ctx context.Context, timeout time.Duration) {
 	select {
 	case <-timer.C:
 		if !t.preserveOrder && !t.connTracking {
-			transformerLogger.Fatalf("[%d/%s] – timed out waiting for graceful termination | %d/%d | %d/%d\n", t.iface.Index, t.iface.Name,
-				t.translatorPool.Running(), t.translatorPool.Waiting(), t.writerPool.Running(), t.writerPool.Waiting())
+			transformerLogger.Fatalf("[%d/%s] – timed out waiting for graceful termination | tp: %d/%d | wp: %d/%d\n",
+				t.iface.Index, t.iface.Name, t.translatorPool.Running(), t.translatorPool.Waiting(), t.writerPool.Running(), t.writerPool.Waiting())
 		} else {
 			transformerLogger.Fatalf("[%d/%s] – timed out waiting for graceful termination\n", t.iface.Index, t.iface.Name)
 		}
-		t.translator.done(ctx)
-		return
-	case <-writeDoneChan:
-		timer.Stop()
 		for _, writeQueue := range t.writeQueues {
 			close(writeQueue) // close writer channels
 		}
-		transformerLogger.Printf("[%d/%s] – TERMINATED\n", t.iface.Index, t.iface.Name)
+		t.translator.done(ctx)
+		return
+
+	case <-writeDoneChan:
+		timer.Stop()
+		var droppedTranslations uint32 = 0
+		for _, writeQueue := range t.writeQueues {
+			for len(writeQueue) > 0 {
+				// safe as at this point no other goroutines are running
+				<-writeQueue // consume all non-written translations
+				droppedTranslations += 1
+			}
+			close(writeQueue) // close writer channels
+		}
+		transformerLogger.Printf("[%d/%s] – STOPPED – dropped translations: %d\n", t.iface.Index, t.iface.Name, droppedTranslations)
 	}
 
 	_timeout := timeout - time.Since(ts)
@@ -344,7 +354,7 @@ func (t *PcapTransformer) WaitDone(ctx context.Context, timeout time.Duration) {
 	// only safe to be called when nothing else is running
 	t.translator.done(ctx)
 
-	transformerLogger.Printf("[%d/%s] – STOPPED | latency: %v\n", t.iface.Index, t.iface.Name, time.Since(ts))
+	transformerLogger.Printf("[%d/%s] – TERMINATED | latency: %v\n", t.iface.Index, t.iface.Name, time.Since(ts))
 }
 
 func (t *PcapTransformer) Apply(ctx context.Context, packet *gopacket.Packet, serial *uint64) error {
@@ -362,21 +372,21 @@ func (t *PcapTransformer) Apply(ctx context.Context, packet *gopacket.Packet, se
 	return t.apply(worker)
 }
 
-func (t *PcapTransformer) translatePacketFn(ctx context.Context, worker interface{}) error {
+func (t *PcapTransformer) translatePacketFn(ctx context.Context, worker interface{}) {
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
+		return
 	default:
-		return t.produceTranslation(ctx, worker.(*pcapTranslatorWorker))
+		t.produceTranslation(ctx, worker.(*pcapTranslatorWorker))
 	}
 }
 
-func (t *PcapTransformer) writeTranslationFn(ctx context.Context, task interface{}) error {
+func (t *PcapTransformer) writeTranslationFn(ctx context.Context, task interface{}) {
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
+		return
 	default:
-		return t.writeTranslation(ctx, task.(*pcapWriteTask))
+		t.writeTranslation(ctx, task.(*pcapWriteTask))
 	}
 }
 
