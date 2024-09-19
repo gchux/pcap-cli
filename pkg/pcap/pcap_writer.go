@@ -2,6 +2,7 @@ package pcap
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -23,16 +24,19 @@ type (
 		io.Writer
 		io.Closer
 		rotate()
+		IsStdOutOrErr() bool
+		GetIface() *string
 	}
 
 	pcapWriter struct {
 		*logrotate.Writer
+		iface            *string
+		isStdOutOrErr    bool
 		v                reflect.Value
 		osFile           reflect.Value
 		osFileSync       reflect.Value
 		bufioWriter      reflect.Value
 		bufioWriterFlush reflect.Value
-		isStdOutOrErr    bool
 	}
 
 	pcapFileNameProvider struct {
@@ -67,15 +71,22 @@ func getSetableField(v reflect.Value, field string) reflect.Value {
 
 func (w *pcapWriter) rotate() {
 	// if `PcapWriter` encapsulates `std[out|err]` do not rotate,
-	// just call `Flush` on the underlying `bufio.Writer` for `os.Stdout`
+	// just call `Flush` on the underlying `bufio.Writer` for `os.Std{out|err}`
 	if w.isStdOutOrErr {
-		// w.osFileSync.Call(nil)
 		w.bufioWriterFlush.Call(nil)
 		return
 	}
 
 	// see: https://pkg.go.dev/cmd/compile#:~:text=//-,go%3Alinkname,-localname%20%5Bimportpath.name
 	rotate(w.Writer)
+}
+
+func (w *pcapWriter) GetIface() *string {
+	return w.iface
+}
+
+func (w *pcapWriter) IsStdOutOrErr() bool {
+	return w.isStdOutOrErr
 }
 
 func (p *pcapFileNameProvider) get() string {
@@ -131,13 +142,20 @@ func isStdoutPcapWriter(template, extension *string, interval *int) bool {
 	return ((template == nil && extension == nil) || (*template == "stdout" || *template == "stderr")) && *interval == 0
 }
 
-func NewStdoutPcapWriter() (PcapWriter, error) {
-	return NewPcapWriter(nil, nil, nil, 0)
+func NewStdoutPcapWriter(ctx context.Context, ifaceAndIndex *string) (PcapWriter, error) {
+	return NewPcapWriter(ctx, ifaceAndIndex, nil, nil, nil, 0)
 }
 
-func NewPcapWriter(template, extension, timezone *string, interval int) (PcapWriter, error) {
+func NewPcapWriter(ctx context.Context, ifaceAndInfex, template, extension, timezone *string, interval int) (PcapWriter, error) {
 	isStdOutOrErr := isStdoutPcapWriter(template, extension, &interval)
-	logger := log.New(os.Stderr, "[pcap/rotate] - ", log.LstdFlags)
+
+	loggerPrefix := fmt.Sprintf("[pcap/writer] - [%s] – ", *ifaceAndInfex)
+	if isStdOutOrErr {
+		loggerPrefix += "[stdout] – "
+	} else {
+		loggerPrefix = fmt.Sprintf("%s[%s] - ", loggerPrefix, *extension)
+	}
+	logger := log.New(os.Stderr, loggerPrefix, log.LstdFlags)
 
 	var err error
 	var writer *logrotate.Writer
@@ -170,5 +188,16 @@ func NewPcapWriter(template, extension, timezone *string, interval int) (PcapWri
 		bufioWriter.Set(reflect.ValueOf(bufio.NewWriterSize(os.Stdout, 1)))
 	}
 
-	return &pcapWriter{writer, v, osFile, osFileSync, bufioWriter, bufioWriterFlush, isStdOutOrErr}, nil
+	go func(ctx context.Context, writer *logrotate.Writer, block bool) {
+		if !block {
+			return
+		}
+		<-ctx.Done()
+		logger.Println("- closing")
+		writer.Close()
+	}(ctx, writer, !isStdOutOrErr)
+
+	logger.Println("- created")
+
+	return &pcapWriter{writer, ifaceAndInfex, isStdOutOrErr, v, osFile, osFileSync, bufioWriter, bufioWriterFlush}, nil
 }

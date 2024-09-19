@@ -128,23 +128,23 @@ func (p *Pcap) Start(ctx context.Context, writers []PcapWriter) error {
 		return fmt.Errorf("invalid format: %s", err)
 	}
 
+	loggerPrefix := fmt.Sprintf("[%d/%s] ", device.NetInterface.Index, device.Name)
 	var packetsCounter atomic.Uint64
 	for {
 		select {
 		case <-ctx.Done():
-			gopacketLogger.Printf("[%d/%s] – stopping packet capture\n", device.NetInterface.Index, device.Name)
+			gopacketLogger.Printf("%s - stopping packet capture\n", loggerPrefix)
 			inactiveHandle.CleanUp()
 			handle.Close()
-			gopacketLogger.Printf("[%d/%s] – raw sockets closed\n", device.NetInterface.Index, device.Name)
-			p.fn.WaitDone(ctx, 2500*time.Millisecond)
+			gopacketLogger.Printf("%s - raw sockets closed\n", loggerPrefix)
+			p.fn.WaitDone(ctx, 2*time.Second)
 			// do not close engine's writers until `stop` is called
 			// if the context is done, simply rotate the current PCAP file
 			// PCAP file rotation includes: flush and sync
 			for _, writer := range pcapWriters {
 				writer.rotate()
 			}
-			gopacketLogger.Printf("[%d/%s] – total packets: %d\n",
-				device.NetInterface.Index, device.Name, packetsCounter.Load())
+			gopacketLogger.Printf("%s – total packets: %d\n", loggerPrefix, packetsCounter.Load())
 			p.fn = nil
 			p.isActive.Store(false)
 			return ctx.Err()
@@ -153,7 +153,7 @@ func (p *Pcap) Start(ctx context.Context, writers []PcapWriter) error {
 			serial := packetsCounter.Add(1)
 			// non-blocking operation
 			if err := p.fn.Apply(ctx, &packet, &serial); err != nil {
-				gopacketLogger.Fatalf("[%d] – failed to translate: %s\n", serial, packet)
+				gopacketLogger.Fatalf("%s | #:%d | failed to translate: %v\n", loggerPrefix, serial, err)
 			}
 		}
 	}

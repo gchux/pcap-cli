@@ -834,7 +834,7 @@ func (t *JSONPcapTranslator) trySetHTTP(
 			frame, frameErr = framer.ReadFrame()
 		}
 
-		if frameErr != nil && frameErr != io.EOF {
+		if frameErr != nil && frameErr != io.EOF && frameErr != io.ErrUnexpectedEOF {
 			errorJSON, _ := L7.Object("error")
 			errorJSON.Set("INVALID_HTTP2_FRAME", "code")
 			errorJSON.Set(frameErr.Error(), "info")
@@ -907,7 +907,7 @@ func (t *JSONPcapTranslator) trySetHTTP(
 		requestStreams.Add(StreamID)
 		request, err := http.ReadRequest(httpDataReader)
 
-		if err != nil && err != io.EOF {
+		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
 			errorJSON, _ := L7.Object("error")
 			errorJSON.Set("INVALID_HTTP11_REQUEST", "code")
 			errorJSON.Set(err.Error(), "info")
@@ -946,7 +946,7 @@ func (t *JSONPcapTranslator) trySetHTTP(
 		//   - see: https://github.com/golang/go/issues/27061
 		response, err := http.ReadResponse(httpDataReader, nil)
 
-		if err != nil && err != io.EOF {
+		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
 			errorJSON, _ := L7.Object("error")
 			errorJSON.Set("INVALID_HTTP11_RESPONSE", "code")
 			errorJSON.Set(err.Error(), "info")

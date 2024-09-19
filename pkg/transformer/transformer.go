@@ -39,19 +39,20 @@ type (
 	}
 
 	PcapTransformer struct {
-		ctx            context.Context
-		iface          *PcapIface
-		ich            chan concurrently.WorkFunction
-		och            <-chan concurrently.OrderedOutput
-		translator     PcapTranslator
-		translatorPool *ants.PoolWithFunc
-		writerPool     *ants.MultiPoolWithFunc
-		writers        []io.Writer
-		writeQueues    []chan *fmt.Stringer
-		wg             *sync.WaitGroup
-		preserveOrder  bool
-		connTracking   bool
-		apply          func(*pcapTranslatorWorker) error
+		ctx             context.Context
+		iface           *PcapIface
+		ich             chan concurrently.WorkFunction
+		och             <-chan concurrently.OrderedOutput
+		translator      PcapTranslator
+		translatorPool  *ants.PoolWithFunc
+		writerPool      *ants.MultiPoolWithFunc
+		writers         []io.Writer
+		writeQueues     []chan *fmt.Stringer
+		writeQueuesDone []chan struct{}
+		wg              *sync.WaitGroup
+		preserveOrder   bool
+		connTracking    bool
+		apply           func(*pcapTranslatorWorker) error
 	}
 
 	IPcapTransformer interface {
@@ -206,26 +207,19 @@ var errUnavailableTranslation = errors.New("packet translation is unavailable")
 
 func (t *PcapTransformer) writeTranslation(ctx context.Context, task *pcapWriteTask) error {
 	defer t.wg.Done()
-	select {
-	case <-ctx.Done():
-		// reject writing translations if context is already done.
-		return ctx.Err()
-	default:
-		t.translator.write(ctx, t.writers[*task.writer], task.translation)
-	}
-	return nil
+	_, err := t.translator.write(ctx, t.writers[*task.writer], task.translation)
+	return err
 }
 
-func (t *PcapTransformer) publishTranslation(ctx context.Context, translation *fmt.Stringer) error {
-	select {
-	case <-ctx.Done():
-		// reject publishing translations into writer queues if context is already done.
-		return ctx.Err()
-	default:
-		if translation == nil {
-			return errUnavailableTranslation
+func (t *PcapTransformer) publishTranslation(_ context.Context, translation *fmt.Stringer) error {
+	if translation == nil {
+		// if `translation` is not available, rollback write commitment
+		for range len(t.writers) {
+			t.wg.Done()
 		}
+		return errUnavailableTranslation
 	}
+
 	for _, translations := range t.writeQueues {
 		// if any of the consumers' buffers is full,
 		// the saturated/slower one will block and delay iterations.
@@ -236,34 +230,41 @@ func (t *PcapTransformer) publishTranslation(ctx context.Context, translation *f
 }
 
 func (t *PcapTransformer) produceTranslation(ctx context.Context, task *pcapTranslatorWorker) error {
-	select {
-	case <-ctx.Done():
-		// do not perform any translations if context is already done
-		return ctx.Err()
-	default:
-		return t.publishTranslation(ctx, task.Run(ctx).(*fmt.Stringer))
-	}
+	return t.publishTranslation(ctx, task.Run(ctx).(*fmt.Stringer))
 }
 
-func (t *PcapTransformer) produceTranslations(ctx context.Context) error {
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case translation := <-t.och:
-			// translations are made available in the enqueued order
-			// consume translations and push them into translations consumers
-			return t.publishTranslation(ctx, translation.Value.(*fmt.Stringer))
-		}
+func (t *PcapTransformer) produceTranslations(ctx context.Context) {
+	for translation := range t.och {
+		// translations are made available in the enqueued order
+		// consume translations and push them into translations consumers
+		t.publishTranslation(ctx, translation.Value.(*fmt.Stringer))
 	}
 }
 
 func (t *PcapTransformer) consumeTranslations(ctx context.Context, index *uint8) error {
+	// `consumeTranslations` runs in 1 goroutine per writer,
+	// so it needs to be context aware to be able to gracefully stop, thus preventing a leak.
 	for {
 		select {
 		case <-ctx.Done():
-			// do not consume translations if context is already done
+			// drop translations if context is already done
+			droppedTranslations := uint32(0)
+			// some translations may have been on-going when context was cancelled:
+			//   - fully consume the `writerQueue` and rollback the write commitment,
+			//   - block until `close` on the `writerQueue` is called by `WaitDone`
+			for translation := range t.writeQueues[*index] {
+				// best-effort: dump all non-written translations into `STDERR`
+				if *index == 0 {
+					fmt.Fprintln(os.Stderr, (*translation).String())
+				}
+				droppedTranslations += 1
+				t.wg.Done()
+			}
+			transformerLogger.Printf("[%d/%s] - w:%d | dropped translations: %d\n",
+				t.iface.Index, t.iface.Name, *index+1, droppedTranslations)
+			close(t.writeQueuesDone[*index])
 			return ctx.Err()
+
 		case translation := <-t.writeQueues[*index]:
 			task := &pcapWriteTask{
 				ctx:         ctx,
@@ -313,24 +314,22 @@ func (t *PcapTransformer) WaitDone(ctx context.Context, timeout time.Duration) {
 		} else {
 			transformerLogger.Fatalf("[%d/%s] – timed out waiting for graceful termination\n", t.iface.Index, t.iface.Name)
 		}
-		for _, writeQueue := range t.writeQueues {
+		for i, writeQueue := range t.writeQueues {
 			close(writeQueue) // close writer channels
+			<-t.writeQueuesDone[i]
 		}
 		t.translator.done(ctx)
 		return
 
 	case <-writeDoneChan:
 		timer.Stop()
-		var droppedTranslations uint32 = 0
-		for _, writeQueue := range t.writeQueues {
-			for len(writeQueue) > 0 {
-				// safe as at this point no other goroutines are running
-				<-writeQueue // consume all non-written translations
-				droppedTranslations += 1
-			}
-			close(writeQueue) // close writer channels
-		}
-		transformerLogger.Printf("[%d/%s] – STOPPED – dropped translations: %d\n", t.iface.Index, t.iface.Name, droppedTranslations)
+		transformerLogger.Printf("[%d/%s] – STOPPED – %v\n", t.iface.Index, t.iface.Name, time.Since(ts))
+	}
+
+	for i, writeQueue := range t.writeQueues {
+		// unblock `consumeTranslations` goroutines
+		close(writeQueue) // close writer channels
+		<-t.writeQueuesDone[i]
 	}
 
 	_timeout := timeout - time.Since(ts)
@@ -372,22 +371,21 @@ func (t *PcapTransformer) Apply(ctx context.Context, packet *gopacket.Packet, se
 	return t.apply(worker)
 }
 
-func (t *PcapTransformer) translatePacketFn(ctx context.Context, worker interface{}) {
+func (t *PcapTransformer) translatePacketFn(ctx context.Context, worker interface{}) error {
 	select {
 	case <-ctx.Done():
-		return
+		// rollback write packet translation commitment
+		for range len(t.writers) {
+			t.wg.Done()
+		}
+		return ctx.Err()
 	default:
-		t.produceTranslation(ctx, worker.(*pcapTranslatorWorker))
+		return t.produceTranslation(ctx, worker.(*pcapTranslatorWorker))
 	}
 }
 
-func (t *PcapTransformer) writeTranslationFn(ctx context.Context, task interface{}) {
-	select {
-	case <-ctx.Done():
-		return
-	default:
-		t.writeTranslation(ctx, task.(*pcapWriteTask))
-	}
+func (t *PcapTransformer) writeTranslationFn(ctx context.Context, task interface{}) error {
+	return t.writeTranslation(ctx, task.(*pcapWriteTask))
 }
 
 func newTranslator(
@@ -474,6 +472,11 @@ func provideStrategy(ctx context.Context, transformer *PcapTransformer, preserve
 		strategy = func(worker *pcapTranslatorWorker) error {
 			select {
 			case <-ctx.Done():
+				// `Apply` commits `transformer` to write the packet translation,
+				// so if the context is done, commitment must be rolled back
+				for range len(transformer.writers) {
+					transformer.wg.Done()
+				}
 				return ctx.Err()
 			default:
 				transformer.ich <- worker
@@ -486,12 +489,7 @@ func provideStrategy(ctx context.Context, transformer *PcapTransformer, preserve
 		// that packets will be consumed/written in non-deterministic order.
 		// `serial` is aviailable to be used for sorting PCAP files.
 		strategy = func(worker *pcapTranslatorWorker) error {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			default:
-				return transformer.translatorPool.Invoke(worker)
-			}
+			return transformer.translatorPool.Invoke(worker)
 		}
 	}
 
@@ -517,21 +515,24 @@ func newTransformer(
 	numWriters := len(writers)
 	// not using `io.MultiWriter` as it writes to all writers sequentially
 	writeQueues := make([]chan *fmt.Stringer, numWriters)
+	writeQueuesDone := make([]chan struct{}, numWriters)
 	for i := range writers {
 		writeQueues[i] = make(chan *fmt.Stringer, 100)
+		writeQueuesDone[i] = make(chan struct{})
 	}
 
 	// same transformer, multiple strategies
 	// via multiple translator implementations
 	transformer := &PcapTransformer{
-		wg:            new(sync.WaitGroup),
-		ctx:           ctx,
-		iface:         iface,
-		translator:    translator,
-		writers:       writers,
-		writeQueues:   writeQueues,
-		preserveOrder: preserveOrder || connTracking,
-		connTracking:  connTracking,
+		wg:              new(sync.WaitGroup),
+		ctx:             ctx,
+		iface:           iface,
+		translator:      translator,
+		writers:         writers,
+		writeQueues:     writeQueues,
+		writeQueuesDone: writeQueuesDone,
+		preserveOrder:   preserveOrder || connTracking,
+		connTracking:    connTracking,
 	}
 
 	provideStrategy(ctx, transformer, preserveOrder, connTracking)
