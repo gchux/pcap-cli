@@ -116,6 +116,8 @@ func startPCAP(ctx context.Context, id *string, dev *pcap.PcapDevice, config *pc
 
 	logger.Printf("device: %+v\n", iface)
 
+	ifaceNameAndIndex := fmt.Sprintf("%d/%s", dev.NetInterface.Index, dev.Name)
+
 	config.Iface = iface
 
 	if *engine == "tcpdump" && *stdout {
@@ -139,14 +141,14 @@ func startPCAP(ctx context.Context, id *string, dev *pcap.PcapDevice, config *pc
 	var pcapWriter pcap.PcapWriter
 
 	if *engine == "google" && *stdout {
-		pcapWriter, err = pcap.NewStdoutPcapWriter()
+		pcapWriter, err = pcap.NewStdoutPcapWriter(ctx, &ifaceNameAndIndex)
 		if err == nil {
 			pcapWriters = append(pcapWriters, pcapWriter)
 		}
 	}
 
 	if *engine == "google" && *writeTo != "stdout" {
-		pcapWriter, err = pcap.NewPcapWriter(writeTo, extension, timezone, *interval)
+		pcapWriter, err = pcap.NewPcapWriter(ctx, &ifaceNameAndIndex, writeTo, extension, timezone, *interval)
 		if err == nil {
 			pcapWriters = append(pcapWriters, pcapWriter)
 		}

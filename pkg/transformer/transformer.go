@@ -41,12 +41,14 @@ type (
 	PcapTransformer struct {
 		ctx             context.Context
 		iface           *PcapIface
+		loggerPrefix    *string
 		ich             chan concurrently.WorkFunction
 		och             <-chan concurrently.OrderedOutput
 		translator      PcapTranslator
 		translatorPool  *ants.PoolWithFunc
 		writerPool      *ants.MultiPoolWithFunc
 		writers         []io.Writer
+		numWriters      *uint8
 		writeQueues     []chan *fmt.Stringer
 		writeQueuesDone []chan struct{}
 		wg              *sync.WaitGroup
@@ -203,7 +205,10 @@ var (
 	}
 )
 
-var errUnavailableTranslation = errors.New("packet translation is unavailable")
+var (
+	errUnavailableTranslation = errors.New("packet translation is unavailable")
+	errUnavailableTranslator  = errors.New("translator is unavailable")
+)
 
 func (t *PcapTransformer) writeTranslation(ctx context.Context, task *pcapWriteTask) error {
 	defer t.wg.Done()
@@ -214,12 +219,13 @@ func (t *PcapTransformer) writeTranslation(ctx context.Context, task *pcapWriteT
 func (t *PcapTransformer) publishTranslation(_ context.Context, translation *fmt.Stringer) error {
 	if translation == nil {
 		// if `translation` is not available, rollback write commitment
-		for range len(t.writers) {
+		for range *t.numWriters {
 			t.wg.Done()
 		}
-		return errUnavailableTranslation
+		return errors.Join(errUnavailableTranslation, errors.New(*t.loggerPrefix+"nil translation"))
 	}
 
+	// fan-out translation into all writers
 	for _, translations := range t.writeQueues {
 		// if any of the consumers' buffers is full,
 		// the saturated/slower one will block and delay iterations.
@@ -260,8 +266,7 @@ func (t *PcapTransformer) consumeTranslations(ctx context.Context, index *uint8)
 				droppedTranslations += 1
 				t.wg.Done()
 			}
-			transformerLogger.Printf("[%d/%s] - w:%d | dropped translations: %d\n",
-				t.iface.Index, t.iface.Name, *index+1, droppedTranslations)
+			transformerLogger.Printf("%s - writer:%d | dropped translations: %d\n", *t.loggerPrefix, *index+1, droppedTranslations)
 			close(t.writeQueuesDone[*index])
 			return ctx.Err()
 
@@ -291,16 +296,16 @@ func (t *PcapTransformer) waitForContextDone(ctx context.Context) error {
 // returns when all packets have been transformed and written
 func (t *PcapTransformer) WaitDone(ctx context.Context, timeout time.Duration) {
 	ts := time.Now()
+	timer := time.NewTimer(timeout)
 
 	writeDoneChan := make(chan struct{})
-	timer := time.NewTimer(timeout)
 
 	go func() {
 		if !t.preserveOrder && !t.connTracking {
-			transformerLogger.Printf("[%d/%s] – gracefully terminating | tp: %d/%d | wp: %d/%d | deadline: %v\n",
-				t.iface.Index, t.iface.Name, t.translatorPool.Running(), t.translatorPool.Waiting(), t.writerPool.Running(), t.writerPool.Waiting(), timeout)
+			transformerLogger.Printf("%s gracefully terminating | tp: %d/%d | wp: %d/%d | deadline: %v\n",
+				*t.loggerPrefix, t.translatorPool.Running(), t.translatorPool.Waiting(), t.writerPool.Running(), t.writerPool.Waiting(), timeout)
 		} else {
-			transformerLogger.Printf("[%d/%s] – gracefully terminating | deadline: %v\n", t.iface.Index, t.iface.Name, timeout)
+			transformerLogger.Printf("%s gracefully terminating | deadline: %v\n", *t.loggerPrefix, timeout)
 		}
 		t.wg.Wait() // wait for all translations to be written
 		close(writeDoneChan)
@@ -309,10 +314,10 @@ func (t *PcapTransformer) WaitDone(ctx context.Context, timeout time.Duration) {
 	select {
 	case <-timer.C:
 		if !t.preserveOrder && !t.connTracking {
-			transformerLogger.Fatalf("[%d/%s] – timed out waiting for graceful termination | tp: %d/%d | wp: %d/%d\n",
-				t.iface.Index, t.iface.Name, t.translatorPool.Running(), t.translatorPool.Waiting(), t.writerPool.Running(), t.writerPool.Waiting())
+			transformerLogger.Fatalf("%s timed out waiting for graceful termination | tp: %d/%d | wp: %d/%d\n",
+				*t.loggerPrefix, t.translatorPool.Running(), t.translatorPool.Waiting(), t.writerPool.Running(), t.writerPool.Waiting())
 		} else {
-			transformerLogger.Fatalf("[%d/%s] – timed out waiting for graceful termination\n", t.iface.Index, t.iface.Name)
+			transformerLogger.Fatalf("%s timed out waiting for graceful termination\n", *t.loggerPrefix)
 		}
 		for i, writeQueue := range t.writeQueues {
 			close(writeQueue) // close writer channels
@@ -323,7 +328,7 @@ func (t *PcapTransformer) WaitDone(ctx context.Context, timeout time.Duration) {
 
 	case <-writeDoneChan:
 		timer.Stop()
-		transformerLogger.Printf("[%d/%s] – STOPPED – %v\n", t.iface.Index, t.iface.Name, time.Since(ts))
+		transformerLogger.Printf("%s STOPPED – %v\n", *t.loggerPrefix, time.Since(ts))
 	}
 
 	for i, writeQueue := range t.writeQueues {
@@ -335,7 +340,7 @@ func (t *PcapTransformer) WaitDone(ctx context.Context, timeout time.Duration) {
 	_timeout := timeout - time.Since(ts)
 	// if order is not enforced: there are 2 worker pools to be stopped
 	if _timeout > 0 && !t.preserveOrder && !t.connTracking {
-		transformerLogger.Printf("[%d/%s] – releasing worker pools | deadline: %v\n", t.iface.Index, t.iface.Name, _timeout)
+		transformerLogger.Printf("%s releasing worker pools | deadline: %v\n", *t.loggerPrefix, _timeout)
 		var wg sync.WaitGroup
 		wg.Add(2)
 		go func() {
@@ -347,13 +352,13 @@ func (t *PcapTransformer) WaitDone(ctx context.Context, timeout time.Duration) {
 			wg.Done()
 		}()
 		wg.Wait()
-		transformerLogger.Printf("[%d/%s] – released worker pools\n", t.iface.Index, t.iface.Name)
+		transformerLogger.Printf("%s released worker pools\n", *t.loggerPrefix)
 	}
 
 	// only safe to be called when nothing else is running
 	t.translator.done(ctx)
 
-	transformerLogger.Printf("[%d/%s] – TERMINATED | latency: %v\n", t.iface.Index, t.iface.Name, time.Since(ts))
+	transformerLogger.Printf("%s TERMINATED | latency: %v\n", *t.loggerPrefix, time.Since(ts))
 }
 
 func (t *PcapTransformer) Apply(ctx context.Context, packet *gopacket.Packet, serial *uint64) error {
@@ -363,7 +368,7 @@ func (t *PcapTransformer) Apply(ctx context.Context, packet *gopacket.Packet, se
 		return ctx.Err()
 	default:
 		// applying transformer will write 1 translation into N>0 writers.
-		t.wg.Add(len(t.writers))
+		t.wg.Add(int(*t.numWriters))
 	}
 	// It is assumed that packets will be produced faster than translations and writing operations, so:
 	//   - process/translate packets concurrently in order to avoid blocking `gopacket` packets channel as much as possible.
@@ -375,7 +380,7 @@ func (t *PcapTransformer) translatePacketFn(ctx context.Context, worker interfac
 	select {
 	case <-ctx.Done():
 		// rollback write packet translation commitment
-		for range len(t.writers) {
+		for range *t.numWriters {
 			t.wg.Done()
 		}
 		return ctx.Err()
@@ -405,13 +410,14 @@ func newTranslator(
 		/* no-go */
 	}
 
-	return nil, fmt.Errorf("translator unavailable: %v", format)
+	return nil, errors.Join(errUnavailableTranslator,
+		fmt.Errorf("[%d/%s] - format: %v", iface.Index, iface.Name, format))
 }
 
 // if preserving packet capture order is not required, translations may be done concurrently
 // concurrently translating packets means that translations are not enqueded in packet capture order.
 // Similarly, sinking translations into files can be safely done concurrently ( in whatever order goroutines are scheduled )
-func provideWorkerPools(ctx context.Context, transformer *PcapTransformer, numWriters int) {
+func provideWorkerPools(ctx context.Context, transformer *PcapTransformer, numWriters *uint8) {
 	poolOpts := ants.Options{
 		PreAlloc:       true,
 		Nonblocking:    false,
@@ -419,7 +425,7 @@ func provideWorkerPools(ctx context.Context, transformer *PcapTransformer, numWr
 	}
 	poolOpt := ants.WithOptions(poolOpts)
 
-	poolSize := 25 * numWriters
+	poolSize := 25 * int(*numWriters)
 
 	translatorPoolFn := func(i interface{}) {
 		transformer.translatePacketFn(ctx, i)
@@ -432,11 +438,11 @@ func provideWorkerPools(ctx context.Context, transformer *PcapTransformer, numWr
 	}
 
 	// I/O ( writing ) is slow; so there will be more writers than translator routines
-	writerPool, _ := ants.NewMultiPoolWithFunc(numWriters, 25, writerPoolFn, ants.LeastTasks, poolOpt)
+	writerPool, _ := ants.NewMultiPoolWithFunc(int(*numWriters), 25, writerPoolFn, ants.LeastTasks, poolOpt)
 	transformer.writerPool = writerPool
 }
 
-func provideConcurrentQueue(ctx context.Context, connTrack bool, transformer *PcapTransformer, numWriters int) {
+func provideConcurrentQueue(ctx context.Context, connTrack bool, transformer *PcapTransformer, numWriters *uint8) {
 	// if connection tracking is enabled, the whole process is synchronous,
 	// so the following considerations apply:
 	//   - should be enabled only in combination with a very specific filter
@@ -448,7 +454,7 @@ func provideConcurrentQueue(ctx context.Context, connTrack bool, transformer *Pc
 		// packets are processed concurrently which makes connection tracking
 		// a very complex process to be done on-the-fly as order of packet translation
 		// is not guaranteed; introducing contention may slow down the whole process.
-		poolSize = 30 * numWriters
+		poolSize = 30 * int(*numWriters)
 	}
 
 	ochOpts := &concurrently.Options{
@@ -474,7 +480,7 @@ func provideStrategy(ctx context.Context, transformer *PcapTransformer, preserve
 			case <-ctx.Done():
 				// `Apply` commits `transformer` to write the packet translation,
 				// so if the context is done, commitment must be rolled back
-				for range len(transformer.writers) {
+				for range *transformer.numWriters {
 					transformer.wg.Done()
 				}
 				return ctx.Err()
@@ -512,7 +518,9 @@ func newTransformer(
 		return nil, err
 	}
 
-	numWriters := len(writers)
+	loggerPrefix := fmt.Sprintf("[%d/%s] -", iface.Index, iface.Name)
+
+	numWriters := uint8(len(writers))
 	// not using `io.MultiWriter` as it writes to all writers sequentially
 	writeQueues := make([]chan *fmt.Stringer, numWriters)
 	writeQueuesDone := make([]chan struct{}, numWriters)
@@ -527,8 +535,10 @@ func newTransformer(
 		wg:              new(sync.WaitGroup),
 		ctx:             ctx,
 		iface:           iface,
+		loggerPrefix:    &loggerPrefix,
 		translator:      translator,
 		writers:         writers,
+		numWriters:      &numWriters,
 		writeQueues:     writeQueues,
 		writeQueuesDone: writeQueuesDone,
 		preserveOrder:   preserveOrder || connTracking,
@@ -540,11 +550,11 @@ func newTransformer(
 	// `preserveOrder==true` causes writes to be sequential and blocking per `io.Writer`.
 	// `preserveOrder==true` although blocking at writting, does not cause `transformer.Apply` to block.
 	if preserveOrder || connTracking {
-		provideConcurrentQueue(ctx, connTracking, transformer, numWriters)
+		provideConcurrentQueue(ctx, connTracking, transformer, &numWriters)
 		go transformer.waitForContextDone(ctx)
 		go transformer.produceTranslations(ctx)
 	} else {
-		provideWorkerPools(ctx, transformer, numWriters)
+		provideWorkerPools(ctx, transformer, &numWriters)
 	}
 
 	// spawn consumers for all `io.Writer`s
@@ -554,7 +564,7 @@ func newTransformer(
 		go transformer.consumeTranslations(ctx, &index)
 	}
 
-	transformerLogger.Printf("[%d/%s] – CREATED\n", iface.Index, iface.Name)
+	transformerLogger.Printf("%s CREATED | format:%s | writers:%d\n", loggerPrefix, *format, numWriters)
 
 	return transformer, nil
 }

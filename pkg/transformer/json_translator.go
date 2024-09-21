@@ -40,7 +40,7 @@ const (
 	jsonTranslationSummary          = "#:{serial} | @:{ifaceIndex}/{ifaceName} | flow:{flowID} | "
 	jsonTranslationSummaryWithoutL4 = jsonTranslationSummary + "{L3Src} > {L3Dst}"
 	jsonTranslationSummaryUDP       = jsonTranslationSummary + "{L4Proto} | {srcProto}/{L3Src}:{L4Src} > {dstProto}/{L3Dst}:{L4Dst}"
-	jsonTranslationSummaryTCP       = jsonTranslationSummaryUDP + " | [{tcpFlags}] | seq/ack:{tcpSeq}/{tcpAck}"
+	jsonTranslationSummaryTCP       = jsonTranslationSummaryUDP + " | [{tcpFlags}] | len/seq/ack:{tcpLen}/{tcpSeq}/{tcpAck}"
 	jsonTranslationFlowTemplate     = "{0}/iface/{1}/flow/{2}:{3}"
 )
 
@@ -130,12 +130,26 @@ func (t *JSONPcapTranslator) translateEthernetLayer(ctx context.Context, eth *la
 	return json
 }
 
+func (t *JSONPcapTranslator) addEndpoints(json *gabs.Container, flow *gopacket.Flow) {
+	flows, _ := json.Object("endpoints")
+
+	flows.Set(flow.Src().String(), "src")
+	flows.Set(flow.Dst().String(), "dst")
+	flows.Set(flow.String(), "fwd")
+	flows.Set(flow.Reverse().String(), "bwd")
+	flows.Set(strconv.FormatUint(flow.FastHash(), 10), "hash")
+}
+
 func (t *JSONPcapTranslator) translateIPv4Layer(ctx context.Context, ip4 *layers.IPv4) fmt.Stringer {
 	json := gabs.New()
 
 	// https://github.com/google/gopacket/blob/master/layers/ip4.go#L43
 
 	L3, _ := json.Object("L3")
+
+	networkFlow := ip4.NetworkFlow()
+	t.addEndpoints(L3, &networkFlow)
+
 	L3.Set(ip4.Version, "v")
 	L3.Set(ip4.SrcIP, "src")
 	L3.Set(ip4.DstIP, "dst")
@@ -146,6 +160,8 @@ func (t *JSONPcapTranslator) translateIPv4Layer(ctx context.Context, ip4 *layers
 	L3.Set(ip4.Length, "len")
 	L3.Set(ip4.FragOffset, "foff")
 	L3.Set(ip4.Checksum, "xsum")
+
+	ip4.NetworkFlow()
 
 	opts, _ := L3.ArrayOfSize(len(ip4.Options), "opts")
 	for i, opt := range ip4.Options {
@@ -175,6 +191,10 @@ func (t *JSONPcapTranslator) translateIPv6Layer(ctx context.Context, ip6 *layers
 	// https://github.com/google/gopacket/blob/master/layers/ip6.go#L28-L43
 
 	L3, _ := json.Object("L3")
+
+	networkFlow := ip6.NetworkFlow()
+	t.addEndpoints(L3, &networkFlow)
+
 	L3.Set(ip6.Version, "v")
 	L3.Set(ip6.SrcIP, "src")
 	L3.Set(ip6.DstIP, "dst")
@@ -204,6 +224,11 @@ func (t *JSONPcapTranslator) translateUDPLayer(ctx context.Context, udp *layers.
 
 	L4, _ := json.Object("L4")
 
+	transportFlow := udp.TransportFlow()
+	t.addEndpoints(L4, &transportFlow)
+
+	L4.Set(len(udp.Payload), "size")
+
 	L4.Set(udp.Checksum, "xsum")
 	L4.Set(udp.Length, "len")
 
@@ -231,6 +256,11 @@ func (t *JSONPcapTranslator) translateTCPLayer(ctx context.Context, tcp *layers.
 	// https://github.com/google/gopacket/blob/master/layers/tcp.go#L19-L35
 
 	L4, _ := json.Object("L4")
+
+	transportFlow := tcp.TransportFlow()
+	t.addEndpoints(L4, &transportFlow)
+
+	L4.Set(strconv.FormatInt(int64(len(tcp.Payload)), 10), "len")
 
 	L4.Set(tcp.Seq, "seq")
 	L4.Set(tcp.Ack, "ack")
@@ -299,7 +329,26 @@ func (t *JSONPcapTranslator) translateTCPLayer(ctx context.Context, tcp *layers.
 				opts.SetIndex(o[1], i)
 			} else {
 				opt, _ := opts.ObjectI(i)
-				opt.Set(strings.Split(o[2], " "), o[1])
+				optKey := strings.TrimSpace(o[1])
+				optVals := strings.Split(o[2], " ")
+				opt.Array(optKey)
+				for _, optVal := range optVals {
+					optVal = strings.TrimSpace(optVal)
+					if optVal == "" {
+						continue
+					} else if strings.HasPrefix(optVal, "0x") {
+						opt.ArrayAppend(strings.TrimRight(optVal, "0"), optKey)
+					} else {
+						if optKey == "Timestamps" {
+							for _, ts := range strings.Split(optVal, "/") {
+								opt.ArrayAppend(ts, optKey)
+							}
+						} else {
+							opt.ArrayAppend(optVal, optKey)
+						}
+					}
+				}
+
 			}
 		}
 	}
@@ -458,7 +507,7 @@ func (t *JSONPcapTranslator) finalize(
 ) (fmt.Stringer, error) {
 	json := t.asTranslation(packet)
 
-	data := make(map[string]any, 14)
+	data := make(map[string]any, 15)
 
 	id := ctx.Value(ContextID)
 	logName := ctx.Value(ContextLogName)
@@ -541,6 +590,8 @@ func (t *JSONPcapTranslator) finalize(
 	data["tcpSeq"] = seq
 	ack, _ := json.Path("L4.ack").Data().(uint32)
 	data["tcpAck"] = ack
+	tcpLen, _ := json.Path("L4.len").Data().(string)
+	data["tcpLen"] = tcpLen
 
 	operation.Set(stringFormatter.Format(jsonTranslationFlowTemplate, id, t.iface.Name, "tcp", flowIDstr), "id")
 
@@ -752,10 +803,13 @@ func (t *JSONPcapTranslator) trySetHTTP(
 			}
 
 			sizeOfFrame := frameHeader.Length /* uint32 */
-			frameJSON.Set(sizeOfFrame, "length")
+			frameJSON.Set(sizeOfFrame, "len")
 
 			// see: https://pkg.go.dev/golang.org/x/net/http2#Flags
-			frameJSON.Set("0b"+strconv.FormatUint(uint64(frameHeader.Flags /* uint8 */), 2), "flags")
+			flagsJSON, _ := frameJSON.Object("flags")
+			flagsJSON.Set("0b"+strconv.FormatUint(uint64(frameHeader.Flags /* uint8 */), 2), "bin")
+			flagsJSON.Set("0x"+strconv.FormatUint(uint64(frameHeader.Flags /* uint8 */), 16), "hex")
+			flagsJSON.Set(strconv.FormatUint(uint64(frameHeader.Flags /* uint8 */), 10), "dec")
 
 			var _ts *traceAndSpan = nil
 
