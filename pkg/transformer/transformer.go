@@ -423,14 +423,21 @@ func provideWorkerPools(ctx context.Context, transformer *PcapTransformer, numWr
 		Nonblocking:    false,
 		ExpiryDuration: 10 * time.Second,
 	}
-	poolOpt := ants.WithOptions(poolOpts)
+
+	poolOpts.PanicHandler = func(i interface{}) {
+		for range *transformer.numWriters {
+			transformer.wg.Done()
+		}
+	}
+
+	poolOptions := ants.WithOptions(poolOpts)
 
 	poolSize := 25 * int(*numWriters)
 
 	translatorPoolFn := func(i interface{}) {
 		transformer.translatePacketFn(ctx, i)
 	}
-	translatorPool, _ := ants.NewPoolWithFunc(poolSize, translatorPoolFn, poolOpt)
+	translatorPool, _ := ants.NewPoolWithFunc(poolSize, translatorPoolFn, poolOptions)
 	transformer.translatorPool = translatorPool
 
 	writerPoolFn := func(i interface{}) {
@@ -438,7 +445,7 @@ func provideWorkerPools(ctx context.Context, transformer *PcapTransformer, numWr
 	}
 
 	// I/O ( writing ) is slow; so there will be more writers than translator routines
-	writerPool, _ := ants.NewMultiPoolWithFunc(int(*numWriters), 25, writerPoolFn, ants.LeastTasks, poolOpt)
+	writerPool, _ := ants.NewMultiPoolWithFunc(int(*numWriters), 25, writerPoolFn, ants.LeastTasks, poolOptions)
 	transformer.writerPool = writerPool
 }
 

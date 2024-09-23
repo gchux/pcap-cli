@@ -293,6 +293,7 @@ func (t *JSONPcapTranslator) addTCPOptions(tcp *layers.TCP, L4 *gabs.Container) 
 			for _, optVal := range optVals {
 				optVal = strings.TrimSpace(optVal)
 
+				// see: https://github.com/google/gopacket/blob/master/layers/tcp.go#L37-L57
 				if optVal == "" {
 					continue
 				} else if strings.HasPrefix(optVal, "0x") {
