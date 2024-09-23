@@ -250,6 +250,75 @@ func (t *JSONPcapTranslator) translateUDPLayer(ctx context.Context, udp *layers.
 	return json
 }
 
+func (t *JSONPcapTranslator) addTCPWindowScale(
+	tcp *layers.TCP,
+	optKey, optHexVal *string,
+	optJSON, L4 *gabs.Container,
+) {
+	winScalePowerOf2, winScaleErr := strconv.ParseUint(*optHexVal, 0, 16)
+	if winScaleErr != nil {
+		optJSON.ArrayAppend(*optHexVal, *optKey)
+		return
+	}
+
+	winScaleMultiplier := uint64(2 << (winScalePowerOf2 - 1))
+	realWindowSizeStr := strconv.FormatUint(uint64(tcp.Window)*winScaleMultiplier, 10)
+	winScale := gabs.New()
+	winScale.Set(optHexVal, "hex")
+	winScale.Set(winScalePowerOf2, "dec")
+	winScale.Set(strconv.FormatUint(winScaleMultiplier, 10), "scale")
+	winScale.Set(realWindowSizeStr, "win")
+
+	optJSON.ArrayAppend(winScale, *optKey)
+	L4.Set(realWindowSizeStr, "xwin")
+}
+
+func (t *JSONPcapTranslator) addTCPOptions(tcp *layers.TCP, L4 *gabs.Container) {
+	opts, _ := L4.ArrayOfSize(len(tcp.Options), "opts")
+	for i, tcpOpt := range tcp.Options {
+		// see: https://github.com/google/gopacket/blob/master/layers/tcp.go#L104C9-L128
+		if o := tcpOptionRgx.FindStringSubmatch(tcpOpt.String()); o != nil {
+			tcpOptVal := strings.TrimSpace(o[2])
+
+			if tcpOptVal == "" {
+				opts.SetIndex(o[1], i)
+				continue
+			}
+
+			opt, _ := opts.ObjectI(i)
+			optKey := strings.TrimSpace(o[1])
+			optVals := strings.Split(tcpOptVal, " ")
+			opt.Array(optKey)
+
+			for _, optVal := range optVals {
+				optVal = strings.TrimSpace(optVal)
+
+				if optVal == "" {
+					continue
+				} else if strings.HasPrefix(optVal, "0x") {
+					optHexVal := strings.TrimRight(optVal, "0")
+					switch tcpOpt.OptionType {
+					case 3: // WindowScale
+						t.addTCPWindowScale(tcp, &optKey, &optHexVal, opt, L4)
+					default:
+						opt.ArrayAppend(optHexVal, optKey)
+					}
+				} else {
+					switch tcpOpt.OptionType {
+					case 8: // Timestamps
+						for _, ts := range strings.Split(optVal, "/") {
+							opt.ArrayAppend(strings.TrimSpace(ts), optKey)
+						}
+					default:
+						opt.ArrayAppend(optVal, optKey)
+					}
+				}
+			}
+
+		}
+	}
+}
+
 func (t *JSONPcapTranslator) translateTCPLayer(ctx context.Context, tcp *layers.TCP) fmt.Stringer {
 	json := gabs.New()
 
@@ -321,37 +390,7 @@ func (t *JSONPcapTranslator) translateTCPLayer(ctx context.Context, tcp *layers.
 		flags.Set(strings.Join(flagsStr, "|"), "str")
 	}
 
-	opts, _ := L4.ArrayOfSize(len(tcp.Options), "opts")
-	for i, opt := range tcp.Options {
-		// see: https://github.com/google/gopacket/blob/master/layers/tcp.go#L104C9-L128
-		if o := tcpOptionRgx.FindStringSubmatch(opt.String()); o != nil {
-			if o[2] == "" {
-				opts.SetIndex(o[1], i)
-			} else {
-				opt, _ := opts.ObjectI(i)
-				optKey := strings.TrimSpace(o[1])
-				optVals := strings.Split(o[2], " ")
-				opt.Array(optKey)
-				for _, optVal := range optVals {
-					optVal = strings.TrimSpace(optVal)
-					if optVal == "" {
-						continue
-					} else if strings.HasPrefix(optVal, "0x") {
-						opt.ArrayAppend(strings.TrimRight(optVal, "0"), optKey)
-					} else {
-						if optKey == "Timestamps" {
-							for _, ts := range strings.Split(optVal, "/") {
-								opt.ArrayAppend(ts, optKey)
-							}
-						} else {
-							opt.ArrayAppend(optVal, optKey)
-						}
-					}
-				}
-
-			}
-		}
-	}
+	t.addTCPOptions(tcp, L4)
 
 	L4.Set(tcp.SrcPort, "src")
 	if name, ok := layers.TCPPortNames[tcp.SrcPort]; ok {
