@@ -194,7 +194,8 @@ func NewPcapWriter(ctx context.Context, ifaceAndInfex, template, extension, time
 			return
 		}
 		<-ctx.Done()
-		logger.Println("- DONE")
+		logger.Println("- ROTATE")
+		rotate(writer)
 	}(ctx, writer, !isStdOutOrErr)
 
 	logger.Println("- created")

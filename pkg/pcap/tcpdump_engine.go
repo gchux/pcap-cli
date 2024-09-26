@@ -75,7 +75,7 @@ func (t *Tcpdump) findAndKill(pid int) (uint32, uint32, error) {
 	return killCounter, procsCounter, nil
 }
 
-func (t *Tcpdump) Start(ctx context.Context, _ []PcapWriter) error {
+func (t *Tcpdump) Start(ctx context.Context, _ []PcapWriter, stopDeadline <-chan *time.Duration) error {
 	// atomically activate the packet capture
 	if !t.isActive.CompareAndSwap(false, true) {
 		return fmt.Errorf("already started")
@@ -92,6 +92,7 @@ func (t *Tcpdump) Start(ctx context.Context, _ []PcapWriter) error {
 
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	cmd.WaitDelay = 2 * time.Second
 
 	cmdLine := strings.Join(cmd.Args[:], " ")
 	if err := cmd.Start(); err != nil {
@@ -107,11 +108,20 @@ func (t *Tcpdump) Start(ctx context.Context, _ []PcapWriter) error {
 	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
 		tcpdumpLogger.Printf("[pid:%d] - %+v' - error: %+v\n", pid, cmdLine, err)
 		cmd.Process.Kill()
-	} else {
-		defer time.AfterFunc(time.Second, func() { cmd.Process.Kill() }).Stop()
 	}
 
-	err := cmd.Wait()
+	stopChan := make(chan error, 1)
+	go func(stopChan chan<- error) {
+		stopChan <- cmd.Wait()
+	}(stopChan)
+
+	var err error
+	select {
+	case <-time.After(*<-stopDeadline):
+		err = context.DeadlineExceeded
+	case err = <-stopChan:
+		close(stopChan)
+	}
 
 	// make sure previous execution does not survive
 	killedProcs, numProcs, killErr := t.findAndKill(pid)

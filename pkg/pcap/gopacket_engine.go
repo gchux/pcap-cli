@@ -28,31 +28,31 @@ func (p *Pcap) newPcap(ctx context.Context) (*pcap.InactiveHandle, error) {
 
 	inactiveHandle, err := pcap.NewInactiveHandle(cfg.Iface)
 	if err != nil {
-		gopacketLogger.Fatalf("could not create: %v\n", err)
+		gopacketLogger.Printf("could not create: %v\n", err)
 	}
 
 	if err = inactiveHandle.SetSnapLen(cfg.Snaplen); err != nil {
-		gopacketLogger.Fatalf("could not set snap length: %v\n", err)
+		gopacketLogger.Printf("could not set snap length: %v\n", err)
 		return nil, err
 	}
 
 	if err = inactiveHandle.SetPromisc(cfg.Promisc); err != nil {
-		gopacketLogger.Fatalf("could not set promisc mode: %v\n", err)
+		gopacketLogger.Printf("could not set promisc mode: %v\n", err)
 		return nil, err
 	}
 
 	// [TODO]: make handle timeout dynamic
 	if err = inactiveHandle.SetTimeout(100 * time.Millisecond); err != nil {
-		gopacketLogger.Fatalf("could not set timeout: %v\n", err)
+		gopacketLogger.Printf("could not set timeout: %v\n", err)
 		return nil, err
 	}
 
 	if cfg.TsType != "" {
 		if t, err := pcap.TimestampSourceFromString(cfg.TsType); err != nil {
-			gopacketLogger.Fatalf("Supported timestamp types: %v\n", inactiveHandle.SupportedTimestamps())
+			gopacketLogger.Printf("Supported timestamp types: %v\n", inactiveHandle.SupportedTimestamps())
 			return nil, err
 		} else if err := inactiveHandle.SetTimestampSource(t); err != nil {
-			gopacketLogger.Fatalf("Supported timestamp types: %v\n", inactiveHandle.SupportedTimestamps())
+			gopacketLogger.Printf("Supported timestamp types: %v\n", inactiveHandle.SupportedTimestamps())
 			return nil, err
 		}
 	}
@@ -62,7 +62,7 @@ func (p *Pcap) newPcap(ctx context.Context) (*pcap.InactiveHandle, error) {
 	return inactiveHandle, nil
 }
 
-func (p *Pcap) Start(ctx context.Context, writers []PcapWriter) error {
+func (p *Pcap) Start(ctx context.Context, writers []PcapWriter, stopDeadline <-chan *time.Duration) error {
 	// atomically activate the packet capture
 	if !p.isActive.CompareAndSwap(false, true) {
 		return fmt.Errorf("already started")
@@ -127,26 +127,32 @@ func (p *Pcap) Start(ctx context.Context, writers []PcapWriter) error {
 	loggerPrefix := fmt.Sprintf("[%d/%s]", device.NetInterface.Index, device.Name)
 
 	var packetsCounter atomic.Uint64
+	var ctxDoneTS time.Time
 	for p.isActive.Load() {
 		select {
 		case <-ctx.Done():
-			gopacketLogger.Printf("%s - stopping packet capture\n", loggerPrefix)
-			inactiveHandle.CleanUp()
-			handle.Close()
-			gopacketLogger.Printf("%s - raw sockets closed\n", loggerPrefix)
-			p.fn.WaitDone(ctx, 2*time.Second)
-			gopacketLogger.Printf("%s – total packets: %d\n", loggerPrefix, packetsCounter.Load())
-			p.isActive.Store(false)
-			return ctx.Err()
+			if p.isActive.CompareAndSwap(true, false) {
+				ctxDoneTS = time.Now()
+				gopacketLogger.Printf("%s - stopping packet capture\n", loggerPrefix)
+				inactiveHandle.CleanUp()
+				handle.Close()
+				gopacketLogger.Printf("%s - raw sockets closed\n", loggerPrefix)
+			}
 
 		case packet := <-source.Packets():
 			serial := packetsCounter.Add(1)
 			// non-blocking operation
-			if err := p.fn.Apply(ctx, &packet, &serial); err != nil {
-				gopacketLogger.Fatalf("%s - #:%d | failed to translate: %v\n", loggerPrefix, serial, err)
+			if err := p.fn.Apply(ctx, &packet, &serial); err != nil && p.isActive.Load() {
+				gopacketLogger.Printf("%s - #:%d | failed to translate: %v\n", loggerPrefix, serial, err)
 			}
 		}
 	}
+
+	engineStopDeadline := <-stopDeadline
+	deadline := *engineStopDeadline - time.Since(ctxDoneTS)
+	p.fn.WaitDone(ctx, &deadline)
+
+	gopacketLogger.Printf("%s – total packets: %d\n", loggerPrefix, packetsCounter.Load())
 
 	return ctx.Err()
 }

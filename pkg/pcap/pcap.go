@@ -5,6 +5,7 @@ import (
 	"net"
 	"regexp"
 	"sync/atomic"
+	"time"
 
 	"github.com/gchux/pcap-cli/pkg/transformer"
 	"github.com/google/gopacket/pcap"
@@ -28,7 +29,7 @@ type (
 	}
 
 	PcapEngine interface {
-		Start(context.Context, []PcapWriter) error
+		Start(context.Context, []PcapWriter, <-chan *time.Duration) error
 		IsActive() bool
 	}
 

@@ -287,7 +287,7 @@ func (fm *flowMutex) untrackConnection(
 ) {
 	defer func() {
 		if r := recover(); r != nil && fm.Debug {
-			transformerLogger.Fatalln("PANIC@untrackConnection: ", r)
+			transformerLogger.Println("PANIC@untrackConnection: ", r)
 		}
 	}()
 

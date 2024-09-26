@@ -58,7 +58,7 @@ type (
 	}
 
 	IPcapTransformer interface {
-		WaitDone(context.Context, time.Duration)
+		WaitDone(context.Context, *time.Duration)
 		Apply(context.Context, *gopacket.Packet, *uint64) error
 	}
 
@@ -303,9 +303,9 @@ func (t *PcapTransformer) waitForContextDone(ctx context.Context) error {
 }
 
 // returns when all packets have been transformed and written
-func (t *PcapTransformer) WaitDone(ctx context.Context, timeout time.Duration) {
+func (t *PcapTransformer) WaitDone(ctx context.Context, timeout *time.Duration) {
 	ts := time.Now()
-	timer := time.NewTimer(timeout)
+	timer := time.NewTimer(*timeout)
 
 	writeDoneChan := make(chan struct{})
 
@@ -323,10 +323,10 @@ func (t *PcapTransformer) WaitDone(ctx context.Context, timeout time.Duration) {
 	select {
 	case <-timer.C:
 		if !t.preserveOrder && !t.connTracking {
-			transformerLogger.Fatalf("%s timed out waiting for graceful termination | tp: %d/%d | wp: %d/%d\n",
+			transformerLogger.Printf("%s timed out waiting for graceful termination | tp: %d/%d | wp: %d/%d\n",
 				*t.loggerPrefix, t.translatorPool.Running(), t.translatorPool.Waiting(), t.writerPool.Running(), t.writerPool.Waiting())
 		} else {
-			transformerLogger.Fatalf("%s timed out waiting for graceful termination\n", *t.loggerPrefix)
+			transformerLogger.Printf("%s timed out waiting for graceful termination\n", *t.loggerPrefix)
 		}
 		for i, writeQueue := range t.writeQueues {
 			close(writeQueue) // close writer channels
@@ -346,7 +346,7 @@ func (t *PcapTransformer) WaitDone(ctx context.Context, timeout time.Duration) {
 		<-t.writeQueuesDone[i]
 	}
 
-	_timeout := timeout - time.Since(ts)
+	_timeout := *timeout - time.Since(ts)
 	// if order is not enforced: there are 2 worker pools to be stopped
 	if _timeout > 0 && !t.preserveOrder && !t.connTracking {
 		transformerLogger.Printf("%s releasing worker pools | deadline: %v\n", *t.loggerPrefix, _timeout)
@@ -434,7 +434,7 @@ func provideWorkerPools(ctx context.Context, transformer *PcapTransformer, numWr
 	}
 
 	poolOpts.PanicHandler = func(i interface{}) {
-		transformerLogger.Fatalf("%s panic: %v\n", *transformer.loggerPrefix, i)
+		transformerLogger.Printf("%s panic: %v\n", *transformer.loggerPrefix, i)
 		for range *transformer.numWriters {
 			transformer.wg.Done()
 		}
