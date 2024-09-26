@@ -53,20 +53,20 @@ func (t *Tcpdump) kill(pid int) error {
 	return proc.Signal(syscall.SIGTERM)
 }
 
-func (t *Tcpdump) findAndKill(pid int) (int, int, error) {
+func (t *Tcpdump) findAndKill(pid int) (uint32, uint32, error) {
 	processes, err := ps.Processes()
 	if err != nil {
 		return 0, 0, err
 	}
 
-	killCounter := 0
-	procsCounter := 0
+	killCounter := uint32(0)
+	procsCounter := uint32(0)
 	for _, p := range processes {
-		procId := p.Pid()
+		procID := p.Pid()
 		execName := p.Executable()
-		if execName == "tcpdump" && procId == pid {
-			tcpdumpLogger.Printf("killing %s(%d)\n", execName, procId)
-			if err := t.kill(procId); err == nil {
+		if execName == "tcpdump" && procID == pid {
+			tcpdumpLogger.Printf("killing %s(%d)\n", execName, procID)
+			if err := t.kill(procID); err == nil {
 				killCounter++
 			}
 			procsCounter++
@@ -104,13 +104,11 @@ func (t *Tcpdump) Start(ctx context.Context, _ []PcapWriter) error {
 
 	<-ctx.Done()
 
-	if err := cmd.Process.Signal(os.Interrupt); err != nil {
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
 		tcpdumpLogger.Printf("[pid:%d] - %+v' - error: %+v\n", pid, cmdLine, err)
-		_ = cmd.Process.Kill()
+		cmd.Process.Kill()
 	} else {
-		defer time.AfterFunc(3*time.Second, func() {
-			_ = cmd.Process.Kill()
-		}).Stop()
+		defer time.AfterFunc(time.Second, func() { cmd.Process.Kill() }).Stop()
 	}
 
 	err := cmd.Wait()

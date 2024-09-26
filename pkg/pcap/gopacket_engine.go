@@ -98,20 +98,16 @@ func (p *Pcap) Start(ctx context.Context, writers []PcapWriter) error {
 	source.NoCopy = true
 	source.DecodeStreamsAsDatagrams = true
 
-	// intentionally not using `io.MultiWriter`
-	pcapWriters := []PcapWriter{}
 	// `io.Writer` is what `fmt.Fprintf` requires
 	ioWriters := make([]io.Writer, len(writers))
 	for i, writer := range writers {
 		ioWriters[i] = writer
-		pcapWriters = append(pcapWriters, writer)
 	}
 
 	device := cfg.Device
 	iface := &transformer.PcapIface{
 		Index: device.NetInterface.Index,
 		Name:  device.Name,
-		Addrs: device.Addresses,
 	}
 
 	format := cfg.Format
@@ -128,9 +124,10 @@ func (p *Pcap) Start(ctx context.Context, writers []PcapWriter) error {
 		return fmt.Errorf("invalid format: %s", err)
 	}
 
-	loggerPrefix := fmt.Sprintf("[%d/%s] ", device.NetInterface.Index, device.Name)
+	loggerPrefix := fmt.Sprintf("[%d/%s]", device.NetInterface.Index, device.Name)
+
 	var packetsCounter atomic.Uint64
-	for {
+	for p.isActive.Load() {
 		select {
 		case <-ctx.Done():
 			gopacketLogger.Printf("%s - stopping packet capture\n", loggerPrefix)
@@ -138,14 +135,7 @@ func (p *Pcap) Start(ctx context.Context, writers []PcapWriter) error {
 			handle.Close()
 			gopacketLogger.Printf("%s - raw sockets closed\n", loggerPrefix)
 			p.fn.WaitDone(ctx, 2*time.Second)
-			// do not close engine's writers until `stop` is called
-			// if the context is done, simply rotate the current PCAP file
-			// PCAP file rotation includes: flush and sync
-			for _, writer := range pcapWriters {
-				writer.rotate()
-			}
 			gopacketLogger.Printf("%s – total packets: %d\n", loggerPrefix, packetsCounter.Load())
-			p.fn = nil
 			p.isActive.Store(false)
 			return ctx.Err()
 
@@ -153,10 +143,12 @@ func (p *Pcap) Start(ctx context.Context, writers []PcapWriter) error {
 			serial := packetsCounter.Add(1)
 			// non-blocking operation
 			if err := p.fn.Apply(ctx, &packet, &serial); err != nil {
-				gopacketLogger.Fatalf("%s | #:%d | failed to translate: %v\n", loggerPrefix, serial, err)
+				gopacketLogger.Fatalf("%s - #:%d | failed to translate: %v\n", loggerPrefix, serial, err)
 			}
 		}
 	}
+
+	return ctx.Err()
 }
 
 func NewPcap(config *PcapConfig) (PcapEngine, error) {

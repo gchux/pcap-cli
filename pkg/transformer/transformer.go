@@ -212,8 +212,17 @@ var (
 
 func (t *PcapTransformer) writeTranslation(ctx context.Context, task *pcapWriteTask) error {
 	defer t.wg.Done()
-	_, err := t.translator.write(ctx, t.writers[*task.writer], task.translation)
-	return err
+	select {
+	case <-ctx.Done():
+		if *task.writer == 0 {
+			// best-effort: dump all non-written translations into `STDERR`
+			fmt.Fprintln(os.Stderr, (*task.translation).String())
+		}
+		return ctx.Err()
+	default:
+		_, err := t.translator.write(ctx, t.writers[*task.writer], task.translation)
+		return err
+	}
 }
 
 func (t *PcapTransformer) publishTranslation(_ context.Context, translation *fmt.Stringer) error {
@@ -266,7 +275,7 @@ func (t *PcapTransformer) consumeTranslations(ctx context.Context, index *uint8)
 				droppedTranslations += 1
 				t.wg.Done()
 			}
-			transformerLogger.Printf("%s - writer:%d | dropped translations: %d\n", *t.loggerPrefix, *index+1, droppedTranslations)
+			transformerLogger.Printf("%s writer:%d | dropped translations: %d\n", *t.loggerPrefix, *index+1, droppedTranslations)
 			close(t.writeQueuesDone[*index])
 			return ctx.Err()
 
@@ -321,7 +330,7 @@ func (t *PcapTransformer) WaitDone(ctx context.Context, timeout time.Duration) {
 		}
 		for i, writeQueue := range t.writeQueues {
 			close(writeQueue) // close writer channels
-			<-t.writeQueuesDone[i]
+			close(t.writeQueuesDone[i])
 		}
 		t.translator.done(ctx)
 		return
@@ -425,6 +434,7 @@ func provideWorkerPools(ctx context.Context, transformer *PcapTransformer, numWr
 	}
 
 	poolOpts.PanicHandler = func(i interface{}) {
+		transformerLogger.Fatalf("%s panic: %v\n", *transformer.loggerPrefix, i)
 		for range *transformer.numWriters {
 			transformer.wg.Done()
 		}

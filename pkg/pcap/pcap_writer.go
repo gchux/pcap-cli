@@ -23,7 +23,7 @@ type (
 	PcapWriter interface {
 		io.Writer
 		io.Closer
-		rotate()
+		Rotate()
 		IsStdOutOrErr() bool
 		GetIface() *string
 	}
@@ -69,11 +69,10 @@ func getSetableField(v reflect.Value, field string) reflect.Value {
 	return makeSetable(getField(v, field))
 }
 
-func (w *pcapWriter) rotate() {
+func (w *pcapWriter) Rotate() {
 	// if `PcapWriter` encapsulates `std[out|err]` do not rotate,
 	// just call `Flush` on the underlying `bufio.Writer` for `os.Std{out|err}`
 	if w.isStdOutOrErr {
-		w.bufioWriterFlush.Call(nil)
 		return
 	}
 
@@ -188,16 +187,17 @@ func NewPcapWriter(ctx context.Context, ifaceAndInfex, template, extension, time
 		bufioWriter.Set(reflect.ValueOf(bufio.NewWriterSize(os.Stdout, 1)))
 	}
 
+	w := &pcapWriter{writer, ifaceAndInfex, isStdOutOrErr, v, osFile, osFileSync, bufioWriter, bufioWriterFlush}
+
 	go func(ctx context.Context, writer *logrotate.Writer, block bool) {
 		if !block {
 			return
 		}
 		<-ctx.Done()
-		logger.Println("- closing")
-		writer.Close()
+		logger.Println("- DONE")
 	}(ctx, writer, !isStdOutOrErr)
 
 	logger.Println("- created")
 
-	return &pcapWriter{writer, ifaceAndInfex, isStdOutOrErr, v, osFile, osFileSync, bufioWriter, bufioWriterFlush}, nil
+	return w, nil
 }
