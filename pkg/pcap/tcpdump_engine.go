@@ -92,7 +92,7 @@ func (t *Tcpdump) Start(ctx context.Context, _ []PcapWriter, stopDeadline <-chan
 
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.WaitDelay = 2 * time.Second
+	cmd.WaitDelay = 1900 * time.Millisecond
 
 	cmdLine := strings.Join(cmd.Args[:], " ")
 	if err := cmd.Start(); err != nil {
@@ -104,23 +104,31 @@ func (t *Tcpdump) Start(ctx context.Context, _ []PcapWriter, stopDeadline <-chan
 	tcpdumpLogger.Printf("EXEC(%d): %v\n", pid, cmdLine)
 
 	<-ctx.Done()
+	ctxDoneTS := time.Now()
 
 	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
 		tcpdumpLogger.Printf("[pid:%d] - %+v' - error: %+v\n", pid, cmdLine, err)
 		cmd.Process.Kill()
 	}
 
-	stopChan := make(chan error, 1)
-	go func(stopChan chan<- error) {
-		stopChan <- cmd.Wait()
-	}(stopChan)
+	cmdStopChan := make(chan error, 1)
+	go func(cmd *exec.Cmd, cmdStopChan chan<- error) {
+		cmdStopChan <- cmd.Wait()
+	}(cmd, cmdStopChan)
+
+	engineStopDeadline := <-stopDeadline
+	engineStopTimeout := *engineStopDeadline - time.Since(ctxDoneTS)
+	timer := time.NewTimer(engineStopTimeout)
 
 	var err error
 	select {
-	case <-time.After(*<-stopDeadline):
+	case <-timer.C:
 		err = context.DeadlineExceeded
-	case err = <-stopChan:
-		close(stopChan)
+	case err = <-cmdStopChan:
+		if !timer.Stop() {
+			<-timer.C
+		}
+		close(cmdStopChan)
 	}
 
 	// make sure previous execution does not survive

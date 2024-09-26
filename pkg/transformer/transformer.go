@@ -336,7 +336,9 @@ func (t *PcapTransformer) WaitDone(ctx context.Context, timeout *time.Duration) 
 		return
 
 	case <-writeDoneChan:
-		timer.Stop()
+		if !timer.Stop() {
+			<-timer.C
+		}
 		transformerLogger.Printf("%s STOPPED – %v\n", *t.loggerPrefix, time.Since(ts))
 	}
 
