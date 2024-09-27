@@ -39,7 +39,8 @@ func (t *Tcpdump) buildArgs(ctx context.Context) []string {
 	}
 
 	if cfg.Filter != "" {
-		args = append(args, cfg.Filter)
+		filter := providePcapFilter(ctx, &cfg.Filter, cfg.Filters)
+		args = append(args, *filter)
 	}
 
 	return args

@@ -9,9 +9,22 @@ import (
 
 	"github.com/gchux/pcap-cli/pkg/transformer"
 	"github.com/google/gopacket/pcap"
+	"github.com/wissance/stringFormatter"
 )
 
 type (
+	PcapFilterMode uint8
+
+	PcapFilter struct {
+		Raw *string
+	}
+
+	PcapFilterProvider interface {
+		Get(context.Context) *string
+		String() *string
+		Apply(context.Context, *string, PcapFilterMode) *string
+	}
+
 	PcapConfig struct {
 		Debug     bool
 		Promisc   bool
@@ -26,6 +39,7 @@ type (
 		Ordered   bool
 		ConnTrack bool
 		Device    *PcapDevice
+		Filters   []PcapFilterProvider
 	}
 
 	PcapEngine interface {
@@ -54,9 +68,22 @@ type (
 )
 
 const (
+	PCAP_FILTER_MODE_AND PcapFilterMode = iota
+	PCAP_FILTER_MODE_OR
+)
+
+const (
 	PcapContextID      = transformer.ContextID
 	PcapContextLogName = transformer.ContextLogName
 )
+
+func providePcapFilter(ctx context.Context, filter *string, providers []PcapFilterProvider) *string {
+	pcapFilter := stringFormatter.Format("({0})", *filter)
+	for _, provider := range providers {
+		pcapFilter = *provider.Apply(ctx, &pcapFilter, PCAP_FILTER_MODE_AND)
+	}
+	return &pcapFilter
+}
 
 func findAllDevs(compare func(*string) bool) ([]*PcapDevice, error) {
 	devices, err := pcap.FindAllDevs()

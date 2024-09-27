@@ -86,9 +86,9 @@ func (p *Pcap) Start(ctx context.Context, writers []PcapWriter, stopDeadline <-c
 	debug := cfg.Debug
 
 	// set packet capture filter; i/e: `tcp port 443`
-	filter := cfg.Filter
-	if filter != "" {
-		if err = handle.SetBPFFilter(filter); err != nil {
+	filter := providePcapFilter(ctx, &cfg.Filter, cfg.Filters)
+	if *filter != "" {
+		if err = handle.SetBPFFilter(*filter); err != nil {
 			return fmt.Errorf("BPF filter error: %s", err)
 		}
 	}
