@@ -120,11 +120,14 @@ func (p *Pcap) Start(ctx context.Context, writers []PcapWriter, stopDeadline <-c
 	} else {
 		p.fn, err = transformer.NewTransformer(ctx, iface, ioWriters, &format, debug)
 	}
+
 	if err != nil {
 		return fmt.Errorf("invalid format: %s", err)
 	}
 
 	loggerPrefix := fmt.Sprintf("[%d/%s]", device.NetInterface.Index, device.Name)
+
+	gopacketLogger.Printf("%s - starting packet capture | filter: %s\n", loggerPrefix, *filter)
 
 	var packetsCounter atomic.Uint64
 	var ctxDoneTS time.Time

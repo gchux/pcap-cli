@@ -20,8 +20,8 @@ type (
 	}
 
 	PcapFilterProvider interface {
-		Get(context.Context) *string
-		String() *string
+		Get(context.Context) (*string, bool)
+		String() string
 		Apply(context.Context, *string, PcapFilterMode) *string
 	}
 
@@ -77,7 +77,16 @@ const (
 	PcapContextLogName = transformer.ContextLogName
 )
 
-func providePcapFilter(ctx context.Context, filter *string, providers []PcapFilterProvider) *string {
+func providePcapFilter(
+	ctx context.Context,
+	filter *string,
+	providers []PcapFilterProvider,
+) *string {
+	select {
+	case <-ctx.Done():
+		return filter
+	default:
+	}
 	pcapFilter := stringFormatter.Format("({0})", *filter)
 	for _, provider := range providers {
 		pcapFilter = *provider.Apply(ctx, &pcapFilter, PCAP_FILTER_MODE_AND)
