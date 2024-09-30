@@ -2,6 +2,7 @@ package pcap
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"regexp"
 	"sync/atomic"
@@ -20,8 +21,8 @@ type (
 	}
 
 	PcapFilterProvider interface {
+		fmt.Stringer
 		Get(context.Context) (*string, bool)
-		String() string
 		Apply(context.Context, *string, PcapFilterMode) *string
 	}
 
