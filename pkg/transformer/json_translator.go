@@ -649,7 +649,7 @@ func (t *JSONPcapTranslator) finalize(
 	}
 
 	appLayer := (*p).ApplicationLayer()
-	if (setFlags == tcpAck || setFlags == tcpPsh || setFlags == tcpPshAck) && appLayer != nil {
+	if ((tcpSyn|tcpFin|tcpRst)&setFlags == 0) && appLayer != nil {
 		return t.addAppLayerData(ctx, p, lock, &flowID, &setFlags, &seq, &appLayer, json, &message, traceAndSpanProvider)
 	}
 

@@ -85,10 +85,19 @@ func (p *Pcap) Start(ctx context.Context, writers []PcapWriter, stopDeadline <-c
 	cfg := *p.config
 	debug := cfg.Debug
 
+	device := cfg.Device
+	iface := &transformer.PcapIface{
+		Index: device.NetInterface.Index,
+		Name:  device.Name,
+	}
+
+	loggerPrefix := fmt.Sprintf("[%d/%s]", device.NetInterface.Index, device.Name)
+
 	// set packet capture filter; i/e: `tcp port 443`
 	filter := providePcapFilter(ctx, &cfg.Filter, cfg.Filters)
 	if *filter != "" {
 		if err = handle.SetBPFFilter(*filter); err != nil {
+			gopacketLogger.Printf("%s - BPF filter error: [%s] => %+v\n", loggerPrefix, *filter, err)
 			return fmt.Errorf("BPF filter error: %s", err)
 		}
 	}
@@ -102,12 +111,6 @@ func (p *Pcap) Start(ctx context.Context, writers []PcapWriter, stopDeadline <-c
 	ioWriters := make([]io.Writer, len(writers))
 	for i, writer := range writers {
 		ioWriters[i] = writer
-	}
-
-	device := cfg.Device
-	iface := &transformer.PcapIface{
-		Index: device.NetInterface.Index,
-		Name:  device.Name,
 	}
 
 	format := cfg.Format
@@ -124,8 +127,6 @@ func (p *Pcap) Start(ctx context.Context, writers []PcapWriter, stopDeadline <-c
 	if err != nil {
 		return fmt.Errorf("invalid format: %s", err)
 	}
-
-	loggerPrefix := fmt.Sprintf("[%d/%s]", device.NetInterface.Index, device.Name)
 
 	gopacketLogger.Printf("%s - starting packet capture | filter: %s\n", loggerPrefix, *filter)
 

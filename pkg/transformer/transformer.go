@@ -328,9 +328,8 @@ func (t *PcapTransformer) WaitDone(ctx context.Context, timeout *time.Duration) 
 		} else {
 			transformerLogger.Printf("%s timed out waiting for graceful termination\n", *t.loggerPrefix)
 		}
-		for i, writeQueue := range t.writeQueues {
+		for _, writeQueue := range t.writeQueues {
 			close(writeQueue) // close writer channels
-			close(t.writeQueuesDone[i])
 		}
 		t.translator.done(ctx)
 		return
@@ -436,7 +435,7 @@ func provideWorkerPools(ctx context.Context, transformer *PcapTransformer, numWr
 	}
 
 	poolOpts.PanicHandler = func(i interface{}) {
-		transformerLogger.Printf("%s panic: %v\n", *transformer.loggerPrefix, i)
+		transformerLogger.Printf("%s panic: %+v\n", *transformer.loggerPrefix, i)
 		for range *transformer.numWriters {
 			transformer.wg.Done()
 		}
