@@ -102,7 +102,10 @@ func providePcapFilter(
 		return filter
 	default:
 	}
-	pcapFilter := stringFormatter.Format("({0})", *filter)
+	pcapFilter := ""
+	if *filter != "" {
+		pcapFilter = stringFormatter.Format("({0})", *filter)
+	}
 	for _, provider := range providers {
 		pcapFilter = *provider.Apply(ctx, &pcapFilter, PCAP_FILTER_MODE_AND)
 	}
