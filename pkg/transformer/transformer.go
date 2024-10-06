@@ -22,6 +22,7 @@ import (
 	"log"
 	"os"
 	"regexp"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -221,7 +222,7 @@ var (
 
 var (
 	errUnavailableTranslation = errors.New("packet translation is unavailable")
-	errUnavailableTranslator  = errors.New("translator is unavailable")
+	errUnavailableTranslator  = errors.New("packet translator is unavailable")
 )
 
 func (t *PcapTransformer) writeTranslation(ctx context.Context, task *pcapWriteTask) error {
@@ -239,13 +240,18 @@ func (t *PcapTransformer) writeTranslation(ctx context.Context, task *pcapWriteT
 	}
 }
 
-func (t *PcapTransformer) publishTranslation(_ context.Context, translation *fmt.Stringer) error {
-	if translation == nil {
-		// if `translation` is not available, rollback write commitment
-		for range *t.numWriters {
-			t.wg.Done()
+func (t *PcapTransformer) publishTranslation(
+	ctx context.Context,
+	translation *fmt.Stringer,
+) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		if translation == nil {
+			return fmt.Errorf("%s publishTranslation: %w",
+				*t.loggerPrefix, errUnavailableTranslation)
 		}
-		return errors.Join(errUnavailableTranslation, errors.New(*t.loggerPrefix+"nil translation"))
 	}
 
 	// fan-out translation into all writers
@@ -258,15 +264,25 @@ func (t *PcapTransformer) publishTranslation(_ context.Context, translation *fmt
 	return nil
 }
 
-func (t *PcapTransformer) produceTranslation(ctx context.Context, task *pcapTranslatorWorker) error {
-	return t.publishTranslation(ctx, task.Run(ctx).(*fmt.Stringer))
+func (t *PcapTransformer) produceTranslation(
+	ctx context.Context,
+	task *pcapTranslatorWorker,
+) error {
+	translation := task.Run(ctx)
+	if translation == nil {
+		return fmt.Errorf("%s - #:%d | produceTranslation: %w",
+			t.loggerPrefix, task.serial, errUnavailableTranslation)
+	}
+	return t.publishTranslation(ctx, translation.(*fmt.Stringer))
 }
 
 func (t *PcapTransformer) produceTranslations(ctx context.Context) {
 	for translation := range t.och {
 		// translations are made available in the enqueued order
 		// consume translations and push them into translations consumers
-		t.publishTranslation(ctx, translation.Value.(*fmt.Stringer))
+		if err := t.publishTranslation(ctx, translation.Value.(*fmt.Stringer)); err != nil {
+			rollbackTranslation(ctx, t)
+		}
 	}
 }
 
@@ -277,7 +293,7 @@ func (t *PcapTransformer) consumeTranslations(ctx context.Context, index *uint8)
 		select {
 		case <-ctx.Done():
 			// drop translations if context is already done
-			droppedTranslations := uint32(0)
+			droppedTranslations := uint64(0)
 			// some translations may have been on-going when context was cancelled:
 			//   - fully consume the `writerQueue` and rollback the write commitment,
 			//   - block until `close` on the `writerQueue` is called by `WaitDone`
@@ -289,7 +305,7 @@ func (t *PcapTransformer) consumeTranslations(ctx context.Context, index *uint8)
 				droppedTranslations += 1
 				t.wg.Done()
 			}
-			transformerLogger.Printf("%s writer:%d | dropped translations: %d\n", *t.loggerPrefix, *index+1, droppedTranslations)
+			transformerLogger.Printf("%s writer:%d | dropped: %d\n", *t.loggerPrefix, *index+1, droppedTranslations)
 			close(t.writeQueuesDone[*index])
 			return ctx.Err()
 
@@ -365,17 +381,17 @@ func (t *PcapTransformer) WaitDone(ctx context.Context, timeout *time.Duration) 
 	// if order is not enforced: there are 2 worker pools to be stopped
 	if _timeout > 0 && !t.preserveOrder && !t.connTracking {
 		transformerLogger.Printf("%s releasing worker pools | deadline: %v\n", *t.loggerPrefix, _timeout)
-		var wg sync.WaitGroup
-		wg.Add(2)
-		go func() {
-			t.translatorPool.ReleaseTimeout(_timeout)
+		var poolReleaserWG sync.WaitGroup
+		poolReleaserWG.Add(2)
+		go func(t *PcapTransformer, wg *sync.WaitGroup, deadline *time.Duration) {
+			t.translatorPool.ReleaseTimeout(*deadline)
 			wg.Done()
-		}()
-		go func() {
-			t.writerPool.ReleaseTimeout(_timeout)
+		}(t, &poolReleaserWG, &_timeout)
+		go func(t *PcapTransformer, wg *sync.WaitGroup, deadline *time.Duration) {
+			t.writerPool.ReleaseTimeout(*deadline)
 			wg.Done()
-		}()
-		wg.Wait()
+		}(t, &poolReleaserWG, &_timeout)
+		poolReleaserWG.Wait()
 		transformerLogger.Printf("%s released worker pools\n", *t.loggerPrefix)
 	}
 
@@ -396,17 +412,13 @@ func (t *PcapTransformer) Apply(ctx context.Context, packet *gopacket.Packet, se
 	}
 	// It is assumed that packets will be produced faster than translations and writing operations, so:
 	//   - process/translate packets concurrently in order to avoid blocking `gopacket` packets channel as much as possible.
-	worker := newPcapTranslatorWorker(serial, packet, t.translator, t.connTracking)
+	worker := newPcapTranslatorWorker(t.iface, serial, packet, t.translator, t.connTracking)
 	return t.apply(worker)
 }
 
 func (t *PcapTransformer) translatePacketFn(ctx context.Context, worker interface{}) error {
 	select {
 	case <-ctx.Done():
-		// rollback write packet translation commitment
-		for range *t.numWriters {
-			t.wg.Done()
-		}
 		return ctx.Err()
 	default:
 		return t.produceTranslation(ctx, worker.(*pcapTranslatorWorker))
@@ -435,7 +447,17 @@ func newTranslator(
 	}
 
 	return nil, errors.Join(errUnavailableTranslator,
-		fmt.Errorf("[%d/%s] - format: %v", iface.Index, iface.Name, format))
+		fmt.Errorf("[%d/%s] - invalid format: %v",
+			iface.Index, iface.Name, format))
+}
+
+func rollbackTranslation(
+	ctx context.Context,
+	transformer *PcapTransformer,
+) {
+	for range *transformer.numWriters {
+		transformer.wg.Done()
+	}
 }
 
 // if preserving packet capture order is not required, translations may be done concurrently
@@ -449,10 +471,10 @@ func provideWorkerPools(ctx context.Context, transformer *PcapTransformer, numWr
 	}
 
 	poolOpts.PanicHandler = func(i interface{}) {
-		transformerLogger.Printf("%s panic: %+v\n", *transformer.loggerPrefix, i)
-		for range *transformer.numWriters {
-			transformer.wg.Done()
-		}
+		rollbackTranslation(ctx, transformer)
+		// if any go routine panics, recover and print the stack
+		transformerLogger.Printf("%s panic: %+v\n%s\n",
+			*transformer.loggerPrefix, i, string(debug.Stack()))
 	}
 
 	poolOptions := ants.WithOptions(poolOpts)
@@ -460,7 +482,15 @@ func provideWorkerPools(ctx context.Context, transformer *PcapTransformer, numWr
 	poolSize := 25 * int(*numWriters)
 
 	translatorPoolFn := func(i interface{}) {
-		transformer.translatePacketFn(ctx, i)
+		select {
+		case <-ctx.Done():
+			rollbackTranslation(ctx, transformer)
+			return
+		default:
+			if err := transformer.translatePacketFn(ctx, i); err != nil {
+				rollbackTranslation(ctx, transformer)
+			}
+		}
 	}
 	translatorPool, _ := ants.NewPoolWithFunc(poolSize, translatorPoolFn, poolOptions)
 	transformer.translatorPool = translatorPool
@@ -468,7 +498,6 @@ func provideWorkerPools(ctx context.Context, transformer *PcapTransformer, numWr
 	writerPoolFn := func(i interface{}) {
 		transformer.writeTranslationFn(ctx, i)
 	}
-
 	// I/O ( writing ) is slow; so there will be more writers than translator routines
 	writerPool, _ := ants.NewMultiPoolWithFunc(int(*numWriters), 25, writerPoolFn, ants.LeastTasks, poolOptions)
 	transformer.writerPool = writerPool
@@ -498,8 +527,12 @@ func provideConcurrentQueue(ctx context.Context, connTrack bool, transformer *Pc
 	transformer.och = concurrently.Process(ctx, transformer.ich, ochOpts)
 }
 
-func provideStrategy(ctx context.Context, transformer *PcapTransformer, preserveOrder, connTracking bool) {
-	var strategy func(*pcapTranslatorWorker) error
+func provideStrategy(
+	ctx context.Context,
+	transformer *PcapTransformer,
+	preserveOrder, connTracking bool,
+) {
+	var apply func(*PcapTransformer, *pcapTranslatorWorker) error = nil
 
 	if preserveOrder || connTracking {
 		// If ordered output is enabled, enqueue translation workers in packet capture order;
@@ -507,17 +540,13 @@ func provideStrategy(ctx context.Context, transformer *PcapTransformer, preserve
 		// if the next packet to arrive finds a full Q, this method will block until slots are available.
 		// The degree of contention is proportial to the Q capacity times translation latency.
 		// Order should only be used for not network intersive workloads.
-		strategy = func(worker *pcapTranslatorWorker) error {
+		apply = func(t *PcapTransformer, w *pcapTranslatorWorker) error {
 			select {
 			case <-ctx.Done():
-				// `Apply` commits `transformer` to write the packet translation,
-				// so if the context is done, commitment must be rolled back
-				for range *transformer.numWriters {
-					transformer.wg.Done()
-				}
+				rollbackTranslation(ctx, transformer)
 				return ctx.Err()
 			default:
-				transformer.ich <- worker
+				t.ich <- w
 			}
 			return nil
 		}
@@ -526,12 +555,23 @@ func provideStrategy(ctx context.Context, transformer *PcapTransformer, preserve
 		// Order of gorouting execution is not guaranteed, which means
 		// that packets will be consumed/written in non-deterministic order.
 		// `serial` is aviailable to be used for sorting PCAP files.
-		strategy = func(worker *pcapTranslatorWorker) error {
-			return transformer.translatorPool.Invoke(worker)
+		apply = func(t *PcapTransformer, w *pcapTranslatorWorker) error {
+			return t.translatorPool.Invoke(w)
 		}
 	}
 
-	transformer.apply = strategy
+	transformer.apply = func(w *pcapTranslatorWorker) error {
+		select {
+		case <-ctx.Done():
+			transformerLogger.Printf("%s #:%d | translation aborted", *w.loggerPrefix, *w.serial)
+			// `Apply` commits `transformer` to write the packet translation,
+			// so if the context is done, commitment must be rolled back
+			rollbackTranslation(ctx, transformer)
+			return errors.Join(errUnavailableTranslation, ctx.Err())
+		default:
+			return apply(transformer, w)
+		}
+	}
 }
 
 // transformers get instances of `io.Writer` instead of `pcap.PcapWriter` to prevent closing.

@@ -17,6 +17,7 @@ package transformer
 import (
 	"context"
 	"fmt"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -26,10 +27,12 @@ import (
 
 type (
 	pcapTranslatorWorker struct {
-		serial     *uint64
-		packet     *gopacket.Packet
-		translator PcapTranslator
-		conntrack  bool
+		iface        *PcapIface
+		serial       *uint64
+		packet       *gopacket.Packet
+		translator   PcapTranslator
+		conntrack    bool
+		loggerPrefix *string
 	}
 
 	packetLayerTranslator func(context.Context, *pcapTranslatorWorker) fmt.Stringer
@@ -164,8 +167,31 @@ func (w *pcapTranslatorWorker) translateTLSLayer(ctx context.Context) fmt.String
 
 // The work that needs to be performed
 // The input type should implement the WorkFunction interface
-func (w *pcapTranslatorWorker) Run(ctx context.Context) interface{} {
-	buffer := w.translator.next(ctx, w.serial, w.packet)
+func (w *pcapTranslatorWorker) Run(ctx context.Context) (buffer interface{}) {
+	defer func() {
+		if r := recover(); r != nil {
+			transformerLogger.Printf("%s @translator | %s\n%s\n",
+				*w.loggerPrefix, r, string(debug.Stack()))
+			buffer = nil
+		}
+	}()
+
+	var _buffer fmt.Stringer = nil
+
+	select {
+	case <-ctx.Done():
+		transformerLogger.Printf("%s @translator | aborted", *w.loggerPrefix)
+		buffer = nil
+		return
+	default:
+		_buffer = w.translator.next(ctx, w.serial, w.packet)
+	}
+
+	if _buffer == nil {
+		transformerLogger.Printf("%s @translator | failed", *w.loggerPrefix)
+		buffer = nil
+		return nil
+	}
 
 	translations := make(chan fmt.Stringer, packetLayerTranslatorsSize)
 	var wg sync.WaitGroup
@@ -193,27 +219,39 @@ func (w *pcapTranslatorWorker) Run(ctx context.Context) interface{} {
 	for translation := range translations {
 		// translations are `nil` if layer is not available
 		if translation != nil {
-			buffer, _ = w.translator.merge(ctx, buffer, translation)
+			_buffer, _ = w.translator.merge(ctx, _buffer, translation)
 		}
 	}
 
-	// `finalize` is the only method that works across layers
-	buffer, _ = w.translator.finalize(ctx, w.serial, w.packet, w.conntrack, buffer)
+	select {
+	case <-ctx.Done():
+		// skip `finalize` deliver translation as-is
+		transformerLogger.Printf("%s @translator | incomplete", *w.loggerPrefix)
+	default:
+		// `finalize` is the only method that works across layers
+		_buffer, _ = w.translator.finalize(ctx, w.serial, w.packet, w.conntrack, _buffer)
+	}
 
-	return &buffer
+	buffer = &_buffer
+	return &_buffer
 }
 
 func newPcapTranslatorWorker(
+	iface *PcapIface,
 	serial *uint64,
 	packet *gopacket.Packet,
 	translator PcapTranslator,
 	connTrack bool,
 ) *pcapTranslatorWorker {
+	loggerPrefix := fmt.Sprintf("[%d/%s] - #:%d |", iface.Index, iface.Name, *serial)
+
 	worker := &pcapTranslatorWorker{
-		serial:     serial,
-		packet:     packet,
-		translator: translator,
-		conntrack:  connTrack,
+		iface:        iface,
+		serial:       serial,
+		packet:       packet,
+		translator:   translator,
+		conntrack:    connTrack,
+		loggerPrefix: &loggerPrefix,
 	}
 	return worker
 }
