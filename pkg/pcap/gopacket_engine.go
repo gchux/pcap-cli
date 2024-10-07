@@ -76,7 +76,11 @@ func (p *Pcap) newPcap(ctx context.Context) (*pcap.InactiveHandle, error) {
 	return inactiveHandle, nil
 }
 
-func (p *Pcap) Start(ctx context.Context, writers []PcapWriter, stopDeadline <-chan *time.Duration) error {
+func (p *Pcap) Start(
+	ctx context.Context,
+	writers []PcapWriter,
+	stopDeadline <-chan *time.Duration,
+) error {
 	// atomically activate the packet capture
 	if !p.isActive.CompareAndSwap(false, true) {
 		return fmt.Errorf("already started")

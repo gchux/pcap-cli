@@ -111,21 +111,32 @@ func main() {
 
 	var wg sync.WaitGroup
 
+	stopDeadlineChan := make(chan *time.Duration, 1)
+
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
 	go func() {
 		<-signals
 		cancel()
+		deadline := 3 * time.Second
+		stopDeadlineChan <- &deadline
 	}()
 
 	for _, dev := range devs {
 		wg.Add(1)
-		go startPCAP(ctx, &id, dev, config, &wg)
+		go startPCAP(ctx, &id, dev, config, &wg, stopDeadlineChan)
 	}
 	wg.Wait()
 }
 
-func startPCAP(ctx context.Context, id *string, dev *pcap.PcapDevice, config *pcap.PcapConfig, wg *sync.WaitGroup) {
+func startPCAP(
+	ctx context.Context,
+	id *string,
+	dev *pcap.PcapDevice,
+	config *pcap.PcapConfig,
+	wg *sync.WaitGroup,
+	stopDeadlineChan chan *time.Duration,
+) {
 	iface := dev.NetInterface.Name
 
 	logger.Printf("device: %+v\n", iface)
@@ -171,7 +182,7 @@ func startPCAP(ctx context.Context, id *string, dev *pcap.PcapDevice, config *pc
 	prefix := fmt.Sprintf("[iface:%s] execution '%s'", iface, *id)
 	logger.Printf("%s started", prefix)
 	// this is a blocking call
-	err = pcapEngine.Start(ctx, pcapWriters)
+	err = pcapEngine.Start(ctx, pcapWriters, stopDeadlineChan)
 	if err != nil {
 		handleError(&prefix, err)
 	}

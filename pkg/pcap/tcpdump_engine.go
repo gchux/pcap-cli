@@ -90,7 +90,11 @@ func (t *Tcpdump) findAndKill(pid int) (uint32, uint32, error) {
 	return killCounter, procsCounter, nil
 }
 
-func (t *Tcpdump) Start(ctx context.Context, _ []PcapWriter, stopDeadline <-chan *time.Duration) error {
+func (t *Tcpdump) Start(
+	ctx context.Context,
+	_ []PcapWriter,
+	stopDeadline <-chan *time.Duration,
+) error {
 	// atomically activate the packet capture
 	if !t.isActive.CompareAndSwap(false, true) {
 		return fmt.Errorf("already started")
