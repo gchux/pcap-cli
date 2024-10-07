@@ -180,9 +180,7 @@ func (w *pcapTranslatorWorker) Run(ctx context.Context) (buffer interface{}) {
 
 	select {
 	case <-ctx.Done():
-		transformerLogger.Printf("%s @translator | aborted", *w.loggerPrefix)
-		buffer = nil
-		return
+		_buffer = nil
 	default:
 		_buffer = w.translator.next(ctx, w.serial, w.packet)
 	}
