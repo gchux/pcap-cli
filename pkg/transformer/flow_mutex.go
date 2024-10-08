@@ -423,7 +423,7 @@ func (fm *flowMutex) lock(
 		case <-ctx.Done():
 			isContextDone = true
 		default:
-			wg.Wait()
+			// wg.Wait()
 		}
 
 		tsAfterWaiting := time.Now()
