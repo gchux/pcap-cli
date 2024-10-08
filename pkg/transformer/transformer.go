@@ -24,6 +24,7 @@ import (
 	"regexp"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/gopacket"
@@ -70,6 +71,7 @@ type (
 		preserveOrder   bool
 		connTracking    bool
 		apply           func(*pcapTranslatorWorker) error
+		counter         *atomic.Int64
 	}
 
 	IPcapTransformer interface {
@@ -226,7 +228,11 @@ var (
 )
 
 func (t *PcapTransformer) writeTranslation(ctx context.Context, task *pcapWriteTask) error {
-	defer t.wg.Done()
+	defer func() {
+		t.counter.Add(-1)
+		t.wg.Done()
+	}()
+
 	select {
 	case <-ctx.Done():
 		if *task.writer == 0 {
@@ -271,7 +277,7 @@ func (t *PcapTransformer) produceTranslation(
 	translation := task.Run(ctx)
 	if translation == nil {
 		return fmt.Errorf("%s - #:%d | produceTranslation: %w",
-			t.loggerPrefix, task.serial, errUnavailableTranslation)
+			*t.loggerPrefix, task.serial, errUnavailableTranslation)
 	}
 	return t.publishTranslation(ctx, translation.(*fmt.Stringer))
 }
@@ -303,9 +309,10 @@ func (t *PcapTransformer) consumeTranslations(ctx context.Context, index *uint8)
 					fmt.Fprintln(os.Stderr, (*translation).String())
 				}
 				droppedTranslations += 1
+				t.counter.Add(-1)
 				t.wg.Done()
 			}
-			transformerLogger.Printf("%s writer:%d | dropped: %d\n", *t.loggerPrefix, *index+1, droppedTranslations)
+			transformerLogger.Printf("%s translations consumer DONE | writer:%d | dropped:%d\n", *t.loggerPrefix, *index+1, droppedTranslations)
 			close(t.writeQueuesDone[*index])
 			return ctx.Err()
 
@@ -341,10 +348,11 @@ func (t *PcapTransformer) WaitDone(ctx context.Context, timeout *time.Duration) 
 
 	go func() {
 		if !t.preserveOrder && !t.connTracking {
-			transformerLogger.Printf("%s gracefully terminating | tp: %d/%d | wp: %d/%d | deadline: %v\n",
-				*t.loggerPrefix, t.translatorPool.Running(), t.translatorPool.Waiting(), t.writerPool.Running(), t.writerPool.Waiting(), timeout)
+			transformerLogger.Printf("%s gracefully terminating | tp: %d/%d | wp: %d/%d | pending:%d | deadline: %v\n",
+				*t.loggerPrefix, t.translatorPool.Running(), t.translatorPool.Waiting(),
+				t.writerPool.Running(), t.writerPool.Waiting(), t.counter.Load(), timeout)
 		} else {
-			transformerLogger.Printf("%s gracefully terminating | deadline: %v\n", *t.loggerPrefix, timeout)
+			transformerLogger.Printf("%s gracefully terminating | pending: %d | deadline: %v\n", *t.loggerPrefix, t.counter.Load(), timeout)
 		}
 		t.wg.Wait() // wait for all translations to be written
 		close(writeDoneChan)
@@ -353,10 +361,10 @@ func (t *PcapTransformer) WaitDone(ctx context.Context, timeout *time.Duration) 
 	select {
 	case <-timer.C:
 		if !t.preserveOrder && !t.connTracking {
-			transformerLogger.Printf("%s timed out waiting for graceful termination | tp: %d/%d | wp: %d/%d\n",
-				*t.loggerPrefix, t.translatorPool.Running(), t.translatorPool.Waiting(), t.writerPool.Running(), t.writerPool.Waiting())
+			transformerLogger.Printf("%s timed out waiting for graceful termination | tp: %d/%d | wp: %d/%d | pending:%d\n",
+				*t.loggerPrefix, t.translatorPool.Running(), t.translatorPool.Waiting(), t.writerPool.Running(), t.writerPool.Waiting(), t.counter.Load())
 		} else {
-			transformerLogger.Printf("%s timed out waiting for graceful termination\n", *t.loggerPrefix)
+			transformerLogger.Printf("%s timed out waiting for graceful termination | pending:%d\n", *t.loggerPrefix, t.counter.Load())
 		}
 		for _, writeQueue := range t.writeQueues {
 			close(writeQueue) // close writer channels
@@ -409,6 +417,7 @@ func (t *PcapTransformer) Apply(ctx context.Context, packet *gopacket.Packet, se
 	default:
 		// applying transformer will write 1 translation into N>0 writers.
 		t.wg.Add(int(*t.numWriters))
+		t.counter.Add(int64(*t.numWriters))
 	}
 	// It is assumed that packets will be produced faster than translations and writing operations, so:
 	//   - process/translate packets concurrently in order to avoid blocking `gopacket` packets channel as much as possible.
@@ -452,10 +461,11 @@ func newTranslator(
 }
 
 func rollbackTranslation(
-	ctx context.Context,
+	_ context.Context,
 	transformer *PcapTransformer,
 ) {
 	for range *transformer.numWriters {
+		transformer.counter.Add(-1)
 		transformer.wg.Done()
 	}
 }
@@ -488,6 +498,7 @@ func provideWorkerPools(ctx context.Context, transformer *PcapTransformer, numWr
 			return
 		default:
 			if err := transformer.translatePacketFn(ctx, i); err != nil {
+				transformerLogger.Printf("%s translation failed: %+v\n", *transformer.loggerPrefix, err)
 				rollbackTranslation(ctx, transformer)
 			}
 		}
@@ -615,6 +626,7 @@ func newTransformer(
 		writeQueuesDone: writeQueuesDone,
 		preserveOrder:   preserveOrder || connTracking,
 		connTracking:    connTracking,
+		counter:         new(atomic.Int64),
 	}
 
 	provideStrategy(ctx, transformer, preserveOrder, connTracking)
