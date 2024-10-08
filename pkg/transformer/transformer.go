@@ -346,7 +346,7 @@ func (t *PcapTransformer) WaitDone(ctx context.Context, timeout *time.Duration) 
 
 	writeDoneChan := make(chan struct{})
 
-	go func() {
+	go func(t *PcapTransformer, writeDone chan struct{}) {
 		if !t.preserveOrder && !t.connTracking {
 			transformerLogger.Printf("%s gracefully terminating | tp: %d/%d | wp: %d/%d | pending:%d | deadline: %v\n",
 				*t.loggerPrefix, t.translatorPool.Running(), t.translatorPool.Waiting(),
@@ -355,8 +355,8 @@ func (t *PcapTransformer) WaitDone(ctx context.Context, timeout *time.Duration) 
 			transformerLogger.Printf("%s gracefully terminating | pending: %d | deadline: %v\n", *t.loggerPrefix, t.counter.Load(), timeout)
 		}
 		t.wg.Wait() // wait for all translations to be written
-		close(writeDoneChan)
-	}()
+		close(writeDone)
+	}(t, writeDoneChan)
 
 	select {
 	case <-timer.C:
@@ -376,7 +376,9 @@ func (t *PcapTransformer) WaitDone(ctx context.Context, timeout *time.Duration) 
 		if !timer.Stop() {
 			<-timer.C
 		}
-		transformerLogger.Printf("%s STOPPED – %v\n", *t.loggerPrefix, time.Since(ts))
+		transformerLogger.Printf("%s STOPPED | tp: %d/%d | wp: %d/%d | pending:%d | latency: %v\n",
+			*t.loggerPrefix, t.translatorPool.Running(), t.translatorPool.Waiting(),
+			t.writerPool.Running(), t.writerPool.Waiting(), t.counter.Load(), time.Since(ts))
 	}
 
 	for i, writeQueue := range t.writeQueues {
@@ -475,9 +477,11 @@ func rollbackTranslation(
 // Similarly, sinking translations into files can be safely done concurrently ( in whatever order goroutines are scheduled )
 func provideWorkerPools(ctx context.Context, transformer *PcapTransformer, numWriters *uint8) {
 	poolOpts := ants.Options{
-		PreAlloc:       true,
-		Nonblocking:    false,
-		ExpiryDuration: 10 * time.Second,
+		PreAlloc:    false,
+		Nonblocking: false,
+		// see: https://github.com/panjf2000/ants/blob/v2.10.0/worker_loop_queue.go#L74
+		ExpiryDuration: time.Duration(0) * time.Second,
+		Logger:         transformerLogger,
 	}
 
 	poolOpts.PanicHandler = func(i interface{}) {
