@@ -90,6 +90,11 @@ type (
 	FTSTSM = *haxmap.Map[uint64, FTSM]       // FlowToStreamToSequenceMap
 )
 
+const (
+	carrierDeadline  = 600 * time.Second /* 10m */
+	trackingDeadline = 10 * time.Second  /* 10s */
+)
+
 func newFlowMutex(
 	ctx context.Context,
 	debug bool,
@@ -262,14 +267,14 @@ func (fm *flowMutex) trackConnection(
 		}
 		lock.mu.Lock()
 		defer lock.mu.Unlock()
-		timestamp := time.Now()
-		message := "unblocking"
-		go fm.log(ctx, serial, flowID, tcpFlags, sequence, &timestamp, &message)
+		tsBeforeUnblocling := time.Now()
+		msgBeforeUnblocking := "unblocking"
+		go fm.log(ctx, serial, flowID, tcpFlags, sequence, &tsBeforeUnblocling, &msgBeforeUnblocking)
 		if lock.activeRequests.Add(-1) >= 0 {
 			lock.wg.Done()
-			timestamp := time.Now()
-			message := "unblocked"
-			go fm.log(ctx, serial, flowID, tcpFlags, sequence, &timestamp, &message)
+			tsAfterUnblocking := time.Now()
+			msgAfterUnblocking := "unblocked"
+			go fm.log(ctx, serial, flowID, tcpFlags, sequence, &tsAfterUnblocking, &msgAfterUnblocking)
 		}
 	})
 
@@ -394,9 +399,9 @@ func (fm *flowMutex) lock(
 
 	// changing the order of `Wait` and `Lock` causes a deadlock
 	if fm.isConnectionTermination(tcpFlags) {
-		timestampBeforeWaiting := time.Now()
-		messageBeforeWaiting := "waiting"
-		go fm.log(ctx, serial, flowID, tcpFlags, sequence, &timestampBeforeWaiting, &messageBeforeWaiting)
+		tsBeforeWaiting := time.Now()
+		msgBeforeWaiting := "waiting"
+		go fm.log(ctx, serial, flowID, tcpFlags, sequence, &tsBeforeWaiting, &msgBeforeWaiting)
 		// Connection termination events must wait for the flow to stop being trace-tracked.
 		// some important considerations:
 		//   - If this flow is not trace-tracked ( meaning this termination event acquires the lock ahead of any other TCP segment carrying an HTTP message with trace information ) `Wait()` won't block:
@@ -421,9 +426,9 @@ func (fm *flowMutex) lock(
 			wg.Wait()
 		}
 
-		timestampAfterWaiting := time.Now()
-		messageAfterWaiting := "continue"
-		go fm.log(ctx, serial, flowID, tcpFlags, sequence, &timestampAfterWaiting, &messageAfterWaiting)
+		tsAfterWaiting := time.Now()
+		msgAfterWaiting := "continue"
+		go fm.log(ctx, serial, flowID, tcpFlags, sequence, &tsAfterWaiting, &msgAfterWaiting)
 	}
 	// it is possible that all packets for this flow arrive to `Lock` at almost the same time:
 	//   - which means that termination could delete the reference to `FlowLock` from `MutexMap` while non terminating ones are waiting for the lock

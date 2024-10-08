@@ -477,11 +477,12 @@ func rollbackTranslation(
 // Similarly, sinking translations into files can be safely done concurrently ( in whatever order goroutines are scheduled )
 func provideWorkerPools(ctx context.Context, transformer *PcapTransformer, numWriters *uint8) {
 	poolOpts := ants.Options{
+		Logger:      transformerLogger,
 		PreAlloc:    false,
 		Nonblocking: false,
 		// see: https://github.com/panjf2000/ants/blob/v2.10.0/worker_loop_queue.go#L74
-		ExpiryDuration: time.Duration(0) * time.Second,
-		Logger:         transformerLogger,
+		ExpiryDuration: time.Duration(10) * time.Second,
+		DisablePurge:   true,
 	}
 
 	poolOpts.PanicHandler = func(i interface{}) {
@@ -612,7 +613,7 @@ func newTransformer(
 	writeQueues := make([]chan *fmt.Stringer, numWriters)
 	writeQueuesDone := make([]chan struct{}, numWriters)
 	for i := range writers {
-		writeQueues[i] = make(chan *fmt.Stringer, 100)
+		writeQueues[i] = make(chan *fmt.Stringer, 50)
 		writeQueuesDone[i] = make(chan struct{})
 	}
 

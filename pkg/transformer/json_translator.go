@@ -58,11 +58,6 @@ const (
 	jsonTranslationFlowTemplate     = "{0}/iface/{1}/flow/{2}:{3}"
 )
 
-const (
-	carrierDeadline  = 600 * time.Second /* 10m */
-	trackingDeadline = 10 * time.Second  /* 10s */
-)
-
 func (t *JSONPcapTranslator) translate(_ *gopacket.Packet) error {
 	return fmt.Errorf("not implemented")
 }
@@ -792,8 +787,10 @@ func (t *JSONPcapTranslator) trySetHTTP(
 		if requestStreams.Cardinality() > 0 ||
 			responseStreams.Cardinality() > 0 {
 			_, lockLatency = lock.UnlockWithTraceAndSpan(
-				ctx, tcpFlags, isHTTP2, requestStreams.ToSlice(),
-				responseStreams.ToSlice(), requestTS, responseTS,
+				ctx, tcpFlags, isHTTP2,
+				requestStreams.ToSlice(),
+				responseStreams.ToSlice(),
+				requestTS, responseTS,
 			)
 		} else {
 			_, lockLatency = lock.UnlockWithTCPFlags(ctx, tcpFlags)

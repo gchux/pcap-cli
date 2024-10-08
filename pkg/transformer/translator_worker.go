@@ -170,7 +170,7 @@ func (w *pcapTranslatorWorker) translateTLSLayer(ctx context.Context) fmt.String
 func (w *pcapTranslatorWorker) Run(ctx context.Context) (buffer interface{}) {
 	defer func() {
 		if r := recover(); r != nil {
-			transformerLogger.Printf("%s @translator | %s\n%s\n",
+			transformerLogger.Printf("%s @translator | panic: %s\n%s\n",
 				*w.loggerPrefix, r, string(debug.Stack()))
 			buffer = nil
 		}
@@ -195,23 +195,31 @@ func (w *pcapTranslatorWorker) Run(ctx context.Context) (buffer interface{}) {
 	var wg sync.WaitGroup
 	wg.Add(packetLayerTranslatorsSize) // number of layers to be translated
 
-	go func() {
+	go func(wg *sync.WaitGroup) {
 		wg.Wait()
 		close(translations)
-	}()
+	}(&wg)
 
-	for _, translators := range packetLayerTranslators {
+	for i, translators := range packetLayerTranslators {
 		// translate layers concurrently:
 		//   - layers must know nothing about each other
-		go func(translators []packetLayerTranslator) {
+		go func(index int, translators []packetLayerTranslator, wg *sync.WaitGroup) {
+			defer func(index int, wg *sync.WaitGroup) {
+				if r := recover(); r != nil {
+					transformerLogger.Printf("%s @translator[%d] | panic: %s\n%s\n",
+						*w.loggerPrefix, index, r, string(debug.Stack()))
+					buffer = nil
+				}
+				wg.Done()
+			}(index, wg)
+
 			for _, translator := range translators {
 				if t := translator(ctx, w); t != nil {
 					translations <- t
 					break // skip next alternatives
 				}
 			}
-			wg.Done()
-		}(translators)
+		}(i, translators, &wg)
 	}
 
 	for translation := range translations {
