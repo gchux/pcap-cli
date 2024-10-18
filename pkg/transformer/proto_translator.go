@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build proto
+
 package transformer
 
 import (
@@ -33,11 +35,20 @@ type (
 	}
 )
 
+func init() {
+	translators.Store(PROTO, newPROTOPcapTranslator)
+}
+
 func (t *ProtoPcapTranslator) done(_ context.Context) {
 	// not implemented
 }
 
-func (t *ProtoPcapTranslator) next(ctx context.Context, serial *uint64, packet *gopacket.Packet) fmt.Stringer {
+func (t *ProtoPcapTranslator) next(
+	ctx context.Context,
+	nic *PcapIface,
+	serial *uint64,
+	packet *gopacket.Packet,
+) fmt.Stringer {
 	// `next` returns the container to be used for merging all layers
 	p := &pb.Packet{}
 
@@ -58,11 +69,6 @@ func (t *ProtoPcapTranslator) next(ctx context.Context, serial *uint64, packet *
 	iface := p.GetIface()
 	iface.Index = uint32(t.iface.Index)
 	iface.Name = t.iface.Name
-	addrs := make([]string, len(t.iface.Addrs))
-	for i, addr := range t.iface.Addrs {
-		addrs[i] = addr.IP.String()
-	}
-	iface.Addrs = addrs
 
 	return p
 }
@@ -130,7 +136,7 @@ func (t *ProtoPcapTranslator) merge(ctx context.Context, tgt fmt.Stringer, src f
 	return tgt, nil
 }
 
-func (t *ProtoPcapTranslator) finalize(ctx context.Context, serial *uint64, p *gopacket.Packet, connTrack bool, packet fmt.Stringer) (fmt.Stringer, error) {
+func (t *ProtoPcapTranslator) finalize(ctx context.Context, iface *PcapIface, serial *uint64, p *gopacket.Packet, connTrack bool, packet fmt.Stringer) (fmt.Stringer, error) {
 	return packet, nil
 }
 
@@ -156,6 +162,6 @@ func (t *ProtoPcapTranslator) write(ctx context.Context, writer io.Writer, packe
 	return protoBytesLen, nil
 }
 
-func newProtoPcapTranslator(iface *PcapIface) *ProtoPcapTranslator {
+func newPROTOPcapTranslator(_ context.Context, _ bool, iface *PcapIface) PcapTranslator {
 	return &ProtoPcapTranslator{iface: iface}
 }

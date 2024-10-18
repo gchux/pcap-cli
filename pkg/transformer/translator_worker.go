@@ -182,7 +182,7 @@ func (w *pcapTranslatorWorker) Run(ctx context.Context) (buffer interface{}) {
 	case <-ctx.Done():
 		_buffer = nil
 	default:
-		_buffer = w.translator.next(ctx, w.serial, w.packet)
+		_buffer = w.translator.next(ctx, w.iface, w.serial, w.packet)
 	}
 
 	if _buffer == nil {
@@ -235,7 +235,7 @@ func (w *pcapTranslatorWorker) Run(ctx context.Context) (buffer interface{}) {
 		transformerLogger.Printf("%s @translator | incomplete", *w.loggerPrefix)
 	default:
 		// `finalize` is the only method that works across layers
-		_buffer, _ = w.translator.finalize(ctx, w.serial, w.packet, w.conntrack, _buffer)
+		_buffer, _ = w.translator.finalize(ctx, w.iface, w.serial, w.packet, w.conntrack, _buffer)
 	}
 
 	buffer = &_buffer

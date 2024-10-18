@@ -117,7 +117,7 @@ func (fm *flowMutex) log(
 	serial *uint64,
 	flowID *uint64,
 	tcpFlags *uint8,
-	sequence *uint32,
+	seq, ack *uint32,
 	timestamp *time.Time,
 	message *string,
 ) {
@@ -142,7 +142,8 @@ func (fm *flowMutex) log(
 
 	tcpJSON, _ := json.Object("tcp")
 	tcpJSON.Set(tcpFlagsStr[*tcpFlags], "flags")
-	tcpJSON.Set(*sequence, "sequence")
+	tcpJSON.Set(*seq, "seq")
+	tcpJSON.Set(*ack, "ack")
 
 	timestampJSON, _ := json.Object("timestamp")
 	timestampJSON.Set(timestamp.Unix(), "seconds")
@@ -196,8 +197,15 @@ func (fm *flowMutex) startReaper(ctx context.Context) {
 }
 
 func (fm *flowMutex) getTracedFlow(
-	flowID *uint64, sequence *uint32,
+	flowID *uint64,
+	seq, ack *uint32,
+	local bool,
 ) (TracedFlowProvider, bool) {
+	ref := seq
+	if local {
+		ref = ack
+	}
+
 	streamToSequenceMap, ok := fm.flowToStreamToSequenceMap.Get(*flowID)
 
 	// no HTTP/1.1 request with a `traceID` has been seen for this `flowID`
@@ -210,14 +218,14 @@ func (fm *flowMutex) getTracedFlow(
 		// an HTTP/1.1 request with a `traceID` has already been seen for this `flowID`
 		var tracedFlow, lastTracedFlow *TracedFlow = nil, nil
 		if sttsm, ok := streamToSequenceMap.Get(*stream); ok {
-			sttsm.Range(func(s uint32, tf *TracedFlow) bool {
+			sttsm.Range(func(r uint32, tf *TracedFlow) bool {
 				// Loop over the map keys (ascending sequence numbers) until one greater than `sequence` is found.
 				// HTTP/1.1 is not multiplexed, so a new request using the same TCP connection ( i/e: pooling )
 				// should be observed (alongside its `traceID`) with a higher sequence number than the previous one;
 				// when the key (a sequence number) is greater than the current one, stop looping;
 				// the previously analyzed `key` (sequence number) must be pointing to the correct `traceID`.
 				// TL;DR: `traceID`s exist within a specific TCP sequence range, which configures a boundary.
-				if *sequence > s {
+				if *ref > r {
 					tracedFlow = tf
 				}
 				lastTracedFlow = tf
@@ -244,7 +252,8 @@ func (fm *flowMutex) trackConnection(
 	serial *uint64,
 	flowID *uint64,
 	tcpFlags *uint8,
-	sequence *uint32,
+	seq, ack *uint32,
+	local bool,
 	ts *traceAndSpan,
 ) (*TracedFlow, bool) {
 	if ts == nil {
@@ -269,18 +278,22 @@ func (fm *flowMutex) trackConnection(
 		defer lock.mu.Unlock()
 		tsBeforeUnblocling := time.Now()
 		msgBeforeUnblocking := "unblocking"
-		go fm.log(ctx, serial, flowID, tcpFlags, sequence, &tsBeforeUnblocling, &msgBeforeUnblocking)
+		go fm.log(ctx, serial, flowID, tcpFlags, seq, ack, &tsBeforeUnblocling, &msgBeforeUnblocking)
 		if lock.activeRequests.Add(-1) >= 0 {
 			lock.wg.Done()
 			tsAfterUnblocking := time.Now()
 			msgAfterUnblocking := "unblocked"
-			go fm.log(ctx, serial, flowID, tcpFlags, sequence, &tsAfterUnblocking, &msgAfterUnblocking)
+			go fm.log(ctx, serial, flowID, tcpFlags, seq, ack, &tsAfterUnblocking, &msgAfterUnblocking)
 		}
 	})
 
 	sequenceToTraceAndSpanMapProvider := func(streamToSequenceMap FTSM) STTFM {
 		sequenceToTraceAndSpanMap := skipmap.NewUint32[*TracedFlow]()
-		sequenceToTraceAndSpanMap.Store(*sequence, tf)
+		if local {
+			sequenceToTraceAndSpanMap.Store(*ack, tf)
+		} else {
+			sequenceToTraceAndSpanMap.Store(*seq, tf)
+		}
 		streamToSequenceMap.Set(*ts.streamID, sequenceToTraceAndSpanMap)
 		return sequenceToTraceAndSpanMap
 	}
@@ -347,10 +360,6 @@ func (fm *flowMutex) untrackConnection(
 	fm.MutexMap.Del(*flowID)
 }
 
-func (fm *flowMutex) isConnectionTermination(tcpFlags *uint8) bool {
-	return *tcpFlags == tcpFin || *tcpFlags == tcpFinAck || *tcpFlags == tcpRst || *tcpFlags == tcpRstAck
-}
-
 func (fm *flowMutex) newFlowLockCarrier(serial, flowID *uint64) *flowLockCarrier {
 	var activeRequests atomic.Int64
 	var released atomic.Bool
@@ -375,7 +384,8 @@ func (fm *flowMutex) lock(
 	serial *uint64,
 	flowID *uint64,
 	tcpFlags *uint8,
-	sequence, _ *uint32, /* TCP seq & ack */
+	seq, ack *uint32,
+	local bool,
 ) (
 	*flowLock,
 	TraceAndSpanProvider,
@@ -389,19 +399,11 @@ func (fm *flowMutex) lock(
 	mu := carrier.mu
 	wg := carrier.wg
 
-	var isContextDone bool
-	select {
-	case <-ctx.Done():
-		isContextDone = true
-	default:
-		isContextDone = false
-	}
-
 	// changing the order of `Wait` and `Lock` causes a deadlock
-	if fm.isConnectionTermination(tcpFlags) {
+	if isConnectionTermination(tcpFlags) {
 		tsBeforeWaiting := time.Now()
 		msgBeforeWaiting := "waiting"
-		go fm.log(ctx, serial, flowID, tcpFlags, sequence, &tsBeforeWaiting, &msgBeforeWaiting)
+		go fm.log(ctx, serial, flowID, tcpFlags, seq, ack, &tsBeforeWaiting, &msgBeforeWaiting)
 		// Connection termination events must wait for the flow to stop being trace-tracked.
 		// some important considerations:
 		//   - If this flow is not trace-tracked ( meaning this termination event acquires the lock ahead of any other TCP segment carrying an HTTP message with trace information ) `Wait()` won't block:
@@ -421,14 +423,14 @@ func (fm *flowMutex) lock(
 		//   - release go routines ASAP to allow termination flow to continue
 		select {
 		case <-ctx.Done():
-			isContextDone = true
+			break
 		default:
 			wg.Wait()
 		}
 
 		tsAfterWaiting := time.Now()
 		msgAfterWaiting := "continue"
-		go fm.log(ctx, serial, flowID, tcpFlags, sequence, &tsAfterWaiting, &msgAfterWaiting)
+		go fm.log(ctx, serial, flowID, tcpFlags, seq, ack, &tsAfterWaiting, &msgAfterWaiting)
 	}
 	// it is possible that all packets for this flow arrive to `Lock` at almost the same time:
 	//   - which means that termination could delete the reference to `FlowLock` from `MutexMap` while non terminating ones are waiting for the lock
@@ -437,7 +439,7 @@ func (fm *flowMutex) lock(
 	lockAcquiredTS := time.Now()
 	carrier.lastLockedAt = &lockAcquiredTS
 
-	tracedFlowProvider, _ := fm.getTracedFlow(flowID, sequence)
+	tracedFlowProvider, _ := fm.getTracedFlow(flowID, seq, ack, local)
 
 	_unlock := func() {
 		defer func(mu *sync.Mutex) {
@@ -468,7 +470,7 @@ func (fm *flowMutex) lock(
 				time.AfterFunc(trackingDeadline, func() {
 					timestamp := time.Now()
 					message := "untracking"
-					go fm.log(ctx, serial, flowID, tcpFlags, sequence, &timestamp, &message)
+					go fm.log(ctx, serial, flowID, tcpFlags, seq, ack, &timestamp, &message)
 					fm.untrackConnection(ctx, flowID, carrier)
 				})
 			}
@@ -483,7 +485,7 @@ func (fm *flowMutex) lock(
 		ctx context.Context,
 		tcpFlags *uint8,
 	) (bool, *time.Duration) {
-		if fm.isConnectionTermination(tcpFlags) {
+		if isConnectionTermination(tcpFlags) {
 			return UnlockAndReleaseFN(ctx)
 		}
 		defer _unlock()
@@ -512,7 +514,7 @@ func (fm *flowMutex) lock(
 		UnlockWithTCPFlags: UnlockWithTCPFlagsFN,
 	}
 
-	if !isContextDone && ((tcpSyn|tcpFin|tcpRst)&*tcpFlags == 0) {
+	if *tcpFlags&(tcpSyn|tcpFin|tcpRst) == 0 {
 		// provide trace tracking only for TCP `PSH+ACK`.
 		// For HTTP/2 multiple streams are delivered over the same TCP connection, so:
 		//   - it is possible to observe multiple requests and responses in the same TCP segment,
@@ -540,14 +542,6 @@ func (fm *flowMutex) lock(
 			sizeOfRequestStreams := int64(len(requestStreams))
 			sizeOfResponseStreams := int64(len(responseStreams))
 
-			select {
-			case <-ctx.Done():
-				activeRequests = activeRequests + sizeOfRequestStreams - sizeOfResponseStreams
-				_, lockLatency := UnlockWithTCPFlagsFN(ctx, tcpFlags)
-				return &activeRequests, lockLatency
-			default:
-			}
-
 			sizeOfRequestTraceAndSpans := len(requestTS)
 			// handle flow `unlock` for requests
 			if sizeOfRequestTraceAndSpans > 0 || sizeOfRequestStreams > 0 {
@@ -556,7 +550,8 @@ func (fm *flowMutex) lock(
 					if ts, tsAvailable := requestTS[stream]; tsAvailable {
 						// tracking connections allows for HTTP responses without trace headers
 						// to be correlated with the request that brought them to existence.
-						if tf, tracked := fm.trackConnection(ctx, carrier, serial, flowID, tcpFlags, sequence, ts); tracked {
+						if tf, tracked := fm.trackConnection(ctx,
+							carrier, serial, flowID, tcpFlags, seq, ack, local, ts); tracked {
 							if activeRequests > 0 {
 								// if HTTP more responses are seen before the currently observed requests:
 								//   - do block `FIN+ACK` from making progress;

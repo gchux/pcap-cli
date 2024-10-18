@@ -24,6 +24,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	mapset "github.com/deckarep/golang-set/v2"
 	"github.com/gchux/pcap-cli/pkg/transformer"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/pcap"
@@ -104,9 +105,14 @@ func (p *Pcap) Start(
 	debug := cfg.Debug
 
 	device := cfg.Device
+	addrs := mapset.NewSetWithSize[string](len(device.Addresses))
+	for _, addr := range device.Addresses {
+		addrs.Add(addr.IP.String())
+	}
 	iface := &transformer.PcapIface{
 		Index: device.NetInterface.Index,
 		Name:  device.Name,
+		Addrs: addrs,
 	}
 
 	loggerPrefix := fmt.Sprintf("[%d/%s]", device.NetInterface.Index, device.Name)

@@ -39,7 +39,7 @@ RUN go mod download
 RUN gofumpt -l -w ./cmd/
 RUN gofumpt -l -w ./pkg/
 RUN go generate ./pkg/...
-RUN go build -a -v -o /app/bin/${BIN_NAME} cmd/pcap.go
+RUN go build -a -v -tags json,text,proto -o /app/bin/${BIN_NAME} cmd/pcap.go
 
 FROM scratch AS releaser
 COPY --link --from=builder /app/bin/${BIN_NAME} /

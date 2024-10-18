@@ -27,9 +27,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	mapset "github.com/deckarep/golang-set/v2"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
-	"github.com/google/gopacket/pcap"
 	"github.com/panjf2000/ants/v2"
 	concurrently "github.com/tejzpr/ordered-concurrently/v3"
 )
@@ -37,10 +37,12 @@ import (
 var transformerLogger = log.New(os.Stderr, "[transformer] - ", log.LstdFlags)
 
 type (
+	PcapTranslatorFactory = func(context.Context, bool, *PcapIface) PcapTranslator
+
 	PcapTranslatorFmt uint8
 
 	PcapTranslator interface {
-		next(context.Context, *uint64, *gopacket.Packet) fmt.Stringer
+		next(context.Context, *PcapIface, *uint64, *gopacket.Packet) fmt.Stringer
 		translateEthernetLayer(context.Context, *layers.Ethernet) fmt.Stringer
 		translateIPv4Layer(context.Context, *layers.IPv4) fmt.Stringer
 		translateIPv6Layer(context.Context, *layers.IPv6) fmt.Stringer
@@ -49,7 +51,7 @@ type (
 		translateTLSLayer(context.Context, *layers.TLS) fmt.Stringer
 		translateDNSLayer(context.Context, *layers.DNS) fmt.Stringer
 		merge(context.Context, fmt.Stringer, fmt.Stringer) (fmt.Stringer, error)
-		finalize(context.Context, *uint64, *gopacket.Packet, bool, fmt.Stringer) (fmt.Stringer, error)
+		finalize(context.Context, *PcapIface, *uint64, *gopacket.Packet, bool, fmt.Stringer) (fmt.Stringer, error)
 		write(context.Context, io.Writer, *fmt.Stringer) (int, error)
 		done(context.Context)
 	}
@@ -88,7 +90,7 @@ type (
 	PcapIface struct {
 		Index int
 		Name  string
-		Addrs []pcap.InterfaceAddress
+		Addrs mapset.Set[string]
 	}
 
 	ContextKey string
@@ -111,6 +113,8 @@ var pcapTranslatorFmts = map[string]PcapTranslatorFmt{
 	"text":  TEXT,
 	"proto": PROTO,
 }
+
+var translators sync.Map
 
 const (
 	projectIdEnvVarName           = "PROJECT_ID"
@@ -227,6 +231,10 @@ var (
 	errUnavailableTranslator  = errors.New("packet translator is unavailable")
 )
 
+func isConnectionTermination(tcpFlags *uint8) bool {
+	return *tcpFlags&(tcpFin|tcpRst) != 0
+}
+
 func (t *PcapTransformer) writeTranslation(ctx context.Context, task *pcapWriteTask) error {
 	defer func() {
 		t.counter.Add(-1)
@@ -277,7 +285,7 @@ func (t *PcapTransformer) produceTranslation(
 	translation := task.Run(ctx)
 	if translation == nil {
 		return fmt.Errorf("%s - #:%d | produceTranslation: %w",
-			*t.loggerPrefix, task.serial, errUnavailableTranslation)
+			*t.loggerPrefix, *task.serial, errUnavailableTranslation)
 	}
 	return t.publishTranslation(ctx, translation.(*fmt.Stringer))
 }
@@ -446,15 +454,8 @@ func newTranslator(
 	iface *PcapIface,
 	format PcapTranslatorFmt,
 ) (PcapTranslator, error) {
-	switch format {
-	case JSON:
-		return newJSONPcapTranslator(ctx, debug, iface), nil
-	case TEXT:
-		return newTextPcapTranslator(iface), nil
-	case PROTO:
-		return newProtoPcapTranslator(iface), nil
-	default:
-		/* no-go */
+	if factory, ok := translators.Load(format); ok {
+		return factory.(PcapTranslatorFactory)(ctx, debug, iface), nil
 	}
 
 	return nil, errors.Join(errUnavailableTranslator,

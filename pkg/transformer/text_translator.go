@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build text
+
 package transformer
 
 import (
@@ -47,6 +49,10 @@ var (
 	textPcapDataStyle   = pterm.NewStyle(pterm.FgBlack, pterm.BgWhite, pterm.Bold)
 )
 
+func init() {
+	translators.Store(TEXT, newTEXTPcapTranslator)
+}
+
 func (tt *textPcapTranslation) String() string {
 	return tt.builder.String()
 }
@@ -81,7 +87,12 @@ func (t *TextPcapTranslator) done(_ context.Context) {
 	// not implemented
 }
 
-func (t *TextPcapTranslator) next(ctx context.Context, serial *uint64, packet *gopacket.Packet) fmt.Stringer {
+func (t *TextPcapTranslator) next(
+	ctx context.Context,
+	nic *PcapIface,
+	serial *uint64,
+	packet *gopacket.Packet,
+) fmt.Stringer {
 	text := new(strings.Builder)
 
 	metadata := (*packet).Metadata()
@@ -166,7 +177,7 @@ func (t *TextPcapTranslator) merge(ctx context.Context, tgt fmt.Stringer, src fm
 	return tgt, nil
 }
 
-func (t *TextPcapTranslator) finalize(ctx context.Context, serial *uint64, p *gopacket.Packet, connTrack bool, packet fmt.Stringer) (fmt.Stringer, error) {
+func (t *TextPcapTranslator) finalize(ctx context.Context, iface *PcapIface, serial *uint64, p *gopacket.Packet, connTrack bool, packet fmt.Stringer) (fmt.Stringer, error) {
 	return packet, nil
 }
 
@@ -176,7 +187,7 @@ func (t *TextPcapTranslator) write(ctx context.Context, writer io.Writer, packet
 	return io.WriteString(writer, translations.String())
 }
 
-func newTextPcapTranslator(iface *PcapIface) *TextPcapTranslator {
+func newTEXTPcapTranslator(_ context.Context, _ bool, iface *PcapIface) PcapTranslator {
 	return &TextPcapTranslator{iface: iface}
 }
 

@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build json
+
 package transformer
 
 import (
@@ -58,6 +60,10 @@ const (
 	jsonTranslationFlowTemplate     = "{0}/iface/{1}/flow/{2}:{3}"
 )
 
+func init() {
+	translators.Store(JSON, newJSONPcapTranslator)
+}
+
 func (t *JSONPcapTranslator) translate(_ *gopacket.Packet) error {
 	return fmt.Errorf("not implemented")
 }
@@ -77,7 +83,12 @@ func (t *JSONPcapTranslator) done(ctx context.Context) {
 }
 
 // return pointer to `struct` `gabs.Container`
-func (t *JSONPcapTranslator) next(ctx context.Context, serial *uint64, packet *gopacket.Packet) fmt.Stringer {
+func (t *JSONPcapTranslator) next(
+	ctx context.Context,
+	nic *PcapIface,
+	serial *uint64,
+	packet *gopacket.Packet,
+) fmt.Stringer {
 	flowID := fnv1a.AddUint64(fnv1a.Init64, uint64(t.iface.Index))
 	flowIDstr := strconv.FormatUint(flowID, 10)
 
@@ -108,13 +119,15 @@ func (t *JSONPcapTranslator) next(ctx context.Context, serial *uint64, packet *g
 	timestamp.Set(info.Timestamp.Nanosecond(), "nanos")
 
 	iface, _ := json.Object("iface")
-	iface.Set(t.iface.Index, "index")
-	iface.Set(t.iface.Name, "name")
-	if sizeOfAddrs := len(t.iface.Addrs); sizeOfAddrs > 0 {
+	iface.Set(nic.Index, "index")
+	iface.Set(nic.Name, "name")
+	if sizeOfAddrs := nic.Addrs.Cardinality(); sizeOfAddrs > 0 {
 		addrs, _ := iface.ArrayOfSize(sizeOfAddrs, "addrs")
-		for i, addr := range t.iface.Addrs {
-			addrs.SetIndex(addr.IP.String(), i)
-		}
+		nic.Addrs.Each(func(IP string) bool {
+			sizeOfAddrs -= 1
+			addrs.SetIndex(IP, sizeOfAddrs)
+			return false
+		})
 	}
 
 	labels, _ := json.Object("logging.googleapis.com/labels")
@@ -551,6 +564,7 @@ func (t *JSONPcapTranslator) merge(ctx context.Context, tgt fmt.Stringer, src fm
 //   - the summary line at {`message`: $summary}
 func (t *JSONPcapTranslator) finalize(
 	ctx context.Context,
+	iface *PcapIface,
 	serial *uint64,
 	p *gopacket.Packet,
 	conntrack bool,
@@ -578,6 +592,9 @@ func (t *JSONPcapTranslator) finalize(
 	data["L3Src"] = l3Src
 	l3Dst, _ := json.Path("L3.dst").Data().(net.IP)
 	data["L3Dst"] = l3Dst
+
+	isSrcLocal := iface.Addrs.Contains(l3Src.String())
+	json.Set(isSrcLocal, "local")
 
 	proto := json.Path("L3.proto.num").Data().(layers.IPProtocol)
 	isTCP := proto == layers.IPProtocolTCP
@@ -653,7 +670,7 @@ func (t *JSONPcapTranslator) finalize(
 	//   - there are no guarantees about about which packet will get the `lock` next
 	// minimize locking: lock per-flow instead of across-flows.
 	// Locking is done in the name of throubleshoot-ability, so some contention at the flow level should be acceptable...
-	lock, traceAndSpanProvider := t.fm.lock(ctx, serial, &flowID, &setFlags, &seq, &ack)
+	lock, traceAndSpanProvider := t.fm.lock(ctx, serial, &flowID, &setFlags, &seq, &ack, isSrcLocal)
 
 	if conntrack {
 		t.analyzeConnection(p, &flowID, &setFlags, json)
@@ -867,13 +884,19 @@ func (t *JSONPcapTranslator) trySetHTTP(
 			var _ts *traceAndSpan = nil
 
 			switch frame := frame.(type) {
+			case *http2.GoAwayFrame:
+				frameJSON.Set("goaway", "type")
+
+			case *http2.RSTStreamFrame:
+				frameJSON.Set("rst", "type")
+
 			case *http2.PingFrame:
 				frameJSON.Set("ping", "type")
 				frameJSON.Set(frame.IsAck(), "ack")
 				frameJSON.Set(string(frame.Data[:]), "data")
 
 			case *http2.SettingsFrame:
-				frameJSON.Set("sttings", "type")
+				frameJSON.Set("settings", "type")
 				settings, _ := frameJSON.Object("settings")
 				frame.ForeachSetting(func(s http2.Setting) error {
 					// see: https://pkg.go.dev/golang.org/x/net/http2#SettingID
@@ -1012,22 +1035,48 @@ func (t *JSONPcapTranslator) trySetHTTP(
 	// attempt to parse HTTP/1.1 request
 	if isHTTP11Request {
 		requestStreams.Add(StreamID)
+
+		L7.Set("request", "kind")
+
 		request, err := http.ReadRequest(httpDataReader)
 
-		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		if (err != nil && err != io.EOF && err != io.ErrUnexpectedEOF) || request == nil {
 			errorJSON, _ := L7.Object("error")
 			errorJSON.Set("INVALID_HTTP11_REQUEST", "code")
-			errorJSON.Set(err.Error(), "info")
+			if err != nil {
+				errorJSON.Set(err.Error(), "info")
+			}
+			errorJSON.Set(request != nil, "parsed")
+
+			L7.Set("HTTP/1.1", "proto")
+
 			json.Set(stringFormatter.Format("{0} | {1}: {2}",
 				*message, "INVALID_HTTP11_REQUEST", err.Error()), "message")
+
 			return L7, true, false
 		}
 
-		L7.Set("request", "kind")
-		url := request.URL.String()
+		url := ""
+		if _url := request.URL; _url != nil {
+			url = _url.String()
+		}
+
+		if url == "" {
+			if parts := http11RequestPayloadRegex.
+				FindSubmatch(appLayerData); len(parts) >= 3 {
+				url = string(parts[2])
+				L7.Set(url, "url")
+				L7.Set("HTTP/1.1", "proto")
+			}
+			// abort, not safe to continue,
+			// the "quasi-RAW" will tell...
+			return L7, true, false
+		}
+
 		L7.Set(url, "url")
 		L7.Set(request.Proto, "proto")
 		L7.Set(request.Method, "method")
+
 		if _ts := t.addHTTPHeaders(L7, &request.Header); _ts != nil {
 			_ts.streamID = &StreamID
 			requestTS[StreamID] = _ts
@@ -1035,6 +1084,7 @@ func (t *JSONPcapTranslator) trySetHTTP(
 			t.setTraceAndSpan(json, _ts)
 			t.recordHTTP11Request(packet, flowID, sequence, _ts, &request.Method, &request.Host, &url)
 		}
+
 		sizeOfBody := t.addHTTPBodyDetails(L7, &request.ContentLength, request.Body)
 		if sizeOfBody > 0 {
 			dataStreams.Add(StreamID)
@@ -1042,30 +1092,42 @@ func (t *JSONPcapTranslator) trySetHTTP(
 		if cl, clErr := strconv.ParseUint(request.Header.Get(httpContentLengthHeader), 10, 64); clErr == nil {
 			fragmented = cl > sizeOfBody
 		}
+
 		json.Set(stringFormatter.Format("{0} | {1} {2} {3}", *message, request.Proto, request.Method, url), "message")
+
 		return L7, true, false
 	}
 
 	// attempt to parse HTTP/1.1 response
 	if isHTTP11Response {
 		responseStreams.Add(StreamID)
+
+		L7.Set("response", "kind")
+
 		// Go's `http` implementation may miss the `Transfer-Encoding` header
 		//   - see: https://github.com/golang/go/issues/27061
 		response, err := http.ReadResponse(httpDataReader, nil)
 
-		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		if (err != nil && err != io.EOF && err != io.ErrUnexpectedEOF) || response == nil {
 			errorJSON, _ := L7.Object("error")
 			errorJSON.Set("INVALID_HTTP11_RESPONSE", "code")
-			errorJSON.Set(err.Error(), "info")
+			if err != nil {
+				errorJSON.Set(err.Error(), "info")
+			}
+			errorJSON.Set(response != nil, "parsed")
+
+			L7.Set("HTTP/1.1", "proto")
+
 			json.Set(stringFormatter.Format("{0} | {1}: {2}",
 				*message, "INVALID_HTTP11_RESPONSE", err.Error()), "message")
+
 			return L7, true, false
 		}
 
-		L7.Set("response", "kind")
 		L7.Set(response.Proto, "proto")
 		L7.Set(response.StatusCode, "code")
 		L7.Set(response.Status, "status")
+
 		if _ts := t.addHTTPHeaders(L7, &response.Header); _ts != nil {
 			_ts.streamID = &StreamID
 			responseTS[StreamID] = _ts
@@ -1079,6 +1141,7 @@ func (t *JSONPcapTranslator) trySetHTTP(
 			t.setTraceAndSpan(json, ts)
 			t.linkHTTP11ResponseToRequest(packet, flowID, L7, ts)
 		}
+
 		sizeOfBody := t.addHTTPBodyDetails(L7, &response.ContentLength, response.Body)
 		if sizeOfBody > 0 {
 			dataStreams.Add(StreamID)
@@ -1088,8 +1151,9 @@ func (t *JSONPcapTranslator) trySetHTTP(
 			//   - this HTTP message is fragmented and so there's more to come
 			fragmented = cl > sizeOfBody
 		}
-		json.Set(stringFormatter.Format("{0} | {1} {2}",
-			*message, response.Proto, response.Status), "message")
+
+		json.Set(stringFormatter.Format("{0} | {1} {2}", *message, response.Proto, response.Status), "message")
+
 		return L7, true, false
 	}
 
@@ -1224,7 +1288,7 @@ func (t *JSONPcapTranslator) write(ctx context.Context, writer io.Writer, packet
 	return writtenBytes, nil
 }
 
-func newJSONPcapTranslator(ctx context.Context, debug bool, iface *PcapIface) *JSONPcapTranslator {
+func newJSONPcapTranslator(ctx context.Context, debug bool, iface *PcapIface) PcapTranslator {
 	flowToStreamToSequenceMap := haxmap.New[uint64, FTSM]()
 	traceToHttpRequestMap := haxmap.New[string, *httpRequest]()
 	flowMutex := newFlowMutex(ctx, debug, flowToStreamToSequenceMap, traceToHttpRequestMap)
