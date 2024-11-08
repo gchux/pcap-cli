@@ -92,6 +92,10 @@ const (
 	PcapContextLogName = transformer.ContextLogName
 )
 
+const (
+	PcapDefaultFilter = "(tcp or udp) and (ip or ip6)"
+)
+
 func providePcapFilter(
 	ctx context.Context,
 	filter *string,
@@ -102,13 +106,25 @@ func providePcapFilter(
 		return filter
 	default:
 	}
+
 	pcapFilter := ""
+
+	// if `filter` is available, then providers are not used to built the BPF filter.
 	if filter != nil && *filter != "" {
 		pcapFilter = stringFormatter.Format("({0})", *filter)
+	} else if len(providers) > 0 {
+		for _, provider := range providers {
+			if provider != nil {
+				if f := provider.Apply(ctx,
+					&pcapFilter, PCAP_FILTER_MODE_AND); f != nil {
+					pcapFilter = *f
+				}
+			}
+		}
+	} else {
+		pcapFilter = string(PcapDefaultFilter)
 	}
-	for _, provider := range providers {
-		pcapFilter = *provider.Apply(ctx, &pcapFilter, PCAP_FILTER_MODE_AND)
-	}
+
 	return &pcapFilter
 }
 

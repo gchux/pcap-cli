@@ -52,8 +52,8 @@ func (t *Tcpdump) buildArgs(ctx context.Context) []string {
 		args = append(args, "-G", fmt.Sprintf("%d", cfg.Interval))
 	}
 
-	if cfg.Filter != "" {
-		filter := providePcapFilter(ctx, &cfg.Filter, cfg.Filters)
+	if filter := providePcapFilter(ctx,
+		&cfg.Filter, cfg.Filters); *filter != "" {
 		args = append(args, *filter)
 	}
 
