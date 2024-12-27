@@ -47,6 +47,7 @@ type (
 	JSONPcapTranslator struct {
 		fm                        *flowMutex
 		iface                     *PcapIface
+		ephemerals                *PcapEmphemeralPorts
 		traceToHttpRequestMap     *haxmap.Map[string, *httpRequest]
 		flowToStreamToSequenceMap FTSTSM
 	}
@@ -185,8 +186,6 @@ func (t *JSONPcapTranslator) translateIPv4Layer(ctx context.Context, ip4 *layers
 	L3.Set(ip4.FragOffset, "foff")
 	L3.Set(ip4.Checksum, "xsum")
 
-	ip4.NetworkFlow()
-
 	opts, _ := L3.ArrayOfSize(len(ip4.Options), "opts")
 	for i, opt := range ip4.Options {
 		o, _ := opts.ObjectI(i)
@@ -318,6 +317,7 @@ func (t *JSONPcapTranslator) addTCPOptions(tcp *layers.TCP, L4 *gabs.Container) 
 				optVal = strings.TrimSpace(optVal)
 
 				// see: https://github.com/google/gopacket/blob/master/layers/tcp.go#L37-L57
+				// [ToDo] – handle: SACK
 				if optVal == "" {
 					continue
 				} else if strings.HasPrefix(optVal, "0x") {
@@ -594,7 +594,6 @@ func (t *JSONPcapTranslator) finalize(
 	data["L3Dst"] = l3Dst
 
 	isSrcLocal := iface.Addrs.Contains(l3Src.String())
-	json.Set(isSrcLocal, "local")
 
 	proto := json.Path("L3.proto.num").Data().(layers.IPProtocol)
 	isTCP := proto == layers.IPProtocolTCP
@@ -640,6 +639,10 @@ func (t *JSONPcapTranslator) finalize(
 		data["L4Src"] = uint16(srcPort)
 		dstPort, _ := json.Path("L4.dst").Data().(layers.UDPPort)
 		data["L4Dst"] = uint16(dstPort)
+
+		isSrcLocal = isSrcLocal && !t.ephemerals.isEphemeralUDPPort(&srcPort)
+		json.Set(isSrcLocal, "local")
+
 		operation.Set(stringFormatter.Format(jsonTranslationFlowTemplate, id, t.iface.Name, "udp", flowIDstr), "id")
 		json.Set(stringFormatter.FormatComplex(jsonTranslationSummaryUDP, data), "message")
 		return json, nil
@@ -664,6 +667,12 @@ func (t *JSONPcapTranslator) finalize(
 	operation.Set(stringFormatter.Format(jsonTranslationFlowTemplate, id, t.iface.Name, "tcp", flowIDstr), "id")
 
 	message := stringFormatter.FormatComplex(jsonTranslationSummaryTCP, data)
+
+	// local means: a service running within the sandbox
+	//   - so it is not a client which created a socket to communicate with a remote host using an ephemeral port
+	// this approach is best effort as a client may use a `not ephemeral port` to create a socket for egress networking.
+	isSrcLocal = isSrcLocal && !t.ephemerals.isEphemeralTCPPort(&srcPort)
+	json.Set(isSrcLocal, "local")
 
 	// `finalize` is invoked from a `worker` via a go-routine `pool`:
 	//   - there are no guarantees about which packet will get `finalize`d 1st
@@ -795,7 +804,7 @@ func (t *JSONPcapTranslator) trySetHTTP(
 	responseTS := make(map[uint32]*traceAndSpan)
 
 	// making at least 1 big assumption:
-	//   HTTP request/status line and headers fit in 1 packet
+	//   HTTP request/status line and headers fit in 1 packet ( TCP segment )
 	//     which is not always the case when fragmentation occurs
 	L7, _ := json.Object("HTTP")
 
@@ -842,7 +851,7 @@ func (t *JSONPcapTranslator) trySetHTTP(
 
 			frameHeader := frame.Header()
 
-			// h2 is multiplexed, `StreamID` will allows to link HTTP conversations
+			// h2 is multiplexed, `StreamID` allows to link HTTP conversations
 			//   - see: https://datatracker.ietf.org/doc/html/rfc9113#name-stream-identifiers
 			//     - Streams initiated by a client MUST use odd-numbered stream identifiers
 			//     - Streams initiated by the server MUST use even-numbered stream identifiers
@@ -1016,16 +1025,24 @@ func (t *JSONPcapTranslator) trySetHTTP(
 	metaHeaders, _ := meta.ArrayOfSize(len(parts)-1, "headers")
 	// HTTP headers starts at `parts[1]`
 	for i, header := range parts[1:] {
-		metaHeaders.SetIndex(string(header), i)
+		if len(header) > 128 {
+			metaHeaders.SetIndex(string(header[:128-3]), i)
+		} else if len(header) > 0 {
+			metaHeaders.SetIndex(string(header), i)
+		} else {
+			metaHeaders.SetIndex("<EMPTY>", i)
+		}
 	}
 	if len(dataBytes) > 1 {
 		parts = bytes.Split(dataBytes[1], http11Separator)
 		body, _ := meta.ArrayOfSize(len(parts), "body")
-		for i, part := range parts {
-			if len(part) > 128 {
-				body.SetIndex(string(part[:128-3])+"...", i)
+		for i, line := range parts {
+			if len(line) > 128 {
+				body.SetIndex(string(line[:128-3])+"...", i)
+			} else if len(line) > 0 {
+				body.SetIndex(string(line), i)
 			} else {
-				body.SetIndex(string(part), i)
+				body.SetIndex("<EMPTY>", i)
 			}
 		}
 	}
@@ -1288,7 +1305,12 @@ func (t *JSONPcapTranslator) write(ctx context.Context, writer io.Writer, packet
 	return writtenBytes, nil
 }
 
-func newJSONPcapTranslator(ctx context.Context, debug bool, iface *PcapIface) PcapTranslator {
+func newJSONPcapTranslator(
+	ctx context.Context,
+	debug bool,
+	iface *PcapIface,
+	ephemerals *PcapEmphemeralPorts,
+) PcapTranslator {
 	flowToStreamToSequenceMap := haxmap.New[uint64, FTSM]()
 	traceToHttpRequestMap := haxmap.New[string, *httpRequest]()
 	flowMutex := newFlowMutex(ctx, debug, flowToStreamToSequenceMap, traceToHttpRequestMap)
@@ -1296,6 +1318,7 @@ func newJSONPcapTranslator(ctx context.Context, debug bool, iface *PcapIface) Pc
 	return &JSONPcapTranslator{
 		fm:                        flowMutex,
 		iface:                     iface,
+		ephemerals:                ephemerals,
 		traceToHttpRequestMap:     traceToHttpRequestMap,
 		flowToStreamToSequenceMap: flowToStreamToSequenceMap,
 	}

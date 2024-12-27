@@ -187,7 +187,12 @@ func (t *TextPcapTranslator) write(ctx context.Context, writer io.Writer, packet
 	return io.WriteString(writer, translations.String())
 }
 
-func newTEXTPcapTranslator(_ context.Context, _ bool, iface *PcapIface) PcapTranslator {
+func newTEXTPcapTranslator(
+	_ context.Context,
+	_ bool,
+	iface *PcapIface,
+	_ *PcapEmphemeralPorts,
+) PcapTranslator {
 	return &TextPcapTranslator{iface: iface}
 }
 

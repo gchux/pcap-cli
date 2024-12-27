@@ -162,6 +162,11 @@ func (t *ProtoPcapTranslator) write(ctx context.Context, writer io.Writer, packe
 	return protoBytesLen, nil
 }
 
-func newPROTOPcapTranslator(_ context.Context, _ bool, iface *PcapIface) PcapTranslator {
+func newPROTOPcapTranslator(
+	_ context.Context,
+	_ bool,
+	iface *PcapIface,
+	_ *PcapEmphemeralPorts,
+) PcapTranslator {
 	return &ProtoPcapTranslator{iface: iface}
 }

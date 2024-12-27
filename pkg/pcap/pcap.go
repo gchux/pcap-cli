@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"net"
 	"regexp"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -40,21 +41,24 @@ type (
 		Apply(context.Context, *string, PcapFilterMode) *string
 	}
 
+	PcapEmphemeralPorts = transformer.PcapEmphemeralPorts
+
 	PcapConfig struct {
-		Debug     bool
-		Promisc   bool
-		Iface     string
-		Snaplen   int
-		TsType    string
-		Format    string
-		Filter    string
-		Output    string
-		Interval  int
-		Extension string
-		Ordered   bool
-		ConnTrack bool
-		Device    *PcapDevice
-		Filters   []PcapFilterProvider
+		Debug      bool
+		Promisc    bool
+		Iface      string
+		Snaplen    int
+		TsType     string
+		Format     string
+		Filter     string
+		Output     string
+		Interval   int
+		Extension  string
+		Ordered    bool
+		ConnTrack  bool
+		Device     *PcapDevice
+		Filters    []PcapFilterProvider
+		Ephemerals *PcapEmphemeralPorts
 	}
 
 	PcapEngine interface {
@@ -96,6 +100,12 @@ const (
 	PcapDefaultFilter = "(tcp or udp) and (ip or ip6)"
 )
 
+const (
+	pcap_min_ephemeral_port uint16 = 0x0400 // 1024 – start of registered ports per RFC 6056
+	PCAP_MIN_EPHEMERAL_PORT uint16 = 0x8000 // 32768 – preferred MIN ephemeral port ( not as high as 0x0C000 / 49152 )
+	PCAP_MAX_EPHEMERAL_PORT uint16 = 0xFFFF // 65535 ( Linux: 60999 / 0xEE47 )
+)
+
 func providePcapFilter(
 	ctx context.Context,
 	filter *string,
@@ -109,8 +119,10 @@ func providePcapFilter(
 
 	pcapFilter := ""
 
-	// if `filter` is available, then providers are not used to built the BPF filter.
-	if filter != nil && *filter != "" {
+	// if `filter` is available, then providers are not used to build the BPF filter.
+	if filter != nil && *filter != "" && !strings.EqualFold(*filter, "DISABLED") {
+		// `filter` is extremely unsafe as it is a free form expression:
+		// [ToDo] – validate `filter` to enforce correctness of expressions.
 		pcapFilter = stringFormatter.Format("({0})", *filter)
 	} else if len(providers) > 0 {
 		for _, provider := range providers {

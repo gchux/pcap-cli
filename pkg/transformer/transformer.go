@@ -37,7 +37,7 @@ import (
 var transformerLogger = log.New(os.Stderr, "[transformer] - ", log.LstdFlags)
 
 type (
-	PcapTranslatorFactory = func(context.Context, bool, *PcapIface) PcapTranslator
+	PcapTranslatorFactory = func(context.Context, bool, *PcapIface, *PcapEmphemeralPorts) PcapTranslator
 
 	PcapTranslatorFmt uint8
 
@@ -59,6 +59,7 @@ type (
 	PcapTransformer struct {
 		ctx             context.Context
 		iface           *PcapIface
+		ephemerals      *PcapEmphemeralPorts
 		loggerPrefix    *string
 		ich             chan concurrently.WorkFunction
 		och             <-chan concurrently.OrderedOutput
@@ -91,6 +92,10 @@ type (
 		Index int
 		Name  string
 		Addrs mapset.Set[string]
+	}
+
+	PcapEmphemeralPorts struct {
+		Min, Max uint16
 	}
 
 	ContextKey string
@@ -230,6 +235,20 @@ var (
 	errUnavailableTranslation = errors.New("packet translation is unavailable")
 	errUnavailableTranslator  = errors.New("packet translator is unavailable")
 )
+
+func (eph *PcapEmphemeralPorts) isEphemeralPort(port *uint16) bool {
+	return *port >= eph.Min && *port <= eph.Max
+}
+
+func (eph *PcapEmphemeralPorts) isEphemeralUDPPort(udpPort *layers.UDPPort) bool {
+	port := uint16(*udpPort)
+	return eph.isEphemeralPort(&port)
+}
+
+func (eph *PcapEmphemeralPorts) isEphemeralTCPPort(tcpPort *layers.TCPPort) bool {
+	port := uint16(*tcpPort)
+	return eph.isEphemeralPort(&port)
+}
 
 func isConnectionTermination(tcpFlags *uint8) bool {
 	return *tcpFlags&(tcpFin|tcpRst) != 0
@@ -452,10 +471,11 @@ func newTranslator(
 	ctx context.Context,
 	debug bool,
 	iface *PcapIface,
+	ephemerals *PcapEmphemeralPorts,
 	format PcapTranslatorFmt,
 ) (PcapTranslator, error) {
 	if factory, ok := translators.Load(format); ok {
-		return factory.(PcapTranslatorFactory)(ctx, debug, iface), nil
+		return factory.(PcapTranslatorFactory)(ctx, debug, iface, ephemerals), nil
 	}
 
 	return nil, errors.Join(errUnavailableTranslator,
@@ -595,6 +615,7 @@ func provideStrategy(
 func newTransformer(
 	ctx context.Context,
 	iface *PcapIface,
+	ephemerals *PcapEmphemeralPorts,
 	writers []io.Writer,
 	format *string,
 	preserveOrder,
@@ -602,7 +623,7 @@ func newTransformer(
 	debug bool,
 ) (IPcapTransformer, error) {
 	pcapFmt := pcapTranslatorFmts[*format]
-	translator, err := newTranslator(ctx, debug, iface, pcapFmt)
+	translator, err := newTranslator(ctx, debug, iface, ephemerals, pcapFmt)
 	if err != nil {
 		return nil, err
 	}
@@ -624,6 +645,7 @@ func newTransformer(
 		wg:              new(sync.WaitGroup),
 		ctx:             ctx,
 		iface:           iface,
+		ephemerals:      ephemerals,
 		loggerPrefix:    &loggerPrefix,
 		translator:      translator,
 		writers:         writers,
@@ -659,18 +681,18 @@ func newTransformer(
 	return transformer, nil
 }
 
-func NewOrderedTransformer(ctx context.Context, iface *PcapIface, writers []io.Writer, format *string, debug bool) (IPcapTransformer, error) {
-	return newTransformer(ctx, iface, writers, format, true /* preserveOrder */, false /* connTracking */, debug)
+func NewOrderedTransformer(ctx context.Context, iface *PcapIface, ephemerals *PcapEmphemeralPorts, writers []io.Writer, format *string, debug bool) (IPcapTransformer, error) {
+	return newTransformer(ctx, iface, ephemerals, writers, format, true /* preserveOrder */, false /* connTracking */, debug)
 }
 
-func NewConnTrackTransformer(ctx context.Context, iface *PcapIface, writers []io.Writer, format *string, debug bool) (IPcapTransformer, error) {
-	return newTransformer(ctx, iface, writers, format, true /* preserveOrder */, true /* connTracking */, debug)
+func NewConnTrackTransformer(ctx context.Context, iface *PcapIface, ephemerals *PcapEmphemeralPorts, writers []io.Writer, format *string, debug bool) (IPcapTransformer, error) {
+	return newTransformer(ctx, iface, ephemerals, writers, format, true /* preserveOrder */, true /* connTracking */, debug)
 }
 
-func NewDebugTransformer(ctx context.Context, iface *PcapIface, writers []io.Writer, format *string) (IPcapTransformer, error) {
-	return newTransformer(ctx, iface, writers, format, false /* preserveOrder */, false /* connTracking */, true /* debug */)
+func NewDebugTransformer(ctx context.Context, iface *PcapIface, ephemerals *PcapEmphemeralPorts, writers []io.Writer, format *string) (IPcapTransformer, error) {
+	return newTransformer(ctx, iface, ephemerals, writers, format, false /* preserveOrder */, false /* connTracking */, true /* debug */)
 }
 
-func NewTransformer(ctx context.Context, iface *PcapIface, writers []io.Writer, format *string, debug bool) (IPcapTransformer, error) {
-	return newTransformer(ctx, iface, writers, format, false /* preserveOrder */, false /* connTracking */, debug)
+func NewTransformer(ctx context.Context, iface *PcapIface, ephemerals *PcapEmphemeralPorts, writers []io.Writer, format *string, debug bool) (IPcapTransformer, error) {
+	return newTransformer(ctx, iface, ephemerals, writers, format, false /* preserveOrder */, false /* connTracking */, debug)
 }

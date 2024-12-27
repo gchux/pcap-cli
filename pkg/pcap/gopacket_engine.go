@@ -141,11 +141,11 @@ func (p *Pcap) Start(
 
 	// create new transformer for the specified output format
 	if cfg.Ordered {
-		p.fn, err = transformer.NewOrderedTransformer(ctx, iface, ioWriters, &format, debug)
+		p.fn, err = transformer.NewOrderedTransformer(ctx, iface, cfg.Ephemerals, ioWriters, &format, debug)
 	} else if cfg.ConnTrack {
-		p.fn, err = transformer.NewConnTrackTransformer(ctx, iface, ioWriters, &format, debug)
+		p.fn, err = transformer.NewConnTrackTransformer(ctx, iface, cfg.Ephemerals, ioWriters, &format, debug)
 	} else {
-		p.fn, err = transformer.NewTransformer(ctx, iface, ioWriters, &format, debug)
+		p.fn, err = transformer.NewTransformer(ctx, iface, cfg.Ephemerals, ioWriters, &format, debug)
 	}
 
 	if err != nil {
@@ -192,6 +192,17 @@ func NewPcap(config *PcapConfig) (PcapEngine, error) {
 	debug := config.Debug
 	if debugEnvVar, err := strconv.ParseBool(os.Getenv("PCAP_DEBUG")); err == nil {
 		config.Debug = debug || debugEnvVar
+	}
+
+	// `config.Ephemerals` is already a safe type,
+	// here the validation only enforces correctness of port range.
+	if config.Ephemerals == nil ||
+		config.Ephemerals.Min < pcap_min_ephemeral_port ||
+		config.Ephemerals.Min >= config.Ephemerals.Max {
+		config.Ephemerals = &PcapEmphemeralPorts{
+			Min: PCAP_MIN_EPHEMERAL_PORT,
+			Max: PCAP_MAX_EPHEMERAL_PORT,
+		}
 	}
 
 	pcap := Pcap{config: config, isActive: &isActive}
