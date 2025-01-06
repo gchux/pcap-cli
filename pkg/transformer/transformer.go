@@ -46,6 +46,11 @@ type (
 		translateEthernetLayer(context.Context, *layers.Ethernet) fmt.Stringer
 		translateIPv4Layer(context.Context, *layers.IPv4) fmt.Stringer
 		translateIPv6Layer(context.Context, *layers.IPv6) fmt.Stringer
+		translateICMPv4Layer(context.Context, *layers.ICMPv4) fmt.Stringer
+		translateICMPv6Layer(context.Context, *layers.ICMPv6) fmt.Stringer
+		translateICMPv6EchoLayer(context.Context, fmt.Stringer, *layers.ICMPv6Echo) fmt.Stringer
+		translateICMPv6RedirectLayer(context.Context, fmt.Stringer, *layers.ICMPv6Redirect) fmt.Stringer
+		translateICMPv6L3HeaderLayer(context.Context, fmt.Stringer, *layers.ICMPv6) fmt.Stringer
 		translateUDPLayer(context.Context, *layers.UDP) fmt.Stringer
 		translateTCPLayer(context.Context, *layers.TCP) fmt.Stringer
 		translateTLSLayer(context.Context, *layers.TLS) fmt.Stringer

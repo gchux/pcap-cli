@@ -97,7 +97,7 @@ const (
 )
 
 const (
-	PcapDefaultFilter = "(tcp or udp) and (ip or ip6)"
+	PcapDefaultFilter = "(tcp or udp or icmp or icmp6) and (ip or ip6)"
 )
 
 const (

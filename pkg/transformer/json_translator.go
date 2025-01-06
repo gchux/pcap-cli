@@ -20,10 +20,12 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"regexp"
 	"strconv"
@@ -222,9 +224,9 @@ func (t *JSONPcapTranslator) translateIPv6Layer(ctx context.Context, ip6 *layers
 	L3.Set(ip6.SrcIP, "src")
 	L3.Set(ip6.DstIP, "dst")
 	L3.Set(ip6.Length, "len")
-	L3.Set(ip6.TrafficClass, "tclass")
-	L3.Set(ip6.FlowLabel, "flabel")
-	L3.Set(ip6.HopLimit, "hlimit")
+	L3.Set(ip6.TrafficClass, "cls")
+	L3.Set(ip6.FlowLabel, "lbl")
+	L3.Set(ip6.HopLimit, "ttl")
 
 	proto, _ := L3.Object("proto")
 	proto.Set(ip6.NextHeader, "num")
@@ -238,6 +240,155 @@ func (t *JSONPcapTranslator) translateIPv6Layer(ctx context.Context, ip6 *layers
 
 	// missing `HopByHop`: https://github.com/google/gopacket/blob/master/layers/ip6.go#L40
 	return json
+}
+
+func (t *JSONPcapTranslator) translateICMPv4Layer(ctx context.Context, icmp4 *layers.ICMPv4) fmt.Stringer {
+	// see: https://github.com/google/gopacket/blob/master/layers/icmp4.go#L208-L215
+
+	json := gabs.New()
+
+	ICMP4, _ := json.Object("ICMP")
+
+	ICMP4.Set(icmp4.TypeCode.Type(), "type")
+	ICMP4.Set(icmp4.TypeCode.Code(), "code")
+	ICMP4.Set(icmp4.Checksum, "xsum")
+
+	// see: https://github.com/google/gopacket/blob/master/layers/icmp4.go#L78-L153
+	ICMP4.Set(icmp4.TypeCode.String(), "str")
+
+	switch icmp4.TypeCode.Type() {
+	case layers.ICMPv4TypeEchoRequest, layers.ICMPv4TypeEchoReply:
+		ICMP4.Set(icmp4.Id, "id")
+		ICMP4.Set(icmp4.Seq, "seq")
+	case layers.ICMPv4TypeTimeExceeded, layers.ICMPv4TypeDestinationUnreachable, layers.ICMPv4TypeRedirect:
+		IPv4, _ := ICMP4.Object("IPv4")
+
+		// original IPv4 header starts from offset 8
+		// reference:
+		//   - https://en.wikipedia.org/wiki/Internet_Control_Message_Protocol#Time_exceeded
+		//   - https://en.wikipedia.org/wiki/Internet_Control_Message_Protocol#Destination_unreachable
+		ipHeader := icmp4.LayerPayload()
+
+		IPv4.Set(binary.BigEndian.Uint16(ipHeader[4:6]), "id")
+		IPv4.Set(uint8(ipHeader[8]), "ttl")
+		IPv4.Set(uint8(ipHeader[9]), "proto")
+		IPv4.Set(binary.BigEndian.Uint16(ipHeader[10:12]), "xsum")
+
+		var ipBytes [4]byte
+
+		copy(ipBytes[:], ipHeader[12:16])
+		srcIP := netip.AddrFrom4(ipBytes)
+		IPv4.Set(srcIP.String(), "src")
+
+		copy(ipBytes[:], ipHeader[16:20])
+		dstIP := netip.AddrFrom4(ipBytes)
+		IPv4.Set(dstIP.String(), "dst")
+
+		if icmp4.TypeCode.Type() == layers.ICMPv4TypeRedirect {
+			// see: https://github.com/google/gopacket/blob/master/layers/icmp4.go#L230
+			copy(ipBytes[:], icmp4.LayerContents()[4:8])
+			ICMP4.Set(netip.AddrFrom4(ipBytes).String(), "tgt")
+		}
+	}
+
+	return json
+}
+
+func (t *JSONPcapTranslator) translateICMPv6Layer(ctx context.Context, icmp6 *layers.ICMPv6) fmt.Stringer {
+	// see: https://github.com/google/gopacket/blob/master/layers/icmp6.go#L174-L183
+
+	json := gabs.New()
+
+	ICMP6, _ := json.Object("ICMP")
+
+	ICMP6.Set(icmp6.TypeCode.Type(), "type")
+	ICMP6.Set(icmp6.TypeCode.Code(), "code")
+	ICMP6.Set(icmp6.Checksum, "xsum")
+
+	ICMP6.Set(icmp6.TypeCode.String(), "str")
+
+	return json
+}
+
+func (t *JSONPcapTranslator) translateICMPv6EchoLayer(ctx context.Context, json fmt.Stringer, icmp6 *layers.ICMPv6Echo) fmt.Stringer {
+	// see: https://github.com/google/gopacket/blob/master/layers/icmp6msg.go#L57-L62
+
+	_json := t.asTranslation(json)
+
+	ICMP6 := _json.S("ICMP")
+
+	ICMP6.Set(icmp6.Identifier, "id")
+	ICMP6.Set(icmp6.SeqNumber, "seq")
+
+	return _json
+}
+
+func (t *JSONPcapTranslator) translateICMPv6RedirectLayer(ctx context.Context, json fmt.Stringer, icmp6 *layers.ICMPv6Redirect) fmt.Stringer {
+	// see: https://github.com/google/gopacket/blob/master/layers/icmp6msg.go#L97-L104
+
+	_json := t.asTranslation(json)
+
+	ICMP6 := _json.S("ICMP")
+
+	ICMP6.Set(icmp6.TargetAddress, "tgt")
+	ICMP6.Set(icmp6.DestinationAddress, "dst")
+
+	return _json
+}
+
+func (t *JSONPcapTranslator) translateICMPv6L3HeaderLayer(ctx context.Context, json fmt.Stringer, icmp6 *layers.ICMPv6) fmt.Stringer {
+	// see: https://github.com/google/gopacket/blob/master/layers/icmp6msg.go#L97-L104
+
+	_json := t.asTranslation(json)
+
+	ICMP6 := _json.S("ICMP")
+
+	IPv6, _ := ICMP6.Object("IPv6")
+
+	ipHeader := icmp6.LayerPayload()[4:]
+
+	// IPv6 header 1st 32 bits ( 4 bytes )
+	ipHeaderBytes0to3 := binary.BigEndian.Uint32(ipHeader[:4])
+
+	// Version: from bit 0 to 3 ( 4 bits )
+	//   - bin mask: 11110000000000000000000000000000
+	//   - hex mask: 0xF0000000
+	//   - must be shifted 28 positions to the right to discard `TrafficClass` (8 bits) and `FlowLabel` (20 bits)
+	version := ipHeaderBytes0to3 & uint32(0xF0000000) >> 28
+	IPv6.Set(version, "v")
+
+	// FlowLabel: from bit 12 to 31 ( 20 bits )
+	//   - bin mask: 00000000000011111111111111111111
+	//   - hex mask: 0xFFFFF
+	flowLabel := ipHeaderBytes0to3 & uint32(0x000FFFFF)
+	IPv6.Set(flowLabel, "lbl")
+
+	// TrafficClass: from bit 4 to 11 ( 6+2 bits )
+	//   - bin mask: 00001111111100000000000000000000
+	//   - hex mask: 0xFF00000
+	//   - must be shifted 20 positions to the right to discard `FlowLabel` bits
+	trafficClass := (ipHeaderBytes0to3 & uint32(0x0FF00000)) >> 20
+	// The six most-significant bits hold the differentiated services field
+	//   - DS field mask: `11111100` or `0xFC`
+	IPv6.Set((trafficClass&0xFC)>>2, "dsf")
+	// The remaining two bits are used for Explicit Congestion Notification
+	//   - ECN mask: `00000011` or `0x03`
+	IPv6.Set((trafficClass & 0x03), "ecn")
+
+	// HopLimit: 8 bits, 7th byte
+	IPv6.Set(uint32(ipHeader[7]), "ttl")
+
+	var ipBytes [16]byte
+
+	copy(ipBytes[:], ipHeader[8:24])
+	srcIP := netip.AddrFrom16(ipBytes)
+	IPv6.Set(srcIP.String(), "src")
+
+	copy(ipBytes[:], ipHeader[24:40])
+	dstIP := netip.AddrFrom16(ipBytes)
+	IPv6.Set(dstIP.String(), "dst")
+
+	return _json
 }
 
 func (t *JSONPcapTranslator) translateUDPLayer(ctx context.Context, udp *layers.UDP) fmt.Stringer {

@@ -65,6 +65,17 @@ var (
 			},
 		},
 		{ // L4
+			// ICMP layers
+			//   - ICMP is not a transport layer protocol, but if it is present
+			//   - then actual transport layer protocol translations are disabled;
+			//   - thus, TCP/UDP translations are causally dependant on the lack of ICMP.
+			func(ctx context.Context, w *pcapTranslatorWorker) fmt.Stringer {
+				return w.translateICMPv4Layer(ctx)
+			},
+			func(ctx context.Context, w *pcapTranslatorWorker) fmt.Stringer {
+				return w.translateICMPv6Layer(ctx)
+			},
+			// non-ICMP layers
 			func(ctx context.Context, w *pcapTranslatorWorker) fmt.Stringer {
 				return w.translateTCPLayer(ctx)
 			},
@@ -116,6 +127,23 @@ func (w *pcapTranslatorWorker) translateLayer(ctx context.Context, layer gopacke
 		return w.translator.translateTLSLayer(ctx, lType)
 	case *layers.DNS:
 		return w.translator.translateDNSLayer(ctx, lType)
+	case *layers.ICMPv4:
+		return w.translator.translateICMPv4Layer(ctx, lType)
+	case *layers.ICMPv6:
+		icmp6 := w.translator.translateICMPv6Layer(ctx, lType)
+		_l := w.asLayer(ctx, lType.NextLayerType())
+		switch _lType := _l.(type) {
+		default:
+			if lType.TypeCode.Type() == layers.ICMPv6TypeDestinationUnreachable ||
+				lType.TypeCode.Type() == layers.ICMPv6TypeTimeExceeded {
+				return w.translator.translateICMPv6L3HeaderLayer(ctx, icmp6, lType)
+			}
+			return icmp6
+		case *layers.ICMPv6Echo:
+			return w.translator.translateICMPv6EchoLayer(ctx, icmp6, _lType)
+		case *layers.ICMPv6Redirect:
+			return w.translator.translateICMPv6RedirectLayer(ctx, icmp6, _lType)
+		}
 	}
 }
 
@@ -129,6 +157,14 @@ func (w *pcapTranslatorWorker) translateIPv4Layer(ctx context.Context) fmt.Strin
 
 func (w *pcapTranslatorWorker) translateIPv6Layer(ctx context.Context) fmt.Stringer {
 	return w.translateLayer(ctx, layers.LayerTypeIPv6)
+}
+
+func (w *pcapTranslatorWorker) translateICMPv4Layer(ctx context.Context) fmt.Stringer {
+	return w.translateLayer(ctx, layers.LayerTypeICMPv4)
+}
+
+func (w *pcapTranslatorWorker) translateICMPv6Layer(ctx context.Context) fmt.Stringer {
+	return w.translateLayer(ctx, layers.LayerTypeICMPv6)
 }
 
 func (w *pcapTranslatorWorker) translateUDPLayer(ctx context.Context) fmt.Stringer {
@@ -200,6 +236,10 @@ func (w *pcapTranslatorWorker) Run(ctx context.Context) (buffer interface{}) {
 		close(translations)
 	}(&wg)
 
+	// O(N*M)
+	//   - N: layers
+	//   - M: protocols
+	// [ToDo]: implement as a `Map` to translate layers+protocols to translation in O(1)
 	for i, translators := range packetLayerTranslators {
 		// translate layers concurrently:
 		//   - layers must know nothing about each other
