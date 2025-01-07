@@ -313,8 +313,8 @@ func (w *pcapTranslatorWorker) Run(ctx context.Context) (buffer interface{}) {
 		go func(index int, layer gopacket.Layer, wg *sync.WaitGroup) {
 			defer func(index int, layer gopacket.Layer, wg *sync.WaitGroup) {
 				if r := recover(); r != nil {
-					transformerLogger.Printf("%s @translator[%d][%s] | panic: %s\n%s\n",
-						*w.loggerPrefix, index, layer.LayerType().String(), r, string(debug.Stack()))
+					transformerLogger.Printf("%s @%s[%d] | panic: %s\n%s\n",
+						*w.loggerPrefix, layer.LayerType().String(), index, r, string(debug.Stack()))
 					buffer = nil
 				}
 				wg.Done()
@@ -323,10 +323,13 @@ func (w *pcapTranslatorWorker) Run(ctx context.Context) (buffer interface{}) {
 			if translator, ok := packetLayerTranslatorsMap[layer.LayerType()]; ok {
 				if t := translator(ctx, w, false /* deep */); t != nil {
 					translations <- t
-				} else if layer.LayerType() != gopacket.LayerTypePayload {
-					transformerLogger.Printf("%s @translator[%d][%s] | not found",
+				} else {
+					transformerLogger.Printf("%s @translator[%d][%s] | unavailable",
 						*w.loggerPrefix, index, layer.LayerType().String())
 				}
+			} else if layer.LayerType() != gopacket.LayerTypePayload {
+				transformerLogger.Printf("%s @translator[%d][%s] | not found",
+					*w.loggerPrefix, index, layer.LayerType().String())
 			}
 		}(i, l, &wg)
 	}

@@ -324,9 +324,12 @@ func (t *JSONPcapTranslator) asICMPv6(
 	if json == nil {
 		json = gabs.New()
 		ICMPv6, _ = json.Object("ICMP")
-	} else {
+	} else if json.Exists("ICMP") {
 		ICMPv6 = json.S("ICMP")
+	} else {
+		ICMPv6, _ = json.Object("ICMP")
 	}
+
 	return json, ICMPv6
 }
 
@@ -379,23 +382,24 @@ func (t *JSONPcapTranslator) translateICMPv6L3HeaderLayer(
 
 	// FlowLabel: from bit 12 to 31 ( 20 bits )
 	//   - bin mask: 00000000000011111111111111111111
-	//   - hex mask: 0xFFFFF
+	//   - hex mask: 0x000FFFFF
 	flowLabel := ipHeaderBytes0to3 & uint32(0x000FFFFF)
 	IPv6.Set(flowLabel, "lbl")
 
 	// TrafficClass: from bit 4 to 11 ( 6+2 bits )
 	//   - bin mask: 00001111111100000000000000000000
-	//   - hex mask: 0xFF00000
+	//   - hex mask: 0x0FF00000
 	//   - must be shifted 20 positions to the right to discard `FlowLabel` bits
 	trafficClass := (ipHeaderBytes0to3 & uint32(0x0FF00000)) >> 20
 	// The six most-significant bits hold the differentiated services field
 	//   - DS field mask: `11111100` or `0xFC`
+	//   - must be shifted 2 bits to the right to remove bits from ECN
 	IPv6.Set((trafficClass&0xFC)>>2, "dsf")
 	// The remaining two bits are used for Explicit Congestion Notification
 	//   - ECN mask: `00000011` or `0x03`
 	IPv6.Set((trafficClass & 0x03), "ecn")
 
-	// HopLimit: 8 bits, 7th byte
+	// HopLimit (aka TTL): 8 bits, 7th byte
 	IPv6.Set(uint32(ipHeader[7]), "ttl")
 
 	var ipBytes [16]byte
@@ -407,6 +411,16 @@ func (t *JSONPcapTranslator) translateICMPv6L3HeaderLayer(
 	copy(ipBytes[:], ipHeader[24:40])
 	dstIP := netip.AddrFrom16(ipBytes)
 	IPv6.Set(dstIP.String(), "dst")
+
+	nextHeader := uint8(ipHeader[6])
+	switch nextHeader {
+	default:
+		IPv6.Set(nextHeader, "proto")
+	case 0x06: // TCP
+		IPv6.Set("TCP", "proto")
+	case 0x11: // UDP
+		IPv6.Set("UDP", "proto")
+	}
 
 	return _json
 }
