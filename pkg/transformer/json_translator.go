@@ -143,6 +143,9 @@ func (t *JSONPcapTranslator) next(
 }
 
 func (t *JSONPcapTranslator) asTranslation(buffer fmt.Stringer) *gabs.Container {
+	if buffer == nil {
+		return nil
+	}
 	return buffer.(*gabs.Container)
 }
 
@@ -310,12 +313,29 @@ func (t *JSONPcapTranslator) translateICMPv6Layer(ctx context.Context, icmp6 *la
 	return json
 }
 
-func (t *JSONPcapTranslator) translateICMPv6EchoLayer(ctx context.Context, json fmt.Stringer, icmp6 *layers.ICMPv6Echo) fmt.Stringer {
+func (t *JSONPcapTranslator) asICMPv6(
+	ctx context.Context,
+	buffer fmt.Stringer,
+) (*gabs.Container, *gabs.Container) {
+	var ICMPv6 *gabs.Container
+
+	json := t.asTranslation(buffer)
+
+	if json == nil {
+		json = gabs.New()
+		ICMPv6, _ = json.Object("ICMP")
+	} else {
+		ICMPv6 = json.S("ICMP")
+	}
+	return json, ICMPv6
+}
+
+func (t *JSONPcapTranslator) translateICMPv6EchoLayer(
+	ctx context.Context, json fmt.Stringer, icmp6 *layers.ICMPv6Echo,
+) fmt.Stringer {
 	// see: https://github.com/google/gopacket/blob/master/layers/icmp6msg.go#L57-L62
 
-	_json := t.asTranslation(json)
-
-	ICMP6 := _json.S("ICMP")
+	_json, ICMP6 := t.asICMPv6(ctx, json)
 
 	ICMP6.Set(icmp6.Identifier, "id")
 	ICMP6.Set(icmp6.SeqNumber, "seq")
@@ -323,12 +343,12 @@ func (t *JSONPcapTranslator) translateICMPv6EchoLayer(ctx context.Context, json 
 	return _json
 }
 
-func (t *JSONPcapTranslator) translateICMPv6RedirectLayer(ctx context.Context, json fmt.Stringer, icmp6 *layers.ICMPv6Redirect) fmt.Stringer {
+func (t *JSONPcapTranslator) translateICMPv6RedirectLayer(
+	ctx context.Context, json fmt.Stringer, icmp6 *layers.ICMPv6Redirect,
+) fmt.Stringer {
 	// see: https://github.com/google/gopacket/blob/master/layers/icmp6msg.go#L97-L104
 
-	_json := t.asTranslation(json)
-
-	ICMP6 := _json.S("ICMP")
+	_json, ICMP6 := t.asICMPv6(ctx, json)
 
 	ICMP6.Set(icmp6.TargetAddress, "tgt")
 	ICMP6.Set(icmp6.DestinationAddress, "dst")
@@ -336,12 +356,12 @@ func (t *JSONPcapTranslator) translateICMPv6RedirectLayer(ctx context.Context, j
 	return _json
 }
 
-func (t *JSONPcapTranslator) translateICMPv6L3HeaderLayer(ctx context.Context, json fmt.Stringer, icmp6 *layers.ICMPv6) fmt.Stringer {
+func (t *JSONPcapTranslator) translateICMPv6L3HeaderLayer(
+	ctx context.Context, json fmt.Stringer, icmp6 *layers.ICMPv6,
+) fmt.Stringer {
 	// see: https://github.com/google/gopacket/blob/master/layers/icmp6msg.go#L97-L104
 
-	_json := t.asTranslation(json)
-
-	ICMP6 := _json.S("ICMP")
+	_json, ICMP6 := t.asICMPv6(ctx, json)
 
 	IPv6, _ := ICMP6.Object("IPv6")
 
