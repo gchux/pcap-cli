@@ -58,7 +58,7 @@ type (
 const (
 	jsonTranslationSummary          = "#:{serial} | @:{ifaceIndex}/{ifaceName} | flow:{flowID} | "
 	jsonTranslationSummaryWithoutL4 = jsonTranslationSummary + "{L3Src} > {L3Dst}"
-	jsonTranslationSummaryICMP      = jsonTranslationSummary + "ICMPv{icmpVersion} | {icmpMessage} | {L3Src} > {L3Dst}"
+	jsonTranslationSummaryICMP      = jsonTranslationSummary + "ICMPv{icmpVersion} | {L3Src} > {L3Dst} | {icmpMessage}"
 	jsonTranslationSummaryUDP       = jsonTranslationSummary + "{L4Proto} | {srcProto}/{L3Src}:{L4Src} > {dstProto}/{L3Dst}:{L4Dst}"
 	jsonTranslationSummaryTCP       = jsonTranslationSummaryUDP + " | [{tcpFlags}] | len/seq/ack:{tcpLen}/{tcpSeq}/{tcpAck}"
 	jsonTranslationFlowTemplate     = "{0}/iface/{1}/flow/{2}:{3}"
