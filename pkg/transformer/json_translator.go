@@ -58,6 +58,7 @@ type (
 const (
 	jsonTranslationSummary          = "#:{serial} | @:{ifaceIndex}/{ifaceName} | flow:{flowID} | "
 	jsonTranslationSummaryWithoutL4 = jsonTranslationSummary + "{L3Src} > {L3Dst}"
+	jsonTranslationSummaryICMP      = jsonTranslationSummary + "ICMPv{icmpVersion} | {icmpMessage} | {L3Src} > {L3Dst}"
 	jsonTranslationSummaryUDP       = jsonTranslationSummary + "{L4Proto} | {srcProto}/{L3Src}:{L4Src} > {dstProto}/{L3Dst}:{L4Dst}"
 	jsonTranslationSummaryTCP       = jsonTranslationSummaryUDP + " | [{tcpFlags}] | len/seq/ack:{tcpLen}/{tcpSeq}/{tcpAck}"
 	jsonTranslationFlowTemplate     = "{0}/iface/{1}/flow/{2}:{3}"
@@ -257,7 +258,7 @@ func (t *JSONPcapTranslator) translateICMPv4Layer(ctx context.Context, icmp4 *la
 	ICMP4.Set(icmp4.Checksum, "xsum")
 
 	// see: https://github.com/google/gopacket/blob/master/layers/icmp4.go#L78-L153
-	ICMP4.Set(icmp4.TypeCode.String(), "str")
+	ICMP4.Set(icmp4.TypeCode.String(), "msg")
 
 	switch icmp4.TypeCode.Type() {
 	case layers.ICMPv4TypeEchoRequest, layers.ICMPv4TypeEchoReply:
@@ -308,7 +309,7 @@ func (t *JSONPcapTranslator) translateICMPv6Layer(ctx context.Context, icmp6 *la
 	ICMP6.Set(icmp6.TypeCode.Code(), "code")
 	ICMP6.Set(icmp6.Checksum, "xsum")
 
-	ICMP6.Set(icmp6.TypeCode.String(), "str")
+	ICMP6.Set(icmp6.TypeCode.String(), "msg")
 
 	return json
 }
@@ -773,29 +774,31 @@ func (t *JSONPcapTranslator) finalize(
 
 	data["serial"] = *serial
 
-	l3Src, _ := json.Path("L3.src").Data().(net.IP)
+	l3Src, _ := json.S("L3", "src").Data().(net.IP)
 	data["L3Src"] = l3Src
-	l3Dst, _ := json.Path("L3.dst").Data().(net.IP)
+	l3Dst, _ := json.S("L3", "dst").Data().(net.IP)
 	data["L3Dst"] = l3Dst
 
 	isSrcLocal := iface.Addrs.Contains(l3Src.String())
 
-	proto := json.Path("L3.proto.num").Data().(layers.IPProtocol)
+	proto := json.S("L3", "proto", "num").Data().(layers.IPProtocol)
 	isTCP := proto == layers.IPProtocolTCP
 	isUDP := proto == layers.IPProtocolUDP
+	isICMPv4 := proto == layers.IPProtocolICMPv4
+	isICMPv6 := proto == layers.IPProtocolICMPv6
 
 	// `flowID` is the unique ID of this conversation:
 	// given by the 6-tuple: iface_index+protocol+src_ip+src_port+dst_ip+dst_port.
 	// Addition is commutative, so after hashing `net.IP` bytes and L4 ports to `uint64`,
 	// the same `uint64`/`flowID` is produced after adding everything up, no matter the order.
 	// Using the same `flowID` will produce grouped logs in Cloud Logging.
-	flowIDstr, _ := json.Path("meta.flow").Data().(string) // this is always available
+	flowIDstr, _ := json.S("meta", "flow").Data().(string) // this is always available
 	flowID, _ := strconv.ParseUint(flowIDstr, 10, 64)
-	if l3FlowIDstr, l3OK := json.Path("L3.flow").Data().(string); l3OK {
+	if l3FlowIDstr, l3OK := json.S("L3", "flow").Data().(string); l3OK {
 		l3FlowID, _ := strconv.ParseUint(l3FlowIDstr, 10, 64)
 		flowID = fnv1a.AddUint64(flowID, l3FlowID)
 	}
-	if l4FlowIDstr, l4OK := json.Path("L4.flow").Data().(string); l4OK {
+	if l4FlowIDstr, l4OK := json.S("L4", "flow").Data().(string); l4OK {
 		l4FlowID, _ := strconv.ParseUint(l4FlowIDstr, 10, 64)
 		flowID = fnv1a.AddUint64(flowID, l4FlowID)
 	} else {
@@ -807,22 +810,34 @@ func (t *JSONPcapTranslator) finalize(
 	json.Set(flowIDstr, "flow")
 
 	if !isTCP && !isUDP {
+		if isICMPv4 || isICMPv6 {
+			if isICMPv6 {
+				data["icmpVersion"] = 6
+			} else {
+				data["icmpVersion"] = 4
+			}
+			data["icmpMessage"] = json.S("ICMP", "msg").Data().(string)
+			operation.Set(stringFormatter.Format(jsonTranslationFlowTemplate, id, t.iface.Name, "icmp", flowIDstr), "id")
+			json.Set(stringFormatter.FormatComplex(jsonTranslationSummaryICMP, data), "message")
+			return json, nil
+		}
+
 		operation.Set(stringFormatter.Format(jsonTranslationFlowTemplate, id, t.iface.Name, "x", flowIDstr), "id")
 		json.Set(stringFormatter.FormatComplex(jsonTranslationSummaryWithoutL4, data), "message")
 		return json, nil
 	}
 
-	l4SrcProto, _ := json.Path("L4.sproto").Data().(string)
+	l4SrcProto, _ := json.S("L4", "sproto").Data().(string)
 	data["srcProto"] = l4SrcProto
 
-	l4DstProto, _ := json.Path("L4.dproto").Data().(string)
+	l4DstProto, _ := json.S("L4", "dproto").Data().(string)
 	data["dstProto"] = l4DstProto
 
 	if isUDP {
 		data["L4Proto"] = "UDP"
-		srcPort, _ := json.Path("L4.src").Data().(layers.UDPPort)
+		srcPort, _ := json.S("L4", "src").Data().(layers.UDPPort)
 		data["L4Src"] = uint16(srcPort)
-		dstPort, _ := json.Path("L4.dst").Data().(layers.UDPPort)
+		dstPort, _ := json.S("L4", "dst").Data().(layers.UDPPort)
 		data["L4Dst"] = uint16(dstPort)
 
 		isSrcLocal = isSrcLocal && !t.ephemerals.isEphemeralUDPPort(&srcPort)
@@ -834,19 +849,19 @@ func (t *JSONPcapTranslator) finalize(
 	}
 
 	data["L4Proto"] = "TCP"
-	srcPort, _ := json.Path("L4.src").Data().(layers.TCPPort)
+	srcPort, _ := json.S("L4", "src").Data().(layers.TCPPort)
 	data["L4Src"] = uint16(srcPort)
-	dstPort, _ := json.Path("L4.dst").Data().(layers.TCPPort)
+	dstPort, _ := json.S("L4", "dst").Data().(layers.TCPPort)
 	data["L4Dst"] = uint16(dstPort)
 
-	setFlags, _ := json.Path("L4.flags.dec").Data().(uint8)
-	data["tcpFlags"] = json.Path("L4.flags.str").Data().(string)
+	setFlags, _ := json.S("L4", "flags", "dec").Data().(uint8)
+	data["tcpFlags"] = json.S("L4", "flags", "str").Data().(string)
 
-	seq, _ := json.Path("L4.seq").Data().(uint32)
+	seq, _ := json.S("L4", "seq").Data().(uint32)
 	data["tcpSeq"] = seq
-	ack, _ := json.Path("L4.ack").Data().(uint32)
+	ack, _ := json.S("L4d", "ack").Data().(uint32)
 	data["tcpAck"] = ack
-	tcpLen, _ := json.Path("L4.len").Data().(string)
+	tcpLen, _ := json.S("L4", "len").Data().(string)
 	data["tcpLen"] = tcpLen
 
 	operation.Set(stringFormatter.Format(jsonTranslationFlowTemplate, id, t.iface.Name, "tcp", flowIDstr), "id")
