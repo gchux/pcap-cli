@@ -27,6 +27,7 @@ import (
 
 type (
 	pcapTranslatorWorker struct {
+		ifaces       netIfaceIndex
 		iface        *PcapIface
 		serial       *uint64
 		packet       *gopacket.Packet
@@ -374,7 +375,7 @@ func (w *pcapTranslatorWorker) Run(ctx context.Context) (buffer interface{}) {
 		transformerLogger.Printf("%s @translator | incomplete", *w.loggerPrefix)
 	default:
 		// `finalize` is the only method that works across layers
-		_buffer, _ = w.translator.finalize(ctx, w.iface, w.serial, w.packet, w.conntrack, _buffer)
+		_buffer, _ = w.translator.finalize(ctx, w.ifaces, w.iface, w.serial, w.packet, w.conntrack, _buffer)
 	}
 
 	buffer = &_buffer
@@ -382,6 +383,7 @@ func (w *pcapTranslatorWorker) Run(ctx context.Context) (buffer interface{}) {
 }
 
 func newPcapTranslatorWorker(
+	ifaces netIfaceIndex,
 	iface *PcapIface,
 	serial *uint64,
 	packet *gopacket.Packet,
@@ -391,6 +393,7 @@ func newPcapTranslatorWorker(
 	loggerPrefix := fmt.Sprintf("[%d/%s] - #:%d |", iface.Index, iface.Name, *serial)
 
 	worker := &pcapTranslatorWorker{
+		ifaces:       ifaces,
 		iface:        iface,
 		serial:       serial,
 		packet:       packet,

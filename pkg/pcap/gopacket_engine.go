@@ -21,6 +21,7 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -105,24 +106,37 @@ func (p *Pcap) Start(
 	debug := cfg.Debug
 
 	device := cfg.Device
-	addrs := mapset.NewSetWithSize[string](len(device.Addresses))
-	for _, addr := range device.Addresses {
-		addrs.Add(addr.IP.String())
-	}
-	iface := &transformer.PcapIface{
-		Index: device.NetInterface.Index,
-		Name:  device.Name,
-		Addrs: addrs,
+	var iface *transformer.PcapIface
+	if device != nil {
+		// `device` is not safe to use outside this branch
+		addrs := mapset.NewSetWithSize[string](len(device.Addresses))
+		for _, addr := range device.Addresses {
+			// [ToDo]: use `net.IP` instead of `string`
+			addrs.Add(addr.IP.String())
+		}
+		iface = &transformer.PcapIface{
+			Index: uint8(device.NetInterface.Index),
+			Name:  device.Name,
+			Addrs: addrs,
+		}
+	} else {
+		iface = &transformer.PcapIface{
+			Index: any_devide_index,
+			Name:  any_device_name,
+			Addrs: mapset.NewThreadUnsafeSetWithSize[string](0),
+		}
 	}
 
-	loggerPrefix := fmt.Sprintf("[%d/%s]", device.NetInterface.Index, device.Name)
+	loggerPrefix := fmt.Sprintf("[%d/%s]", iface.Index, iface.Name)
 
-	// set packet capture filter; i/e: `tcp port 443`
-	filter := providePcapFilter(ctx, &cfg.Filter, cfg.Filters)
-	if *filter != "" {
-		if err = handle.SetBPFFilter(*filter); err != nil {
-			gopacketLogger.Printf("%s - BPF filter error: [%s] => %+v\n", loggerPrefix, *filter, err)
-			return fmt.Errorf("BPF filter error: %s", err)
+	if iface.Index != any_devide_index {
+		// set packet capture filter; i/e: `tcp port 443`
+		if filter := providePcapFilter(ctx, &cfg.Filter, cfg.Filters); *filter != "" {
+			if err = handle.SetBPFFilter(*filter); err != nil {
+				gopacketLogger.Printf("%s - BPF filter error: [%s] => %+v\n", loggerPrefix, *filter, err)
+				return fmt.Errorf("BPF filter error: %s", err)
+			}
+			gopacketLogger.Printf("%s - starting packet capture | filter: %s\n", loggerPrefix, *filter)
 		}
 	}
 
@@ -151,8 +165,6 @@ func (p *Pcap) Start(
 	if err != nil {
 		return fmt.Errorf("invalid format: %s", err)
 	}
-
-	gopacketLogger.Printf("%s - starting packet capture | filter: %s\n", loggerPrefix, *filter)
 
 	var packetsCounter atomic.Uint64
 	var ctxDoneTS time.Time
@@ -207,9 +219,13 @@ func NewPcap(config *PcapConfig) (PcapEngine, error) {
 
 	pcap := Pcap{config: config, isActive: &isActive}
 
-	devices, err := FindDevicesByName(&config.Iface)
-	if err == nil {
-		config.Device = devices[0]
+	if strings.EqualFold(config.Iface, any_device_name) {
+		config.Device = nil
+	} else {
+		devices, err := FindDevicesByName(&config.Iface)
+		if err == nil {
+			config.Device = devices[0]
+		}
 	}
 
 	return &pcap, nil

@@ -20,9 +20,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"regexp"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -56,14 +58,17 @@ type (
 		translateTLSLayer(context.Context, *layers.TLS) fmt.Stringer
 		translateDNSLayer(context.Context, *layers.DNS) fmt.Stringer
 		merge(context.Context, fmt.Stringer, fmt.Stringer) (fmt.Stringer, error)
-		finalize(context.Context, *PcapIface, *uint64, *gopacket.Packet, bool, fmt.Stringer) (fmt.Stringer, error)
+		finalize(context.Context, netIfaceIndex, *PcapIface, *uint64, *gopacket.Packet, bool, fmt.Stringer) (fmt.Stringer, error)
 		write(context.Context, io.Writer, *fmt.Stringer) (int, error)
 		done(context.Context)
 	}
 
+	netIfaceIndex map[string]*PcapIface
+
 	PcapTransformer struct {
 		ctx             context.Context
 		iface           *PcapIface
+		ifaces          netIfaceIndex
 		ephemerals      *PcapEmphemeralPorts
 		loggerPrefix    *string
 		ich             chan concurrently.WorkFunction
@@ -94,7 +99,7 @@ type (
 	}
 
 	PcapIface struct {
-		Index int
+		Index uint8
 		Name  string
 		Addrs mapset.Set[string]
 	}
@@ -455,7 +460,7 @@ func (t *PcapTransformer) Apply(ctx context.Context, packet *gopacket.Packet, se
 	}
 	// It is assumed that packets will be produced faster than translations and writing operations, so:
 	//   - process/translate packets concurrently in order to avoid blocking `gopacket` packets channel as much as possible.
-	worker := newPcapTranslatorWorker(t.iface, serial, packet, t.translator, t.connTracking)
+	worker := newPcapTranslatorWorker(t.ifaces, t.iface, serial, packet, t.translator, t.connTracking)
 	return t.apply(worker)
 }
 
@@ -644,12 +649,43 @@ func newTransformer(
 		writeQueuesDone[i] = make(chan struct{})
 	}
 
+	// inverted index from `net.Address` to `PcapInterface`
+	//   - will allow to find the correct interface in O(1) when the selected interface is `0/any`
+	var ifaces netIfaceIndex = make(map[string]*PcapIface)
+	if _ifaces, err := net.Interfaces(); err == nil {
+		// O(N*M): we must visit all interfaces to get all available IPs
+		//   - N: is the number of interfaces
+		//   - M: is the number of IPs per interface
+		for _, _iface := range _ifaces {
+
+			_addrs, err := _iface.Addrs()
+			if err != nil {
+				continue
+			}
+
+			pcapIface := &PcapIface{
+				Index: uint8(_iface.Index),
+				Name:  _iface.Name,
+				Addrs: mapset.NewSetWithSize[string](len(_addrs)),
+			}
+
+			// O(M): M is the number of IPs assigned to this interface
+			for _, _addr := range _addrs {
+				addr := strings.SplitN(_addr.String(), "/", 2)[0]
+				pcapIface.Addrs.Add(addr)
+				ifaces[addr] = pcapIface
+			}
+
+		}
+	}
+
 	// same transformer, multiple strategies
 	// via multiple translator implementations
 	transformer := &PcapTransformer{
 		wg:              new(sync.WaitGroup),
 		ctx:             ctx,
 		iface:           iface,
+		ifaces:          ifaces,
 		ephemerals:      ephemerals,
 		loggerPrefix:    &loggerPrefix,
 		translator:      translator,

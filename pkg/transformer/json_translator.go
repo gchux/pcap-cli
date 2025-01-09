@@ -122,12 +122,13 @@ func (t *JSONPcapTranslator) next(
 	timestamp.Set(info.Timestamp.Unix(), "seconds")
 	timestamp.Set(info.Timestamp.Nanosecond(), "nanos")
 
+	netIface := *nic
 	iface, _ := json.Object("iface")
-	iface.Set(nic.Index, "index")
-	iface.Set(nic.Name, "name")
+	iface.Set(netIface.Index, "index")
+	iface.Set(netIface.Name, "name")
 	if sizeOfAddrs := nic.Addrs.Cardinality(); sizeOfAddrs > 0 {
 		addrs, _ := iface.ArrayOfSize(sizeOfAddrs, "addrs")
-		nic.Addrs.Each(func(IP string) bool {
+		netIface.Addrs.Each(func(IP string) bool {
 			sizeOfAddrs -= 1
 			addrs.SetIndex(IP, sizeOfAddrs)
 			return false
@@ -161,7 +162,10 @@ func (t *JSONPcapTranslator) translateEthernetLayer(ctx context.Context, eth *la
 	return json
 }
 
-func (t *JSONPcapTranslator) addEndpoints(json *gabs.Container, flow *gopacket.Flow) {
+func (t *JSONPcapTranslator) addEndpoints(
+	json *gabs.Container,
+	flow *gopacket.Flow,
+) {
 	flows, _ := json.Object("endpoints")
 
 	flows.Set(flow.Src().String(), "src")
@@ -171,7 +175,10 @@ func (t *JSONPcapTranslator) addEndpoints(json *gabs.Container, flow *gopacket.F
 	flows.Set(strconv.FormatUint(flow.FastHash(), 10), "hash")
 }
 
-func (t *JSONPcapTranslator) translateIPv4Layer(ctx context.Context, ip4 *layers.IPv4) fmt.Stringer {
+func (t *JSONPcapTranslator) translateIPv4Layer(
+	ctx context.Context,
+	ip4 *layers.IPv4,
+) fmt.Stringer {
 	json := gabs.New()
 
 	// https://github.com/google/gopacket/blob/master/layers/ip4.go#L43
@@ -214,7 +221,10 @@ func (t *JSONPcapTranslator) translateIPv4Layer(ctx context.Context, ip4 *layers
 	return json
 }
 
-func (t *JSONPcapTranslator) translateIPv6Layer(ctx context.Context, ip6 *layers.IPv6) fmt.Stringer {
+func (t *JSONPcapTranslator) translateIPv6Layer(
+	ctx context.Context,
+	ip6 *layers.IPv6,
+) fmt.Stringer {
 	json := gabs.New()
 
 	// https://github.com/google/gopacket/blob/master/layers/ip6.go#L28-L43
@@ -750,6 +760,7 @@ func (t *JSONPcapTranslator) merge(ctx context.Context, tgt fmt.Stringer, src fm
 //   - the summary line at {`message`: $summary}
 func (t *JSONPcapTranslator) finalize(
 	ctx context.Context,
+	ifaces netIfaceIndex,
 	iface *PcapIface,
 	serial *uint64,
 	p *gopacket.Packet,
@@ -778,6 +789,9 @@ func (t *JSONPcapTranslator) finalize(
 	data["L3Src"] = l3Src
 	l3Dst, _ := json.S("L3", "dst").Data().(net.IP)
 	data["L3Dst"] = l3Dst
+
+	// report complete interface details when capturing for `any` interface
+	t.checkL3Address(ctx, json, ifaces, iface, l3Src, l3Dst)
 
 	isSrcLocal := iface.Addrs.Contains(l3Src.String())
 
@@ -906,6 +920,42 @@ func (t *JSONPcapTranslator) finalize(
 	json.Set(lockLatency.String(), "ll")
 
 	return json, nil
+}
+
+func (t *JSONPcapTranslator) checkL3Address(
+	ctx context.Context,
+	json *gabs.Container,
+	ifaces netIfaceIndex,
+	iface *PcapIface,
+	srcIP, dstIP net.IP,
+) {
+	if iface.Index != 0 {
+		return
+	}
+
+	// O(1) interface lookups by IP
+	_iface, ok := ifaces[srcIP.String()]
+	if !ok {
+		_iface, ok = ifaces[dstIP.String()]
+	}
+
+	if !ok {
+		// this should never happen
+		return
+	}
+
+	ifaceJSON := json.S("iface")
+	ifaceJSON.Set(_iface.Index, "index")
+	ifaceJSON.Set(_iface.Name, "name")
+
+	if sizeOfAddrs := _iface.Addrs.Cardinality(); sizeOfAddrs > 0 {
+		addrs, _ := ifaceJSON.ArrayOfSize(sizeOfAddrs, "addrs")
+		_iface.Addrs.Each(func(IP string) bool {
+			sizeOfAddrs -= 1
+			addrs.SetIndex(IP, sizeOfAddrs)
+			return false
+		})
+	}
 }
 
 func (t *JSONPcapTranslator) analyzeConnection(

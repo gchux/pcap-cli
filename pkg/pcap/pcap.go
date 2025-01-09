@@ -106,6 +106,12 @@ const (
 	PCAP_MAX_EPHEMERAL_PORT uint16 = 0xFFFF // 65535 ( Linux: 60999 / 0xEE47 )
 )
 
+const (
+	// see: https://github.com/google/gopacket/blob/master/pcap/pcap.go#L802-L808
+	any_device_name  string = "any"
+	any_devide_index uint8  = 0
+)
+
 func providePcapFilter(
 	ctx context.Context,
 	filter *string,
