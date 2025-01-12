@@ -171,23 +171,18 @@ func (p *Pcap) Start(
 		return fmt.Errorf("invalid format: %s", err)
 	}
 
-	var packetsCounter atomic.Uint64
-	serial := uint64(0)
-
-	firstPacket, err := source.NextPacket()
-	if err == nil && firstPacket != nil {
+	if firstPacket, err := source.NextPacket(); err == nil && firstPacket != nil {
+		serial := uint64(1)
 		if err = p.fn.Apply(ctx, &firstPacket, &serial); err != nil {
-			gopacketLogger.Printf("%s - #:%d | failed to translate 1st packet: %v\n", loggerPrefix, 1, err)
-		} else {
-			gopacketLogger.Printf("%s - translated 1st packet\n", loggerPrefix)
+			gopacketLogger.Printf("%s - #:0 | failed to translate 1st packet: %v\n", loggerPrefix, err)
 		}
-		serial = packetsCounter.Add(1)
 	} else {
-		gopacketLogger.Printf("%s - #:%d | error: %v\n", loggerPrefix, 1, err)
+		gopacketLogger.Printf("%s - #:0 | error: %v\n", loggerPrefix, err)
 	}
 
 	gopacketLogger.Printf("%s - translating packets\n", loggerPrefix)
 
+	var packetsCounter atomic.Uint64
 	var ctxDoneTS time.Time
 	for p.isActive.Load() {
 		select {
@@ -198,7 +193,7 @@ func (p *Pcap) Start(
 			}
 
 		case packet := <-source.Packets():
-			serial = packetsCounter.Add(1)
+			serial := packetsCounter.Add(1)
 			// non-blocking operation
 			if err = p.fn.Apply(ctx, &packet, &serial); err != nil && p.isActive.Load() {
 				gopacketLogger.Printf("%s - #:%d | failed to translate: %v\n", loggerPrefix, serial, err)
