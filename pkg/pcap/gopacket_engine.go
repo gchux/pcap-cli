@@ -95,11 +95,13 @@ func (p *Pcap) Start(
 	if err != nil {
 		return err
 	}
+	defer inactiveHandle.CleanUp()
 
 	if handle, err = inactiveHandle.Activate(); err != nil {
 		p.isActive.Store(false)
 		return fmt.Errorf("failed to activate: %s", err)
 	}
+	defer handle.Close()
 	p.activeHandle = handle
 
 	cfg := *p.config
@@ -136,13 +138,16 @@ func (p *Pcap) Start(
 				gopacketLogger.Printf("%s - BPF filter error: [%s] => %+v\n", loggerPrefix, *filter, err)
 				return fmt.Errorf("BPF filter error: %s", err)
 			}
-			gopacketLogger.Printf("%s - starting packet capture | filter: %s\n", loggerPrefix, *filter)
+			gopacketLogger.Printf("%s - filter: %s\n", loggerPrefix, *filter)
 		}
 	}
+
+	gopacketLogger.Printf("%s - starting packet capture\n", loggerPrefix)
 
 	source := gopacket.NewPacketSource(handle, handle.LinkType())
 	source.Lazy = false
 	source.NoCopy = true
+	source.SkipDecodeRecovery = false
 	source.DecodeStreamsAsDatagrams = true
 
 	// `io.Writer` is what `fmt.Fprintf` requires
@@ -167,6 +172,22 @@ func (p *Pcap) Start(
 	}
 
 	var packetsCounter atomic.Uint64
+	serial := uint64(0)
+
+	firstPacket, err := source.NextPacket()
+	if err == nil && firstPacket != nil {
+		if err = p.fn.Apply(ctx, &firstPacket, &serial); err != nil {
+			gopacketLogger.Printf("%s - #:%d | failed to translate 1st packet: %v\n", loggerPrefix, 1, err)
+		} else {
+			gopacketLogger.Printf("%s - translated 1st packet\n", loggerPrefix)
+		}
+		serial = packetsCounter.Add(1)
+	} else {
+		gopacketLogger.Printf("%s - #:%d | error: %v\n", loggerPrefix, 1, err)
+	}
+
+	gopacketLogger.Printf("%s - translating packets\n", loggerPrefix)
+
 	var ctxDoneTS time.Time
 	for p.isActive.Load() {
 		select {
@@ -174,19 +195,18 @@ func (p *Pcap) Start(
 			if p.isActive.CompareAndSwap(true, false) {
 				ctxDoneTS = time.Now()
 				gopacketLogger.Printf("%s - stopping packet capture\n", loggerPrefix)
-				inactiveHandle.CleanUp()
-				handle.Close()
-				gopacketLogger.Printf("%s - raw sockets closed\n", loggerPrefix)
 			}
 
 		case packet := <-source.Packets():
-			serial := packetsCounter.Add(1)
+			serial = packetsCounter.Add(1)
 			// non-blocking operation
-			if err := p.fn.Apply(ctx, &packet, &serial); err != nil && p.isActive.Load() {
+			if err = p.fn.Apply(ctx, &packet, &serial); err != nil && p.isActive.Load() {
 				gopacketLogger.Printf("%s - #:%d | failed to translate: %v\n", loggerPrefix, serial, err)
 			}
 		}
 	}
+
+	gopacketLogger.Printf("%s - stopping packet capture\n", loggerPrefix)
 
 	engineStopDeadline := <-stopDeadline
 	deadline := *engineStopDeadline - time.Since(ctxDoneTS)

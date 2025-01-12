@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	mapset "github.com/deckarep/golang-set/v2"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 )
@@ -136,6 +137,12 @@ var (
 			return w.translateICMPv6RedirectLayer(ctx, deep)
 		},
 	}
+
+	skippedLayersList = []gopacket.LayerType{
+		gopacket.LayerTypeDecodeFailure,
+		layers.LayerTypeLinuxSLL,
+	}
+	skippedLayers = mapset.NewSet(skippedLayersList...)
 )
 
 func (w pcapTranslatorWorker) pkt(ctx context.Context) gopacket.Packet {
@@ -328,9 +335,17 @@ func (w *pcapTranslatorWorker) Run(ctx context.Context) (buffer interface{}) {
 					transformerLogger.Printf("%s @translator[%d][%s] | unavailable",
 						*w.loggerPrefix, index, layer.LayerType().String())
 				}
-			} else if layer.LayerType() != gopacket.LayerTypePayload {
-				transformerLogger.Printf("%s @translator[%d][%s] | not found",
-					*w.loggerPrefix, index, layer.LayerType().String())
+			} else {
+				switch layer.(type) {
+				case *gopacket.DecodeFailure:
+					err := layer.(*gopacket.DecodeFailure)
+					transformerLogger.Printf("%s error@layer[%d]: %s", *w.loggerPrefix, index, err.Error())
+				default:
+					if !skippedLayers.Contains(layer.LayerType()) {
+						transformerLogger.Printf("%s @translator[%d][%s] | not found",
+							*w.loggerPrefix, index, layer.LayerType().String())
+					}
+				}
 			}
 		}(i, l, &wg)
 	}

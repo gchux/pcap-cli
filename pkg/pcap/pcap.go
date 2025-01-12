@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/gchux/pcap-cli/pkg/transformer"
+	"github.com/google/gopacket"
 	"github.com/google/gopacket/pcap"
 	"github.com/wissance/stringFormatter"
 )
@@ -74,7 +75,7 @@ type (
 	Pcap struct {
 		config         *PcapConfig
 		isActive       *atomic.Bool
-		activeHandle   *pcap.Handle
+		activeHandle   gopacket.PacketDataSource
 		inactiveHandle *pcap.InactiveHandle
 		fn             transformer.IPcapTransformer
 	}
