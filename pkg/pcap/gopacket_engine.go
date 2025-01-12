@@ -172,7 +172,7 @@ func (p *Pcap) Start(
 	}
 
 	if firstPacket, err := source.NextPacket(); err == nil && firstPacket != nil {
-		serial := uint64(1)
+		serial := uint64(0)
 		if err = p.fn.Apply(ctx, &firstPacket, &serial); err != nil {
 			gopacketLogger.Printf("%s - #:0 | failed to translate 1st packet: %v\n", loggerPrefix, err)
 		}
