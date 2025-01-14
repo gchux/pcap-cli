@@ -15,12 +15,14 @@
 package transformer
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"net/netip"
 	"os"
 	"regexp"
 	"runtime/debug"
@@ -30,10 +32,12 @@ import (
 	"time"
 
 	mapset "github.com/deckarep/golang-set/v2"
+	"github.com/google/btree"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/panjf2000/ants/v2"
 	concurrently "github.com/tejzpr/ordered-concurrently/v3"
+	"github.com/wissance/stringFormatter"
 )
 
 var transformerLogger = log.New(os.Stderr, "[transformer] - ", log.LstdFlags)
@@ -43,9 +47,30 @@ type (
 
 	PcapTranslatorFmt uint8
 
+	TCPFlag  string
+	TCPFlags []uint8
+
+	PcapL3Filters struct {
+		// filter IPs in O(log N)
+		networks4 *btree.BTreeG[netip.Prefix]
+		networks6 *btree.BTreeG[netip.Prefix]
+	}
+
+	PcapL4Filters struct {
+		// filter ports and flags in O(1)
+		ports mapset.Set[uint16]
+		flags uint8
+	}
+
+	PcapFilters struct {
+		l3 *PcapL3Filters
+		l4 *PcapL4Filters
+	}
+
 	PcapTranslator interface {
 		next(context.Context, *PcapIface, *uint64, *gopacket.Packet) fmt.Stringer
 		translateEthernetLayer(context.Context, *layers.Ethernet) fmt.Stringer
+		translateARPLayer(context.Context, *layers.ARP) fmt.Stringer
 		translateIPv4Layer(context.Context, *layers.IPv4) fmt.Stringer
 		translateIPv6Layer(context.Context, *layers.IPv6) fmt.Stringer
 		translateICMPv4Layer(context.Context, *layers.ICMPv4) fmt.Stringer
@@ -85,6 +110,8 @@ type (
 		connTracking    bool
 		apply           func(*pcapTranslatorWorker) error
 		counter         *atomic.Int64
+		filters         *PcapFilters
+		debug, compat   bool
 	}
 
 	IPcapTransformer interface {
@@ -146,9 +173,7 @@ const (
 	// keeping it in sync with `h2`:
 	//   - A stream identifier of zero (0x00) is used for connection control messages
 	http11StreamID = uint32(1)
-)
 
-var (
 	tcpSynStr = "SYN"
 	tcpAckStr = "ACK"
 	tcpPshStr = "PSH"
@@ -157,7 +182,9 @@ var (
 	tcpUrgStr = "URG"
 	tcpEceStr = "ECE"
 	tcpCwrStr = "CWR"
+)
 
+var (
 	tcpFlags = map[string]uint8{
 		tcpFinStr: 0b00000001,
 		tcpSynStr: 0b00000010,
@@ -168,6 +195,7 @@ var (
 		tcpEceStr: 0b01000000,
 		tcpCwrStr: 0b10000000,
 	}
+	TCP_FLAGS = tcpFlags
 
 	tcpSynAckStr    = tcpSynStr + "|" + tcpAckStr
 	tcpSynRstStr    = tcpSynStr + "|" + tcpRstStr
@@ -245,6 +273,128 @@ var (
 	errUnavailableTranslation = errors.New("packet translation is unavailable")
 	errUnavailableTranslator  = errors.New("packet translator is unavailable")
 )
+
+func parseTCPflags(tcp *layers.TCP) uint8 {
+	var setFlags uint8 = 0
+
+	if tcp.SYN {
+		setFlags = setFlags | tcpSyn
+	}
+	if tcp.ACK {
+		setFlags = setFlags | tcpAck
+	}
+	if tcp.PSH {
+		setFlags = setFlags | tcpPsh
+	}
+	if tcp.FIN {
+		setFlags = setFlags | tcpFin
+	}
+	if tcp.RST {
+		setFlags = setFlags | tcpRst
+	}
+	if tcp.URG {
+		setFlags = setFlags | tcpUrg
+	}
+	if tcp.ECE {
+		setFlags = setFlags | tcpEce
+	}
+	if tcp.CWR {
+		setFlags = setFlags | tcpCwr
+	}
+
+	return setFlags
+}
+
+func (flag *TCPFlag) materialize() uint8 {
+	flagStr := string(*flag)
+	if f, ok := tcpFlags[flagStr]; ok {
+		return f
+	}
+	return 0b00000000
+}
+
+func mergeTCPFlags(flags ...TCPFlag) uint8 {
+	mergedFlags := uint8(0)
+	for _, flag := range flags {
+		mergedFlags |= flag.materialize()
+	}
+	return mergedFlags
+}
+
+func (f *PcapFilters) addNetwork(
+	networks *btree.BTreeG[netip.Prefix],
+	isIPv6 bool, ipRange string,
+) {
+	if prefix, err := netip.ParsePrefix(ipRange); err == nil {
+		if isIPv6 && prefix.Addr().Is6() ||
+			!isIPv6 && prefix.Addr().Is4() {
+			networks.ReplaceOrInsert(prefix)
+		}
+	}
+}
+
+func (f *PcapFilters) addNetworks(
+	networks *btree.BTreeG[netip.Prefix],
+	isIPv6 bool, ipRanges ...string,
+) {
+	for _, ipRange := range ipRanges {
+		f.addNetwork(networks, isIPv6, ipRange)
+	}
+}
+
+func (f *PcapFilters) AddIPv4s(IPv4s ...string) {
+	for _, IPv4 := range IPv4s {
+		f.addNetwork(f.l3.networks4, false /* isIPv6 */, stringFormatter.Format("{0}/32", IPv4))
+	}
+}
+
+func (f *PcapFilters) AddIPv6s(IPv6s ...string) {
+	for _, IPv6 := range IPv6s {
+		f.addNetwork(f.l3.networks4, false /* isIPv6 */, stringFormatter.Format("{0}/128", IPv6))
+	}
+}
+
+func (f *PcapFilters) AddIPv4Ranges(IPv4Ranges ...string) {
+	f.addNetworks(f.l3.networks4, false /* isIPv6 */, IPv4Ranges...)
+}
+
+func (f *PcapFilters) AddIPv6Ranges(IPv6Ranges ...string) {
+	f.addNetworks(f.l3.networks6, true /* isIPv6 */, IPv6Ranges...)
+}
+
+func (f *PcapFilters) AddPorts(ports ...uint16) {
+	f.l4.ports.Append(ports...)
+}
+
+func (f *PcapFilters) AddTCPFlags(flags ...TCPFlag) {
+	for _, flag := range flags {
+		f.l4.flags |= flag.materialize()
+	}
+}
+
+func (f *PcapFilters) CombineAndAddTCPFlags(flag ...TCPFlag) {
+	f.l4.flags |= mergeTCPFlags(flag...)
+}
+
+func ipLessThanFunc(a, b netip.Prefix) bool {
+	if a.Overlaps(b) {
+		return false
+	}
+	return bytes.Compare(a.Addr().AsSlice(), b.Addr().AsSlice()) < 0
+}
+
+func NewPcapFilters() *PcapFilters {
+	return &PcapFilters{
+		l3: &PcapL3Filters{
+			networks4: btree.NewG[netip.Prefix](2, ipLessThanFunc),
+			networks6: btree.NewG[netip.Prefix](2, ipLessThanFunc),
+		},
+		l4: &PcapL4Filters{
+			ports: mapset.NewSet[uint16](),
+			flags: 0b00000000,
+		},
+	}
+}
 
 func (eph *PcapEmphemeralPorts) isEphemeralPort(port *uint16) bool {
 	return *port >= eph.Min && *port <= eph.Max
@@ -460,7 +610,7 @@ func (t *PcapTransformer) Apply(ctx context.Context, packet *gopacket.Packet, se
 	}
 	// It is assumed that packets will be produced faster than translations and writing operations, so:
 	//   - process/translate packets concurrently in order to avoid blocking `gopacket` packets channel as much as possible.
-	worker := newPcapTranslatorWorker(t.ifaces, t.iface, serial, packet, t.translator, t.connTracking)
+	worker := newPcapTranslatorWorker(t.ifaces, t.iface, t.filters, serial, packet, t.translator, t.connTracking, t.compat)
 	return t.apply(worker)
 }
 
@@ -626,11 +776,12 @@ func newTransformer(
 	ctx context.Context,
 	iface *PcapIface,
 	ephemerals *PcapEmphemeralPorts,
+	filters *PcapFilters,
 	writers []io.Writer,
 	format *string,
 	preserveOrder,
 	connTracking bool,
-	debug bool,
+	debug, compat bool,
 ) (IPcapTransformer, error) {
 	pcapFmt := pcapTranslatorFmts[*format]
 	translator, err := newTranslator(ctx, debug, iface, ephemerals, pcapFmt)
@@ -686,6 +837,7 @@ func newTransformer(
 		ctx:             ctx,
 		iface:           iface,
 		ifaces:          ifaces,
+		filters:         filters,
 		ephemerals:      ephemerals,
 		loggerPrefix:    &loggerPrefix,
 		translator:      translator,
@@ -696,6 +848,8 @@ func newTransformer(
 		preserveOrder:   preserveOrder || connTracking,
 		connTracking:    connTracking,
 		counter:         new(atomic.Int64),
+		debug:           debug,
+		compat:          compat,
 	}
 
 	provideStrategy(ctx, transformer, preserveOrder, connTracking)
@@ -722,18 +876,50 @@ func newTransformer(
 	return transformer, nil
 }
 
-func NewOrderedTransformer(ctx context.Context, iface *PcapIface, ephemerals *PcapEmphemeralPorts, writers []io.Writer, format *string, debug bool) (IPcapTransformer, error) {
-	return newTransformer(ctx, iface, ephemerals, writers, format, true /* preserveOrder */, false /* connTracking */, debug)
+func NewOrderedTransformer(
+	ctx context.Context,
+	iface *PcapIface,
+	ephemerals *PcapEmphemeralPorts,
+	filters *PcapFilters,
+	writers []io.Writer,
+	format *string,
+	debug, compat bool,
+) (IPcapTransformer, error) {
+	return newTransformer(ctx, iface, ephemerals, filters, writers, format, true /* preserveOrder */, false /* connTracking */, debug, compat)
 }
 
-func NewConnTrackTransformer(ctx context.Context, iface *PcapIface, ephemerals *PcapEmphemeralPorts, writers []io.Writer, format *string, debug bool) (IPcapTransformer, error) {
-	return newTransformer(ctx, iface, ephemerals, writers, format, true /* preserveOrder */, true /* connTracking */, debug)
+func NewConnTrackTransformer(
+	ctx context.Context,
+	iface *PcapIface,
+	ephemerals *PcapEmphemeralPorts,
+	filters *PcapFilters,
+	writers []io.Writer,
+	format *string,
+	debug, compat bool,
+) (IPcapTransformer, error) {
+	return newTransformer(ctx, iface, ephemerals, filters, writers, format, true /* preserveOrder */, true /* connTracking */, debug, compat)
 }
 
-func NewDebugTransformer(ctx context.Context, iface *PcapIface, ephemerals *PcapEmphemeralPorts, writers []io.Writer, format *string) (IPcapTransformer, error) {
-	return newTransformer(ctx, iface, ephemerals, writers, format, false /* preserveOrder */, false /* connTracking */, true /* debug */)
+func NewDebugTransformer(
+	ctx context.Context,
+	iface *PcapIface,
+	ephemerals *PcapEmphemeralPorts,
+	filters *PcapFilters,
+	writers []io.Writer,
+	format *string,
+	compat bool,
+) (IPcapTransformer, error) {
+	return newTransformer(ctx, iface, ephemerals, filters, writers, format, false /* preserveOrder */, false /* connTracking */, true /* debug */, compat)
 }
 
-func NewTransformer(ctx context.Context, iface *PcapIface, ephemerals *PcapEmphemeralPorts, writers []io.Writer, format *string, debug bool) (IPcapTransformer, error) {
-	return newTransformer(ctx, iface, ephemerals, writers, format, false /* preserveOrder */, false /* connTracking */, debug)
+func NewTransformer(
+	ctx context.Context,
+	iface *PcapIface,
+	ephemerals *PcapEmphemeralPorts,
+	filters *PcapFilters,
+	writers []io.Writer,
+	format *string,
+	debug, compat bool,
+) (IPcapTransformer, error) {
+	return newTransformer(ctx, iface, ephemerals, filters, writers, format, false /* preserveOrder */, false /* connTracking */, debug, compat)
 }

@@ -106,6 +106,7 @@ func (p *Pcap) Start(
 
 	cfg := *p.config
 	debug := cfg.Debug
+	compat := cfg.Compat
 
 	device := cfg.Device
 	var iface *transformer.PcapIface
@@ -131,7 +132,8 @@ func (p *Pcap) Start(
 
 	loggerPrefix := fmt.Sprintf("[%d/%s]", iface.Index, iface.Name)
 
-	if iface.Index != any_devide_index {
+	// [ToDo]: confirm that both validations are required
+	if !compat && iface.Index != any_devide_index {
 		// set packet capture filter; i/e: `tcp port 443`
 		if filter := providePcapFilter(ctx, &cfg.Filter, cfg.Filters); *filter != "" {
 			if err = handle.SetBPFFilter(*filter); err != nil {
@@ -145,7 +147,9 @@ func (p *Pcap) Start(
 	gopacketLogger.Printf("%s - starting packet capture\n", loggerPrefix)
 
 	source := gopacket.NewPacketSource(handle, handle.LinkType())
-	source.Lazy = false
+	// https://github.com/google/gopacket/blob/master/packet.go#L660-L680
+	source.Lazy = true
+	// https://github.com/google/gopacket/blob/master/packet.go#L655-L659
 	source.NoCopy = true
 	source.SkipDecodeRecovery = false
 	source.DecodeStreamsAsDatagrams = true
@@ -157,14 +161,18 @@ func (p *Pcap) Start(
 	}
 
 	format := cfg.Format
+	compatFilters, ok := cfg.CompatFilters.(*transformer.PcapFilters)
+	if !ok {
+		compatFilters = nil
+	}
 
 	// create new transformer for the specified output format
 	if cfg.Ordered {
-		p.fn, err = transformer.NewOrderedTransformer(ctx, iface, cfg.Ephemerals, ioWriters, &format, debug)
+		p.fn, err = transformer.NewOrderedTransformer(ctx, iface, cfg.Ephemerals, compatFilters, ioWriters, &format, debug, compat)
 	} else if cfg.ConnTrack {
-		p.fn, err = transformer.NewConnTrackTransformer(ctx, iface, cfg.Ephemerals, ioWriters, &format, debug)
+		p.fn, err = transformer.NewConnTrackTransformer(ctx, iface, cfg.Ephemerals, compatFilters, ioWriters, &format, debug, compat)
 	} else {
-		p.fn, err = transformer.NewTransformer(ctx, iface, cfg.Ephemerals, ioWriters, &format, debug)
+		p.fn, err = transformer.NewTransformer(ctx, iface, cfg.Ephemerals, compatFilters, ioWriters, &format, debug, compat)
 	}
 
 	if err != nil {

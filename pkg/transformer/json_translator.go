@@ -162,6 +162,38 @@ func (t *JSONPcapTranslator) translateEthernetLayer(ctx context.Context, eth *la
 	return json
 }
 
+func (t *JSONPcapTranslator) translateARPLayer(ctx context.Context, arp *layers.ARP) fmt.Stringer {
+	json := gabs.New()
+
+	arpJSON, _ := json.Object("ARP")
+
+	arpJSON.Set(arp.Operation, "op")
+
+	var ipBytes [4]byte
+
+	copy(ipBytes[:], arp.SourceProtAddress)
+	ip4 := netip.AddrFrom4(ipBytes)
+	mac := net.HardwareAddr(arp.SourceHwAddress[:])
+
+	srcJSON, _ := arpJSON.Object("src")
+	srcJSON.Set(ip4.String(), "IP")
+	srcJSON.Set(mac.String(), "MAC")
+
+	copy(ipBytes[:], arp.DstProtAddress)
+	ip4 = netip.AddrFrom4(ipBytes)
+	mac = net.HardwareAddr(arp.DstHwAddress[:])
+
+	dstJSON, _ := arpJSON.Object("dst")
+	dstJSON.Set(ip4.String(), "IP")
+	dstJSON.Set(mac.String(), "MAC")
+
+	flowID := fnv1a.HashUint64(fnv1a.HashBytes64(arp.SourceProtAddress) + fnv1a.HashBytes64(arp.DstProtAddress))
+	flowIDstr := strconv.FormatUint(flowID, 10)
+	arpJSON.Set(flowIDstr, "flow")
+
+	return json
+}
+
 func (t *JSONPcapTranslator) addEndpoints(
 	json *gabs.Container,
 	flow *gopacket.Flow,
@@ -212,7 +244,7 @@ func (t *JSONPcapTranslator) translateIPv4Layer(
 	// https://github.com/google/gopacket/blob/master/layers/ip4.go#L28-L40
 	L3.SetP(strings.Split(ip4.Flags.String(), "|"), "flags")
 
-	// hashing bytes yields `uint64`, and addition is commutatie:
+	// hashing bytes yields `uint64`, and addition is commutative:
 	//   - so hashing the IP byte array representations and then adding then resulting `uint64`s is a commutative operation as well.
 	flowID := fnv1a.HashUint64(uint64(4) + fnv1a.HashBytes64(ip4.SrcIP.To4()) + fnv1a.HashBytes64(ip4.DstIP.To4()))
 	flowIDstr := strconv.FormatUint(flowID, 10)
@@ -246,7 +278,7 @@ func (t *JSONPcapTranslator) translateIPv6Layer(
 	proto.Set(ip6.NextHeader, "num")
 	proto.Set(ip6.NextHeader.String(), "name")
 
-	// hashing bytes yields `uint64`, and addition is commutatie:
+	// hashing bytes yields `uint64`, and addition is commutative:
 	//   - so hashing the IP byte array representations and then adding then resulting `uint64`s is a commutative operation as well.
 	flowID := fnv1a.HashUint64(uint64(41) + fnv1a.HashBytes64(ip6.SrcIP.To16()) + fnv1a.HashBytes64(ip6.DstIP.To16()))
 	flowIDstr := strconv.FormatUint(flowID, 10)
@@ -288,6 +320,7 @@ func (t *JSONPcapTranslator) translateICMPv4Layer(ctx context.Context, icmp4 *la
 		IPv4.Set(uint8(ipHeader[9]), "proto")
 		IPv4.Set(binary.BigEndian.Uint16(ipHeader[10:12]), "xsum")
 
+		// IP addresses are represented as bigendian []byte slices in Go
 		var ipBytes [4]byte
 
 		copy(ipBytes[:], ipHeader[12:16])
@@ -559,41 +592,22 @@ func (t *JSONPcapTranslator) translateTCPLayer(ctx context.Context, tcp *layers.
 	L4.Set(tcp.Checksum, "xsum")
 	L4.Set(tcp.Urgent, "urg")
 
-	var setFlags uint8 = 0
-
 	flags, _ := L4.Object("flags")
 
 	flagsMap, _ := flags.Object("map")
 
 	flagsMap.Set(tcp.SYN, "SYN")
-	if tcp.SYN {
-		setFlags = setFlags | tcpSyn
-	}
 	flagsMap.Set(tcp.ACK, "ACK")
-	if tcp.ACK {
-		setFlags = setFlags | tcpAck
-	}
 	flagsMap.Set(tcp.PSH, "PSH")
-	if tcp.PSH {
-		setFlags = setFlags | tcpPsh
-	}
 	flagsMap.Set(tcp.FIN, "FIN")
-	if tcp.FIN {
-		setFlags = setFlags | tcpFin
-	}
 	flagsMap.Set(tcp.RST, "RST")
-	if tcp.RST {
-		setFlags = setFlags | tcpRst
-	}
 	flagsMap.Set(tcp.URG, "URG")
-	if tcp.URG {
-		setFlags = setFlags | tcpUrg
-	}
-
 	flagsMap.Set(tcp.ECE, "ECE")
 	flagsMap.Set(tcp.CWR, "CWR")
+
 	flagsMap.Set(tcp.NS, "NS")
 
+	setFlags := parseTCPflags(tcp)
 	flags.Set(setFlags, "dec")
 	flags.Set("0b"+strconv.FormatUint(uint64(setFlags), 2), "bin")
 	flags.Set("0x"+strconv.FormatUint(uint64(setFlags), 16), "hex")
@@ -785,10 +799,17 @@ func (t *JSONPcapTranslator) finalize(
 
 	data["serial"] = *serial
 
+	flowIDstr, _ := json.S("meta", "flow").Data().(string) // this is always available
+
 	l3Src, _ := json.S("L3", "src").Data().(net.IP)
 	data["L3Src"] = l3Src
 	l3Dst, _ := json.S("L3", "dst").Data().(net.IP)
 	data["L3Dst"] = l3Dst
+
+	if l3Src == nil && l3Dst == nil {
+		operation.Set(stringFormatter.Format(jsonTranslationFlowTemplate, id, t.iface.Name, "x", flowIDstr), "id")
+		return json, nil
+	}
 
 	// report complete interface details when capturing for `any` interface
 	t.checkL3Address(ctx, json, ifaces, iface, l3Src, l3Dst)
@@ -806,7 +827,6 @@ func (t *JSONPcapTranslator) finalize(
 	// Addition is commutative, so after hashing `net.IP` bytes and L4 ports to `uint64`,
 	// the same `uint64`/`flowID` is produced after adding everything up, no matter the order.
 	// Using the same `flowID` will produce grouped logs in Cloud Logging.
-	flowIDstr, _ := json.S("meta", "flow").Data().(string) // this is always available
 	flowID, _ := strconv.ParseUint(flowIDstr, 10, 64)
 	if l3FlowIDstr, l3OK := json.S("L3", "flow").Data().(string); l3OK {
 		l3FlowID, _ := strconv.ParseUint(l3FlowIDstr, 10, 64)

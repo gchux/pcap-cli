@@ -30,10 +30,24 @@ import (
 )
 
 type (
+	TCPFlag             = transformer.TCPFlag
+	TCPFlags            = transformer.TCPFlags
+	PcapEmphemeralPorts = transformer.PcapEmphemeralPorts
+
 	PcapFilterMode uint8
 
 	PcapFilter struct {
 		Raw *string
+	}
+
+	PcapFilters interface {
+		AddIPv4s(...string)
+		AddIPv6s(...string)
+		AddIPv4Ranges(...string)
+		AddIPv6Ranges(...string)
+		AddPorts(...uint16)
+		AddTCPFlags(...TCPFlag)
+		CombineAndAddTCPFlags(...TCPFlag)
 	}
 
 	PcapFilterProvider interface {
@@ -42,24 +56,24 @@ type (
 		Apply(context.Context, *string, PcapFilterMode) *string
 	}
 
-	PcapEmphemeralPorts = transformer.PcapEmphemeralPorts
-
 	PcapConfig struct {
-		Debug      bool
-		Promisc    bool
-		Iface      string
-		Snaplen    int
-		TsType     string
-		Format     string
-		Filter     string
-		Output     string
-		Interval   int
-		Extension  string
-		Ordered    bool
-		ConnTrack  bool
-		Device     *PcapDevice
-		Filters    []PcapFilterProvider
-		Ephemerals *PcapEmphemeralPorts
+		Compat        bool
+		Debug         bool
+		Promisc       bool
+		Iface         string
+		Snaplen       int
+		TsType        string
+		Format        string
+		Filter        string
+		Output        string
+		Interval      int
+		Extension     string
+		Ordered       bool
+		ConnTrack     bool
+		Device        *PcapDevice
+		Filters       []PcapFilterProvider
+		CompatFilters PcapFilters
+		Ephemerals    *PcapEmphemeralPorts
 	}
 
 	PcapEngine interface {
@@ -113,6 +127,17 @@ const (
 	any_devide_index uint8  = 0
 )
 
+const (
+	TCP_FLAG_SYN transformer.TCPFlag = transformer.TCPFlag("SYN")
+	TCP_FLAG_ACK transformer.TCPFlag = transformer.TCPFlag("ACK")
+	TCP_FLAG_PSH transformer.TCPFlag = transformer.TCPFlag("PSH")
+	TCP_FLAG_FIN transformer.TCPFlag = transformer.TCPFlag("FIN")
+	TCP_FLAG_RST transformer.TCPFlag = transformer.TCPFlag("RST")
+	TCP_FLAG_URG transformer.TCPFlag = transformer.TCPFlag("URG")
+	TCP_FLAG_ECE transformer.TCPFlag = transformer.TCPFlag("ECE")
+	TCP_FLAG_CWR transformer.TCPFlag = transformer.TCPFlag("CWR")
+)
+
 func providePcapFilter(
 	ctx context.Context,
 	filter *string,
@@ -154,17 +179,13 @@ func findAllDevs(compare func(*string) bool) ([]*PcapDevice, error) {
 	}
 
 	var devs []*PcapDevice
-
 	for _, device := range devices {
 		if compare(&device.Name) {
-			iface, err := net.InterfaceByName(device.Name)
-			if err != nil {
-				continue
+			if iface, err := net.InterfaceByName(device.Name); err == nil {
+				devs = append(devs, &PcapDevice{iface, device})
 			}
-			devs = append(devs, &PcapDevice{iface, device})
 		}
 	}
-
 	return devs, nil
 }
 
@@ -181,4 +202,8 @@ func FindDevicesByName(deviceName *string) ([]*PcapDevice, error) {
 		return name == *deviceName
 	}
 	return findAllDevs(compare)
+}
+
+func NewPcapFilters() PcapFilters {
+	return transformer.NewPcapFilters()
 }

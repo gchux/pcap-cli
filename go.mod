@@ -10,6 +10,7 @@ require (
 	github.com/alphadose/haxmap v1.4.0
 	github.com/deckarep/golang-set/v2 v2.6.0
 	github.com/easyCZ/logrotate v0.3.0
+	github.com/google/btree v1.1.3
 	github.com/google/gopacket v1.1.19
 	github.com/google/uuid v1.6.0
 	github.com/itchyny/timefmt-go v0.1.6

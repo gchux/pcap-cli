@@ -17,6 +17,7 @@ package transformer
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"runtime/debug"
 	"sync"
 	"time"
@@ -28,16 +29,20 @@ import (
 
 type (
 	pcapTranslatorWorker struct {
-		ifaces       netIfaceIndex
-		iface        *PcapIface
-		serial       *uint64
-		packet       *gopacket.Packet
-		translator   PcapTranslator
-		conntrack    bool
+		ifaces     netIfaceIndex
+		iface      *PcapIface
+		filters    *PcapFilters
+		serial     *uint64
+		packet     *gopacket.Packet
+		translator PcapTranslator
+		conntrack  bool
+		compat     bool
+
 		loggerPrefix *string
 	}
 
 	packetLayerTranslator = func(context.Context, *pcapTranslatorWorker, bool) fmt.Stringer
+	layersTranslators     = map[gopacket.LayerType]packetLayerTranslator
 
 	httpRequest struct {
 		timestamp   *time.Time
@@ -116,7 +121,7 @@ var (
 
 	packetLayerTranslatorsSize = len(packetLayerTranslators)
 
-	packetLayerTranslatorsMap = map[gopacket.LayerType]packetLayerTranslator{
+	packetLayerTranslatorsMap layersTranslators = map[gopacket.LayerType]packetLayerTranslator{
 		layers.LayerTypeEthernet: packetLayerTranslators[0][0],
 		layers.LayerTypeIPv4:     packetLayerTranslators[1][0],
 		layers.LayerTypeIPv6:     packetLayerTranslators[1][1],
@@ -127,14 +132,25 @@ var (
 		layers.LayerTypeDNS:      packetLayerTranslators[3][0],
 		layers.LayerTypeTLS:      packetLayerTranslators[3][1],
 		layers.LayerTypeICMPv6Echo: func(
-			ctx context.Context, w *pcapTranslatorWorker, deep bool,
+			ctx context.Context,
+			w *pcapTranslatorWorker,
+			deep bool,
 		) fmt.Stringer {
 			return w.translateICMPv6EchoLayer(ctx, deep)
 		},
 		layers.LayerTypeICMPv6Redirect: func(
-			ctx context.Context, w *pcapTranslatorWorker, deep bool,
+			ctx context.Context,
+			w *pcapTranslatorWorker,
+			deep bool,
 		) fmt.Stringer {
 			return w.translateICMPv6RedirectLayer(ctx, deep)
+		},
+		layers.LayerTypeARP: func(
+			ctx context.Context,
+			w *pcapTranslatorWorker,
+			deep bool,
+		) fmt.Stringer {
+			return w.translateARPLayer(ctx, deep)
 		},
 	}
 
@@ -150,6 +166,8 @@ func (w pcapTranslatorWorker) pkt(ctx context.Context) gopacket.Packet {
 }
 
 func (w *pcapTranslatorWorker) asLayer(ctx context.Context, layer gopacket.LayerType) gopacket.Layer {
+	// https://github.com/google/gopacket/blob/master/packet.go#L568-L585
+	// https://github.com/google/gopacket/blob/master/packet.go#L476-L483
 	return w.pkt(ctx).Layer(layer)
 }
 
@@ -167,6 +185,8 @@ func (w *pcapTranslatorWorker) translateLayer(
 		return nil
 	case *layers.Ethernet:
 		return w.translator.translateEthernetLayer(ctx, lType)
+	case *layers.ARP:
+		return w.translator.translateARPLayer(ctx, lType)
 	case *layers.IPv4:
 		return w.translator.translateIPv4Layer(ctx, lType)
 	case *layers.IPv6:
@@ -213,6 +233,10 @@ func (w *pcapTranslatorWorker) translateLayer(
 
 func (w pcapTranslatorWorker) translateEthernetLayer(ctx context.Context, deep bool) fmt.Stringer {
 	return w.translateLayer(ctx, layers.LayerTypeEthernet, deep)
+}
+
+func (w pcapTranslatorWorker) translateARPLayer(ctx context.Context, deep bool) fmt.Stringer {
+	return w.translateLayer(ctx, layers.LayerTypeARP, deep)
 }
 
 func (w *pcapTranslatorWorker) translateIPv4Layer(ctx context.Context, deep bool) fmt.Stringer {
@@ -273,6 +297,115 @@ func (w *pcapTranslatorWorker) translateTLSLayer(ctx context.Context, deep bool)
 	return w.translateLayer(ctx, layers.LayerTypeTLS, deep)
 }
 
+func (w *pcapTranslatorWorker) isIPv4Allowed(
+	ctx context.Context,
+	ip4 *layers.IPv4,
+) bool {
+	var ipBytes [4]byte
+
+	copy(ipBytes[:], ip4.SrcIP.To4())
+	ipv4 := netip.AddrFrom4(ipBytes)
+	prefix := netip.PrefixFrom(ipv4, 32)
+
+	if w.filters.l3.networks4.Has(prefix) {
+		return true
+	}
+
+	copy(ipBytes[:], ip4.DstIP.To4())
+	ipv4 = netip.AddrFrom4(ipBytes)
+	prefix = netip.PrefixFrom(ipv4, 32)
+
+	return w.filters.l3.networks4.Has(prefix)
+}
+
+func (w *pcapTranslatorWorker) isIPv6Allowed(
+	ctx context.Context,
+	ip6 *layers.IPv6,
+) bool {
+	var ipBytes [16]byte
+
+	copy(ipBytes[:], ip6.SrcIP.To16())
+	ipv4 := netip.AddrFrom16(ipBytes)
+	prefix := netip.PrefixFrom(ipv4, 128)
+
+	if w.filters.l3.networks6.Has(prefix) {
+		return true
+	}
+
+	copy(ipBytes[:], ip6.DstIP.To16())
+	ipv4 = netip.AddrFrom16(ipBytes)
+	prefix = netip.PrefixFrom(ipv4, 128)
+
+	return w.filters.l3.networks6.Has(prefix)
+}
+
+func (w *pcapTranslatorWorker) isL3Allowed(
+	ctx context.Context,
+) bool {
+	if w.filters.l3.networks4.Len() == 0 &&
+		w.filters.l3.networks6.Len() == 0 {
+		// no IP filters available
+		// fail open and fail fast
+		return true
+	}
+
+	layer := w.asLayer(ctx, layers.LayerTypeIPv4)
+	isIPv6 := false
+	if layer == nil {
+		if layer = w.asLayer(ctx, layers.LayerTypeIPv6); layer == nil {
+			// the packet does not contain IP layer information
+			return true
+		} else {
+			isIPv6 = true
+		}
+	}
+
+	if isIPv6 {
+		ip6 := layer.(*layers.IPv6)
+		return w.isIPv6Allowed(ctx, ip6)
+	}
+
+	ip4 := layer.(*layers.IPv4)
+	return w.isIPv4Allowed(ctx, ip4)
+}
+
+func (w *pcapTranslatorWorker) isL4Allowed(
+	ctx context.Context,
+) bool {
+	if w.filters.l4.ports.Cardinality() == 0 {
+		// fail open and fail fast
+		return true
+	}
+
+	layer := w.asLayer(ctx, layers.LayerTypeTCP)
+	if layer != nil {
+		tcp := layer.(*layers.TCP)
+		if w.filters.l4.flags > 0 {
+			// fail fast & open: if this it TCP, then flags cannot be 0; some flag must be set
+			if flags := parseTCPflags(tcp); (flags & w.filters.l4.flags) == 0 {
+				return false
+			}
+		}
+		// fail open
+		return w.filters.l4.ports.IsEmpty() ||
+			w.filters.l4.ports.ContainsAny(uint16(tcp.SrcPort), uint16(tcp.DstPort))
+	}
+
+	layer = w.asLayer(ctx, layers.LayerTypeUDP)
+	if layer == nil {
+		// fail open
+		return true
+	}
+
+	udp := layer.(*layers.UDP)
+	return w.filters.l4.ports.IsEmpty() ||
+		w.filters.l4.ports.ContainsAny(uint16(udp.SrcPort), uint16(udp.DstPort))
+}
+
+func (w *pcapTranslatorWorker) shouldTranslate(ctx context.Context) bool {
+	return w.isL3Allowed(ctx) && w.isL4Allowed(ctx)
+}
+
 // The work that needs to be performed
 // The input type should implement the WorkFunction interface
 func (w *pcapTranslatorWorker) Run(ctx context.Context) (buffer interface{}) {
@@ -283,6 +416,14 @@ func (w *pcapTranslatorWorker) Run(ctx context.Context) (buffer interface{}) {
 			buffer = nil
 		}
 	}()
+
+	// fail open:
+	//   - if there aren't any filters, continue with translation
+	if w.compat &&
+		w.filters != nil &&
+		!w.shouldTranslate(ctx) {
+		return nil
+	}
 
 	var _buffer fmt.Stringer = nil
 
@@ -312,42 +453,46 @@ func (w *pcapTranslatorWorker) Run(ctx context.Context) (buffer interface{}) {
 		close(translations)
 	}(&wg)
 
+	translate := func(index int, layer gopacket.Layer, wg *sync.WaitGroup) {
+		layerType := layer.LayerType()
+
+		defer func(index int, layer gopacket.Layer, wg *sync.WaitGroup) {
+			if r := recover(); r != nil {
+				transformerLogger.Printf("%s @%s[%d] | panic: %s\n%s\n",
+					*w.loggerPrefix, layerType.String(), index, r, string(debug.Stack()))
+				buffer = nil
+			}
+			wg.Done()
+		}(index, layer, wg)
+
+		if translator, ok := packetLayerTranslatorsMap[layerType]; ok {
+			if t := translator(ctx, w, false /* deep */); t != nil {
+				translations <- t
+			} else {
+				transformerLogger.Printf("%s @translator[%d][%s] | unavailable",
+					*w.loggerPrefix, index, layerType.String())
+			}
+		} else {
+			switch layer.(type) {
+			case *gopacket.DecodeFailure:
+				err := layer.(*gopacket.DecodeFailure)
+				transformerLogger.Printf("%s error@layer[%d]: %s", *w.loggerPrefix, index, err.Error())
+			default:
+				if !skippedLayers.Contains(layerType) {
+					transformerLogger.Printf("%s @translator[%d][%s] | not found",
+						*w.loggerPrefix, index, layerType.String())
+				}
+			}
+		}
+	}
+
 	// O(N); N is the number of layers available in the packet
 	// this is a faster implementation as there is no layer discovery;
 	// layers are translated on-demand based on the packet's contents.
 	for i, l := range packetLayers {
 		// translate layers concurrently:
 		//   - layers must know nothing about each other
-		go func(index int, layer gopacket.Layer, wg *sync.WaitGroup) {
-			defer func(index int, layer gopacket.Layer, wg *sync.WaitGroup) {
-				if r := recover(); r != nil {
-					transformerLogger.Printf("%s @%s[%d] | panic: %s\n%s\n",
-						*w.loggerPrefix, layer.LayerType().String(), index, r, string(debug.Stack()))
-					buffer = nil
-				}
-				wg.Done()
-			}(index, layer, wg)
-
-			if translator, ok := packetLayerTranslatorsMap[layer.LayerType()]; ok {
-				if t := translator(ctx, w, false /* deep */); t != nil {
-					translations <- t
-				} else {
-					transformerLogger.Printf("%s @translator[%d][%s] | unavailable",
-						*w.loggerPrefix, index, layer.LayerType().String())
-				}
-			} else {
-				switch layer.(type) {
-				case *gopacket.DecodeFailure:
-					err := layer.(*gopacket.DecodeFailure)
-					transformerLogger.Printf("%s error@layer[%d]: %s", *w.loggerPrefix, index, err.Error())
-				default:
-					if !skippedLayers.Contains(layer.LayerType()) {
-						transformerLogger.Printf("%s @translator[%d][%s] | not found",
-							*w.loggerPrefix, index, layer.LayerType().String())
-					}
-				}
-			}
-		}(i, l, &wg)
+		go translate(i, l, &wg)
 	}
 
 	// O(N*M)
@@ -400,20 +545,24 @@ func (w *pcapTranslatorWorker) Run(ctx context.Context) (buffer interface{}) {
 func newPcapTranslatorWorker(
 	ifaces netIfaceIndex,
 	iface *PcapIface,
+	filters *PcapFilters,
 	serial *uint64,
 	packet *gopacket.Packet,
 	translator PcapTranslator,
 	connTrack bool,
+	compat bool,
 ) *pcapTranslatorWorker {
 	loggerPrefix := fmt.Sprintf("[%d/%s] - #:%d |", iface.Index, iface.Name, *serial)
 
 	worker := &pcapTranslatorWorker{
+		filters:      filters,
 		ifaces:       ifaces,
 		iface:        iface,
 		serial:       serial,
 		packet:       packet,
 		translator:   translator,
 		conntrack:    connTrack,
+		compat:       compat,
 		loggerPrefix: &loggerPrefix,
 	}
 	return worker
