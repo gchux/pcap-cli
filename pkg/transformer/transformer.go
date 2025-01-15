@@ -463,8 +463,11 @@ func (t *PcapTransformer) produceTranslation(
 ) error {
 	translation := task.Run(ctx)
 	if translation == nil {
-		return fmt.Errorf("%s - #:%d | produceTranslation: %w",
-			*t.loggerPrefix, *task.serial, errUnavailableTranslation)
+		/*
+			return fmt.Errorf("%s #:%d | produceTranslation: %w",
+				*t.loggerPrefix, *task.serial, errUnavailableTranslation)
+		*/
+		return nil
 	}
 	return t.publishTranslation(ctx, translation.(*fmt.Stringer))
 }

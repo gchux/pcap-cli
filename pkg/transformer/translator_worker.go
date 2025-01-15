@@ -460,7 +460,6 @@ func (w *pcapTranslatorWorker) Run(ctx context.Context) (buffer interface{}) {
 			if r := recover(); r != nil {
 				transformerLogger.Printf("%s @%s[%d] | panic: %s\n%s\n",
 					*w.loggerPrefix, layerType.String(), index, r, string(debug.Stack()))
-				buffer = nil
 			}
 			wg.Done()
 		}(index, layer, wg)
