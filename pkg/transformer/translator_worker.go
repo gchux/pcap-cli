@@ -384,30 +384,34 @@ func (w *pcapTranslatorWorker) isL3Allowed(
 func (w *pcapTranslatorWorker) isL4Allowed(
 	ctx context.Context,
 ) bool {
-	if w.filters.l4.ports.IsEmpty() &&
-		w.filters.l4.flags == 0 &&
+	protosFilterAvailable := !w.filters.l4.protos.IsEmpty()
+	tcpFlagsFilterAvailable := w.filters.l4.flags > 0
+	portsFilterAvailable := !w.filters.l4.ports.IsEmpty()
+
+	if !protosFilterAvailable &&
+		!tcpFlagsFilterAvailable &&
+		!portsFilterAvailable {
 		// nothing to verify...
-		w.filters.l4.protos.IsEmpty() {
 		// fail open and fail fast
 		return true
 	}
 
 	layer := w.asLayer(ctx, layers.LayerTypeTCP)
 	if layer != nil {
-		if !w.filters.l4.protos.IsEmpty() &&
+		if protosFilterAvailable &&
 			!w.filters.l4.protos.Contains(0x06) {
 			return false
 		}
 
 		tcp := layer.(*layers.TCP)
-		if w.filters.l4.flags > 0 {
+		if tcpFlagsFilterAvailable {
 			// fail fast & open: if this it TCP, then flags cannot be 0; some flag must be set
 			if flags := parseTCPflags(tcp); (flags & w.filters.l4.flags) == 0 {
 				return false
 			}
 		}
 		// fail open
-		return w.filters.l4.ports.IsEmpty() ||
+		return !portsFilterAvailable ||
 			w.filters.l4.ports.ContainsAny(uint16(tcp.SrcPort), uint16(tcp.DstPort))
 	}
 
@@ -417,18 +421,60 @@ func (w *pcapTranslatorWorker) isL4Allowed(
 		return true
 	}
 
-	if !w.filters.l4.protos.IsEmpty() &&
+	if protosFilterAvailable &&
 		!w.filters.l4.protos.Contains(0x11) {
 		return false
 	}
 
 	udp := layer.(*layers.UDP)
-	return w.filters.l4.ports.IsEmpty() ||
+	// fail open
+	return !portsFilterAvailable ||
 		w.filters.l4.ports.ContainsAny(uint16(udp.SrcPort), uint16(udp.DstPort))
 }
 
 func (w *pcapTranslatorWorker) shouldTranslate(ctx context.Context) bool {
 	return w.isL3Allowed(ctx) && w.isL4Allowed(ctx)
+}
+
+func (w *pcapTranslatorWorker) translate(
+	ctx context.Context,
+	index int,
+	layer gopacket.Layer,
+	translations chan<- fmt.Stringer,
+	wg *sync.WaitGroup,
+) {
+	layerType := layer.LayerType()
+	layerTypeStr := layerType.String()
+
+	defer func(index int, layer gopacket.Layer, wg *sync.WaitGroup) {
+		if r := recover(); r != nil {
+			transformerLogger.Printf("%s @%s[%d] | panic: %s\n%s\n",
+				*w.loggerPrefix, layerTypeStr, index, r, string(debug.Stack()))
+		}
+		wg.Done()
+	}(index, layer, wg)
+
+	if translator, ok := packetLayerTranslatorsMap[layerType]; ok {
+		if t := translator(ctx, w, false /* deep */); t == nil {
+			transformerLogger.Printf("%s @translator[%d][%s] | unavailable",
+				*w.loggerPrefix, index, layerTypeStr)
+		} else {
+			translations <- t
+		}
+		return
+	}
+
+	// translator does not have an implementation to handle this layer type
+	switch layer.(type) {
+	case *gopacket.DecodeFailure:
+		err := layer.(*gopacket.DecodeFailure)
+		transformerLogger.Printf("%s error@layer[%d]: %s", *w.loggerPrefix, index, err.Error())
+	default:
+		if !skippedLayers.Contains(layerType) {
+			transformerLogger.Printf("%s @translator[%d][%s] | not found",
+				*w.loggerPrefix, index, layerTypeStr)
+		}
+	}
 }
 
 // The work that needs to be performed
@@ -443,7 +489,9 @@ func (w *pcapTranslatorWorker) Run(ctx context.Context) (buffer interface{}) {
 	}()
 
 	// fail open:
-	//   - if there aren't any filters, continue with translation
+	//   - if there aren't any filters, continue with translation.
+	// fail fast:
+	//   - do not translate any layers before enforcing filters.
 	if w.compat &&
 		w.filters != nil &&
 		!w.shouldTranslate(ctx) {
@@ -471,44 +519,11 @@ func (w *pcapTranslatorWorker) Run(ctx context.Context) (buffer interface{}) {
 	// number of layers to be translated
 	packetLayers := w.pkt(ctx).Layers()
 	wg.Add(len(packetLayers))
-	// wg.Add(packetLayerTranslatorsSize)
 
 	go func(wg *sync.WaitGroup) {
 		wg.Wait()
 		close(translations)
 	}(&wg)
-
-	translate := func(index int, layer gopacket.Layer, wg *sync.WaitGroup) {
-		layerType := layer.LayerType()
-
-		defer func(index int, layer gopacket.Layer, wg *sync.WaitGroup) {
-			if r := recover(); r != nil {
-				transformerLogger.Printf("%s @%s[%d] | panic: %s\n%s\n",
-					*w.loggerPrefix, layerType.String(), index, r, string(debug.Stack()))
-			}
-			wg.Done()
-		}(index, layer, wg)
-
-		if translator, ok := packetLayerTranslatorsMap[layerType]; ok {
-			if t := translator(ctx, w, false /* deep */); t != nil {
-				translations <- t
-			} else {
-				transformerLogger.Printf("%s @translator[%d][%s] | unavailable",
-					*w.loggerPrefix, index, layerType.String())
-			}
-		} else {
-			switch layer.(type) {
-			case *gopacket.DecodeFailure:
-				err := layer.(*gopacket.DecodeFailure)
-				transformerLogger.Printf("%s error@layer[%d]: %s", *w.loggerPrefix, index, err.Error())
-			default:
-				if !skippedLayers.Contains(layerType) {
-					transformerLogger.Printf("%s @translator[%d][%s] | not found",
-						*w.loggerPrefix, index, layerType.String())
-				}
-			}
-		}
-	}
 
 	// O(N); N is the number of layers available in the packet
 	// this is a faster implementation as there is no layer discovery;
@@ -516,35 +531,8 @@ func (w *pcapTranslatorWorker) Run(ctx context.Context) (buffer interface{}) {
 	for i, l := range packetLayers {
 		// translate layers concurrently:
 		//   - layers must know nothing about each other
-		go translate(i, l, &wg)
+		go w.translate(ctx, i, l, translations, &wg)
 	}
-
-	// O(N*M)
-	//   - N: layers
-	//   - M: protocols
-	/*
-		for i, translators := range packetLayerTranslators {
-			// translate layers concurrently:
-			//   - layers must know nothing about each other
-			go func(index int, translators []packetLayerTranslator, wg *sync.WaitGroup) {
-				defer func(index int, wg *sync.WaitGroup) {
-					if r := recover(); r != nil {
-						transformerLogger.Printf("%s @translator[%d] | panic: %s\n%s\n",
-							*w.loggerPrefix, index, r, string(debug.Stack()))
-						buffer = nil
-					}
-					wg.Done()
-				}(index, wg)
-
-				for _, translator := range translators {
-					if t := translator(ctx, w, true); t != nil {
-						translations <- t
-						break // skip next alternatives
-					}
-				}
-			}(i, translators, &wg)
-		}
-	*/
 
 	for translation := range translations {
 		// translations are `nil` if layer is not available
@@ -558,7 +546,7 @@ func (w *pcapTranslatorWorker) Run(ctx context.Context) (buffer interface{}) {
 		// skip `finalize` deliver translation as-is
 		transformerLogger.Printf("%s @translator | incomplete", *w.loggerPrefix)
 	default:
-		// `finalize` is the only method that works across layers
+		// `finalize` is the only method that is allowed to work across layers
 		_buffer, _ = w.translator.finalize(ctx, w.ifaces, w.iface, w.serial, w.packet, w.conntrack, _buffer)
 	}
 
