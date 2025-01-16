@@ -30,8 +30,10 @@ import (
 )
 
 type (
-	TCPFlag             = transformer.TCPFlag
-	TCPFlags            = transformer.TCPFlags
+	TCPFlag  = transformer.TCPFlag
+	TCPFlags = transformer.TCPFlags
+	L4Proto  = transformer.L4Proto
+
 	PcapEmphemeralPorts = transformer.PcapEmphemeralPorts
 
 	PcapFilterMode uint8
@@ -50,7 +52,7 @@ type (
 		AddTCPFlags(...TCPFlag)
 		CombineAndAddTCPFlags(...TCPFlag)
 		AddL3Protos(...uint8)
-		AddL4Protos(...uint8)
+		AddL4Protos(...L4Proto)
 	}
 
 	PcapFilterProvider interface {
@@ -131,14 +133,19 @@ const (
 )
 
 const (
-	TCP_FLAG_SYN = transformer.TCPFlag("SYN")
-	TCP_FLAG_ACK = transformer.TCPFlag("ACK")
-	TCP_FLAG_PSH = transformer.TCPFlag("PSH")
-	TCP_FLAG_FIN = transformer.TCPFlag("FIN")
-	TCP_FLAG_RST = transformer.TCPFlag("RST")
-	TCP_FLAG_URG = transformer.TCPFlag("URG")
-	TCP_FLAG_ECE = transformer.TCPFlag("ECE")
-	TCP_FLAG_CWR = transformer.TCPFlag("CWR")
+	TCP_FLAG_SYN = TCPFlag("SYN")
+	TCP_FLAG_ACK = TCPFlag("ACK")
+	TCP_FLAG_PSH = TCPFlag("PSH")
+	TCP_FLAG_FIN = TCPFlag("FIN")
+	TCP_FLAG_RST = TCPFlag("RST")
+	TCP_FLAG_URG = TCPFlag("URG")
+	TCP_FLAG_ECE = TCPFlag("ECE")
+	TCP_FLAG_CWR = TCPFlag("CWR")
+
+	L4_PROTO_TCP   = L4Proto(0x06)
+	L4_PROTO_UDP   = L4Proto(0x11)
+	L4_PROTO_ICMP  = L4Proto(0x01)
+	L4_PROTO_ICMP6 = L4Proto(0x3A)
 )
 
 func providePcapFilter(

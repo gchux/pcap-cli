@@ -49,6 +49,7 @@ type (
 
 	TCPFlag  string
 	TCPFlags []uint8
+	L3Proto  uint8
 	L4Proto  uint8
 
 	PcapL3Filters struct {
@@ -309,11 +310,15 @@ func parseTCPflags(tcp *layers.TCP) uint8 {
 }
 
 func (flag *TCPFlag) materialize() uint8 {
-	flagStr := string(*flag)
-	if f, ok := tcpFlags[flagStr]; ok {
+	_flag := string(*flag)
+	if f, ok := tcpFlags[_flag]; ok {
 		return f
 	}
 	return 0b00000000
+}
+
+func (flag *TCPFlag) ToUint8() uint8 {
+	return flag.materialize()
 }
 
 func mergeTCPFlags(flags ...TCPFlag) uint8 {
@@ -392,8 +397,10 @@ func (f *PcapFilters) AddL3Protos(protos ...uint8) {
 	f.AddProtos(f.l3.protos, protos...)
 }
 
-func (f *PcapFilters) AddL4Protos(protos ...uint8) {
-	f.AddProtos(f.l4.protos, protos...)
+func (f *PcapFilters) AddL4Protos(protos ...L4Proto) {
+	for _, l4Proto := range protos {
+		f.l4.protos.Add(uint8(l4Proto))
+	}
 }
 
 func ipLessThanFunc(a, b netip.Prefix) bool {
