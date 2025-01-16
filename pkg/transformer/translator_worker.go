@@ -395,7 +395,7 @@ func (w *pcapTranslatorWorker) isL4Allowed(
 	layer := w.asLayer(ctx, layers.LayerTypeTCP)
 	if layer != nil {
 		if !w.filters.l4.protos.IsEmpty() &&
-			p.AddL4Protos(0x01); !w.filters.l4.protos.Contains(0x06) {
+			!w.filters.l4.protos.Contains(0x06) {
 			return false
 		}
 
