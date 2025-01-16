@@ -49,17 +49,20 @@ type (
 
 	TCPFlag  string
 	TCPFlags []uint8
+	L4Proto  uint8
 
 	PcapL3Filters struct {
 		// filter IPs in O(log N)
 		networks4 *btree.BTreeG[netip.Prefix]
 		networks6 *btree.BTreeG[netip.Prefix]
+		protos    mapset.Set[uint8]
 	}
 
 	PcapL4Filters struct {
 		// filter ports and flags in O(1)
-		ports mapset.Set[uint16]
-		flags uint8
+		ports  mapset.Set[uint16]
+		flags  uint8
+		protos mapset.Set[uint8]
 	}
 
 	PcapFilters struct {
@@ -376,6 +379,23 @@ func (f *PcapFilters) CombineAndAddTCPFlags(flag ...TCPFlag) {
 	f.l4.flags |= mergeTCPFlags(flag...)
 }
 
+func (f *PcapFilters) AddProtos(
+	protosSet mapset.Set[uint8],
+	protos ...uint8,
+) {
+	for _, proto := range protos {
+		protosSet.Add(proto)
+	}
+}
+
+func (f *PcapFilters) AddL3Protos(protos ...uint8) {
+	f.AddProtos(f.l3.protos, protos...)
+}
+
+func (f *PcapFilters) AddL4Protos(protos ...uint8) {
+	f.AddProtos(f.l4.protos, protos...)
+}
+
 func ipLessThanFunc(a, b netip.Prefix) bool {
 	if a.Overlaps(b) {
 		return false
@@ -388,10 +408,12 @@ func NewPcapFilters() *PcapFilters {
 		l3: &PcapL3Filters{
 			networks4: btree.NewG[netip.Prefix](2, ipLessThanFunc),
 			networks6: btree.NewG[netip.Prefix](2, ipLessThanFunc),
+			protos:    mapset.NewSet[uint8](),
 		},
 		l4: &PcapL4Filters{
-			ports: mapset.NewSet[uint16](),
-			flags: 0b00000000,
+			ports:  mapset.NewSet[uint16](),
+			flags:  0b00000000,
+			protos: mapset.NewSet[uint8](),
 		},
 	}
 }

@@ -40,6 +40,7 @@ type (
 		Raw *string
 	}
 
+	// PCAP owns the behavior that will be exposed to consumers
 	PcapFilters interface {
 		AddIPv4s(...string)
 		AddIPv6s(...string)
@@ -48,6 +49,8 @@ type (
 		AddPorts(...uint16)
 		AddTCPFlags(...TCPFlag)
 		CombineAndAddTCPFlags(...TCPFlag)
+		AddL3Protos(...uint8)
+		AddL4Protos(...uint8)
 	}
 
 	PcapFilterProvider interface {
@@ -112,7 +115,7 @@ const (
 )
 
 const (
-	PcapDefaultFilter = "(tcp or udp or icmp or icmp6) and (ip or ip6)"
+	PcapDefaultFilter = "(tcp or udp or icmp or icmp6 or arp) and (ip or ip6) and not llc"
 )
 
 const (
@@ -128,14 +131,14 @@ const (
 )
 
 const (
-	TCP_FLAG_SYN transformer.TCPFlag = transformer.TCPFlag("SYN")
-	TCP_FLAG_ACK transformer.TCPFlag = transformer.TCPFlag("ACK")
-	TCP_FLAG_PSH transformer.TCPFlag = transformer.TCPFlag("PSH")
-	TCP_FLAG_FIN transformer.TCPFlag = transformer.TCPFlag("FIN")
-	TCP_FLAG_RST transformer.TCPFlag = transformer.TCPFlag("RST")
-	TCP_FLAG_URG transformer.TCPFlag = transformer.TCPFlag("URG")
-	TCP_FLAG_ECE transformer.TCPFlag = transformer.TCPFlag("ECE")
-	TCP_FLAG_CWR transformer.TCPFlag = transformer.TCPFlag("CWR")
+	TCP_FLAG_SYN = transformer.TCPFlag("SYN")
+	TCP_FLAG_ACK = transformer.TCPFlag("ACK")
+	TCP_FLAG_PSH = transformer.TCPFlag("PSH")
+	TCP_FLAG_FIN = transformer.TCPFlag("FIN")
+	TCP_FLAG_RST = transformer.TCPFlag("RST")
+	TCP_FLAG_URG = transformer.TCPFlag("URG")
+	TCP_FLAG_ECE = transformer.TCPFlag("ECE")
+	TCP_FLAG_CWR = transformer.TCPFlag("CWR")
 )
 
 func providePcapFilter(

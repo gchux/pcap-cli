@@ -301,6 +301,11 @@ func (w *pcapTranslatorWorker) isIPv4Allowed(
 	ctx context.Context,
 	ip4 *layers.IPv4,
 ) bool {
+	if !w.filters.l3.protos.IsEmpty() &&
+		!w.filters.l3.protos.Contains(0x04) {
+		return false
+	}
+
 	var ipBytes [4]byte
 
 	copy(ipBytes[:], ip4.SrcIP.To4())
@@ -322,6 +327,11 @@ func (w *pcapTranslatorWorker) isIPv6Allowed(
 	ctx context.Context,
 	ip6 *layers.IPv6,
 ) bool {
+	if !w.filters.l3.protos.IsEmpty() &&
+		!w.filters.l3.protos.Contains(0x29) {
+		return false
+	}
+
 	var ipBytes [16]byte
 
 	copy(ipBytes[:], ip6.SrcIP.To16())
@@ -343,7 +353,9 @@ func (w *pcapTranslatorWorker) isL3Allowed(
 	ctx context.Context,
 ) bool {
 	if w.filters.l3.networks4.Len() == 0 &&
-		w.filters.l3.networks6.Len() == 0 {
+		w.filters.l3.networks6.Len() == 0 &&
+		w.filters.l3.protos.IsEmpty() {
+		// nothing to verify...
 		// no IP filters available
 		// fail open and fail fast
 		return true
@@ -372,13 +384,21 @@ func (w *pcapTranslatorWorker) isL3Allowed(
 func (w *pcapTranslatorWorker) isL4Allowed(
 	ctx context.Context,
 ) bool {
-	if w.filters.l4.ports.Cardinality() == 0 {
+	if w.filters.l4.ports.IsEmpty() &&
+		w.filters.l4.flags == 0 &&
+		// nothing to verify...
+		w.filters.l4.protos.IsEmpty() {
 		// fail open and fail fast
 		return true
 	}
 
 	layer := w.asLayer(ctx, layers.LayerTypeTCP)
 	if layer != nil {
+		if !w.filters.l4.protos.IsEmpty() &&
+			p.AddL4Protos(0x01); !w.filters.l4.protos.Contains(0x06) {
+			return false
+		}
+
 		tcp := layer.(*layers.TCP)
 		if w.filters.l4.flags > 0 {
 			// fail fast & open: if this it TCP, then flags cannot be 0; some flag must be set
@@ -395,6 +415,11 @@ func (w *pcapTranslatorWorker) isL4Allowed(
 	if layer == nil {
 		// fail open
 		return true
+	}
+
+	if !w.filters.l4.protos.IsEmpty() &&
+		!w.filters.l4.protos.Contains(0x11) {
+		return false
 	}
 
 	udp := layer.(*layers.UDP)
