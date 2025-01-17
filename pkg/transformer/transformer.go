@@ -15,14 +15,12 @@
 package transformer
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
-	"net/netip"
 	"os"
 	"regexp"
 	"runtime/debug"
@@ -32,12 +30,10 @@ import (
 	"time"
 
 	mapset "github.com/deckarep/golang-set/v2"
-	"github.com/google/btree"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/panjf2000/ants/v2"
 	concurrently "github.com/tejzpr/ordered-concurrently/v3"
-	"github.com/wissance/stringFormatter"
 )
 
 var transformerLogger = log.New(os.Stderr, "[transformer] - ", log.LstdFlags)
@@ -46,30 +42,6 @@ type (
 	PcapTranslatorFactory = func(context.Context, bool, *PcapIface, *PcapEmphemeralPorts) PcapTranslator
 
 	PcapTranslatorFmt uint8
-
-	TCPFlag  string
-	TCPFlags []uint8
-	L3Proto  uint8
-	L4Proto  uint8
-
-	PcapL3Filters struct {
-		// filter IPs in O(log N)
-		networks4 *btree.BTreeG[netip.Prefix]
-		networks6 *btree.BTreeG[netip.Prefix]
-		protos    mapset.Set[uint8]
-	}
-
-	PcapL4Filters struct {
-		// filter ports and flags in O(1)
-		ports  mapset.Set[uint16]
-		flags  uint8
-		protos mapset.Set[uint8]
-	}
-
-	PcapFilters struct {
-		l3 *PcapL3Filters
-		l4 *PcapL4Filters
-	}
 
 	PcapTranslator interface {
 		next(context.Context, *PcapIface, *uint64, *gopacket.Packet) fmt.Stringer
@@ -199,7 +171,7 @@ var (
 		tcpEceStr: 0b01000000,
 		tcpCwrStr: 0b10000000,
 	}
-	TCP_FLAGS = tcpFlags
+	tcpFlagNil = 0b00000000
 
 	tcpSynAckStr    = tcpSynStr + "|" + tcpAckStr
 	tcpSynRstStr    = tcpSynStr + "|" + tcpRstStr
@@ -278,171 +250,6 @@ var (
 	errUnavailableTranslator  = errors.New("packet translator is unavailable")
 )
 
-func parseTCPflags(tcp *layers.TCP) uint8 {
-	var setFlags uint8 = 0
-
-	if tcp.SYN {
-		setFlags = setFlags | tcpSyn
-	}
-	if tcp.ACK {
-		setFlags = setFlags | tcpAck
-	}
-	if tcp.PSH {
-		setFlags = setFlags | tcpPsh
-	}
-	if tcp.FIN {
-		setFlags = setFlags | tcpFin
-	}
-	if tcp.RST {
-		setFlags = setFlags | tcpRst
-	}
-	if tcp.URG {
-		setFlags = setFlags | tcpUrg
-	}
-	if tcp.ECE {
-		setFlags = setFlags | tcpEce
-	}
-	if tcp.CWR {
-		setFlags = setFlags | tcpCwr
-	}
-
-	return setFlags
-}
-
-func (flag *TCPFlag) materialize() uint8 {
-	_flag := string(*flag)
-	if f, ok := tcpFlags[_flag]; ok {
-		return f
-	}
-	return 0b00000000
-}
-
-func (flag *TCPFlag) ToUint8() uint8 {
-	return flag.materialize()
-}
-
-func mergeTCPFlags(flags ...TCPFlag) uint8 {
-	mergedFlags := uint8(0)
-	for _, flag := range flags {
-		mergedFlags |= flag.materialize()
-	}
-	return mergedFlags
-}
-
-func (f *PcapFilters) addNetwork(
-	networks *btree.BTreeG[netip.Prefix],
-	isIPv6 bool, ipRange string,
-) {
-	if prefix, err := netip.ParsePrefix(ipRange); err == nil {
-		if isIPv6 && prefix.Addr().Is6() ||
-			!isIPv6 && prefix.Addr().Is4() {
-			networks.ReplaceOrInsert(prefix)
-		}
-	}
-}
-
-func (f *PcapFilters) addNetworks(
-	networks *btree.BTreeG[netip.Prefix],
-	isIPv6 bool, ipRanges ...string,
-) {
-	for _, ipRange := range ipRanges {
-		f.addNetwork(networks, isIPv6, ipRange)
-	}
-}
-
-func (f *PcapFilters) AddIPv4s(IPv4s ...string) {
-	for _, IPv4 := range IPv4s {
-		f.addNetwork(f.l3.networks4, false /* isIPv6 */, stringFormatter.Format("{0}/32", IPv4))
-	}
-}
-
-func (f *PcapFilters) AddIPv6s(IPv6s ...string) {
-	for _, IPv6 := range IPv6s {
-		f.addNetwork(f.l3.networks4, false /* isIPv6 */, stringFormatter.Format("{0}/128", IPv6))
-	}
-}
-
-func (f *PcapFilters) AddIPv4Ranges(IPv4Ranges ...string) {
-	f.addNetworks(f.l3.networks4, false /* isIPv6 */, IPv4Ranges...)
-}
-
-func (f *PcapFilters) AddIPv6Ranges(IPv6Ranges ...string) {
-	f.addNetworks(f.l3.networks6, true /* isIPv6 */, IPv6Ranges...)
-}
-
-func (f *PcapFilters) AddPorts(ports ...uint16) {
-	f.l4.ports.Append(ports...)
-}
-
-func (f *PcapFilters) AddTCPFlags(flags ...TCPFlag) {
-	for _, flag := range flags {
-		f.l4.flags |= flag.materialize()
-	}
-}
-
-func (f *PcapFilters) CombineAndAddTCPFlags(flag ...TCPFlag) {
-	f.l4.flags |= mergeTCPFlags(flag...)
-}
-
-func (f *PcapFilters) AddProtos(
-	protosSet mapset.Set[uint8],
-	protos ...uint8,
-) {
-	for _, proto := range protos {
-		protosSet.Add(proto)
-	}
-}
-
-func (f *PcapFilters) AddL3Protos(protos ...uint8) {
-	f.AddProtos(f.l3.protos, protos...)
-}
-
-func (f *PcapFilters) AddL4Protos(protos ...L4Proto) {
-	for _, l4Proto := range protos {
-		f.l4.protos.Add(uint8(l4Proto))
-	}
-}
-
-func ipLessThanFunc(a, b netip.Prefix) bool {
-	if a.Overlaps(b) {
-		return false
-	}
-	return bytes.Compare(a.Addr().AsSlice(), b.Addr().AsSlice()) < 0
-}
-
-func NewPcapFilters() *PcapFilters {
-	return &PcapFilters{
-		l3: &PcapL3Filters{
-			networks4: btree.NewG[netip.Prefix](2, ipLessThanFunc),
-			networks6: btree.NewG[netip.Prefix](2, ipLessThanFunc),
-			protos:    mapset.NewSet[uint8](),
-		},
-		l4: &PcapL4Filters{
-			ports:  mapset.NewSet[uint16](),
-			flags:  0b00000000,
-			protos: mapset.NewSet[uint8](),
-		},
-	}
-}
-
-func (eph *PcapEmphemeralPorts) isEphemeralPort(port *uint16) bool {
-	return *port >= eph.Min && *port <= eph.Max
-}
-
-func (eph *PcapEmphemeralPorts) isEphemeralUDPPort(udpPort *layers.UDPPort) bool {
-	port := uint16(*udpPort)
-	return eph.isEphemeralPort(&port)
-}
-
-func (eph *PcapEmphemeralPorts) isEphemeralTCPPort(tcpPort *layers.TCPPort) bool {
-	port := uint16(*tcpPort)
-	return eph.isEphemeralPort(&port)
-}
-
-func isConnectionTermination(tcpFlags *uint8) bool {
-	return *tcpFlags&(tcpFin|tcpRst) != 0
-}
-
 func (t *PcapTransformer) writeTranslation(ctx context.Context, task *pcapWriteTask) error {
 	defer func() {
 		t.counter.Add(-1)
@@ -492,10 +299,6 @@ func (t *PcapTransformer) produceTranslation(
 ) error {
 	translation := task.Run(ctx)
 	if translation == nil {
-		/*
-			return fmt.Errorf("%s #:%d | produceTranslation: %w",
-				*t.loggerPrefix, *task.serial, errUnavailableTranslation)
-		*/
 		return nil
 	}
 	return t.publishTranslation(ctx, translation.(*fmt.Stringer))

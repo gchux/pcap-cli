@@ -32,7 +32,8 @@ import (
 type (
 	TCPFlag  = transformer.TCPFlag
 	TCPFlags = transformer.TCPFlags
-	L4Proto  = transformer.L4Proto
+
+	L4Proto = transformer.L4Proto
 
 	PcapEmphemeralPorts = transformer.PcapEmphemeralPorts
 
@@ -128,8 +129,8 @@ const (
 
 const (
 	// see: https://github.com/google/gopacket/blob/master/pcap/pcap.go#L802-L808
-	any_device_name  string = "any"
-	any_devide_index uint8  = 0
+	anyDeviceName  string = "any"
+	anyDeviceIndex uint8  = 0
 )
 
 const (

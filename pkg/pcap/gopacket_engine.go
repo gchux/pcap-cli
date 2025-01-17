@@ -124,17 +124,16 @@ func (p *Pcap) Start(
 		}
 	} else {
 		iface = &transformer.PcapIface{
-			Index: any_devide_index,
-			Name:  any_device_name,
+			Index: anyDeviceIndex,
+			Name:  anyDeviceName,
 			Addrs: mapset.NewThreadUnsafeSetWithSize[string](0),
 		}
 	}
 
 	loggerPrefix := fmt.Sprintf("[%d/%s]", iface.Index, iface.Name)
 
-	// [ToDo]: confirm that both validations are required
-	if !compat && iface.Index != any_devide_index {
-		// set packet capture filter; i/e: `tcp port 443`
+	if !compat {
+		// set packet capture filter; i/e: `tcp port 8080`
 		if filter := providePcapFilter(ctx, &cfg.Filter, cfg.Filters); *filter != "" {
 			if err = handle.SetBPFFilter(*filter); err != nil {
 				gopacketLogger.Printf("%s - BPF filter error: [%s] => %+v\n", loggerPrefix, *filter, err)
@@ -242,7 +241,7 @@ func NewPcap(config *PcapConfig) (PcapEngine, error) {
 
 	pcap := Pcap{config: config, isActive: &isActive}
 
-	if strings.EqualFold(config.Iface, any_device_name) {
+	if strings.EqualFold(config.Iface, anyDeviceName) {
 		config.Device = nil
 	} else {
 		devices, err := FindDevicesByName(&config.Iface)

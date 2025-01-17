@@ -52,7 +52,7 @@ func (t *Tcpdump) buildArgs(ctx context.Context) []string {
 		args = append(args, "-G", fmt.Sprintf("%d", cfg.Interval))
 	}
 
-	if cfg.Iface != any_device_name {
+	if cfg.Iface != anyDeviceName {
 		if filter := providePcapFilter(ctx,
 			&cfg.Filter, cfg.Filters); *filter != "" {
 			args = append(args, *filter)

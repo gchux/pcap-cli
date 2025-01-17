@@ -384,13 +384,13 @@ func (w *pcapTranslatorWorker) isL3Allowed(
 func (w *pcapTranslatorWorker) isL4Allowed(
 	ctx context.Context,
 ) bool {
-	protosFilterAvailable := !w.filters.l4.protos.IsEmpty()
-	tcpFlagsFilterAvailable := w.filters.l4.flags > 0
-	portsFilterAvailable := !w.filters.l4.ports.IsEmpty()
+	isProtosFilterAvailable := !w.filters.l4.protos.IsEmpty()
+	isTCPflagsFilterAvailable := w.filters.l4.flags > 0b00000000
+	isPortsFilterAvailable := !w.filters.l4.ports.IsEmpty()
 
-	if !protosFilterAvailable &&
-		!tcpFlagsFilterAvailable &&
-		!portsFilterAvailable {
+	if !isProtosFilterAvailable &&
+		!isTCPflagsFilterAvailable &&
+		!isPortsFilterAvailable {
 		// nothing to verify...
 		// fail open and fail fast
 		return true
@@ -398,20 +398,22 @@ func (w *pcapTranslatorWorker) isL4Allowed(
 
 	layer := w.asLayer(ctx, layers.LayerTypeTCP)
 	if layer != nil {
-		if protosFilterAvailable &&
+		if isProtosFilterAvailable &&
 			!w.filters.l4.protos.Contains(0x06) {
 			return false
 		}
 
 		tcp := layer.(*layers.TCP)
-		if tcpFlagsFilterAvailable {
+
+		if isTCPflagsFilterAvailable {
 			// fail fast & open: if this it TCP, then flags cannot be 0; some flag must be set
 			if flags := parseTCPflags(tcp); (flags & w.filters.l4.flags) == 0 {
 				return false
 			}
 		}
+
 		// fail open
-		return !portsFilterAvailable ||
+		return !isPortsFilterAvailable ||
 			w.filters.l4.ports.ContainsAny(uint16(tcp.SrcPort), uint16(tcp.DstPort))
 	}
 
@@ -421,14 +423,14 @@ func (w *pcapTranslatorWorker) isL4Allowed(
 		return true
 	}
 
-	if protosFilterAvailable &&
+	if isProtosFilterAvailable &&
 		!w.filters.l4.protos.Contains(0x11) {
 		return false
 	}
 
 	udp := layer.(*layers.UDP)
 	// fail open
-	return !portsFilterAvailable ||
+	return !isPortsFilterAvailable ||
 		w.filters.l4.ports.ContainsAny(uint16(udp.SrcPort), uint16(udp.DstPort))
 }
 
