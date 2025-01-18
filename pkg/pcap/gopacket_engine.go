@@ -160,7 +160,7 @@ func (p *Pcap) Start(
 	}
 
 	format := cfg.Format
-	compatFilters, ok := cfg.CompatFilters.(*transformer.PcapFilters)
+	compatFilters, ok := cfg.CompatFilters.(transformer.PcapFilters)
 	if !ok {
 		compatFilters = nil
 	}

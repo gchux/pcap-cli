@@ -86,7 +86,7 @@ type (
 		connTracking    bool
 		apply           func(*pcapTranslatorWorker) error
 		counter         *atomic.Int64
-		filters         *PcapFilters
+		filters         PcapFilters
 		debug, compat   bool
 	}
 
@@ -611,7 +611,7 @@ func newTransformer(
 	ctx context.Context,
 	iface *PcapIface,
 	ephemerals *PcapEmphemeralPorts,
-	filters *PcapFilters,
+	filters PcapFilters,
 	writers []io.Writer,
 	format *string,
 	preserveOrder,
@@ -715,7 +715,7 @@ func NewOrderedTransformer(
 	ctx context.Context,
 	iface *PcapIface,
 	ephemerals *PcapEmphemeralPorts,
-	filters *PcapFilters,
+	filters PcapFilters,
 	writers []io.Writer,
 	format *string,
 	debug, compat bool,
@@ -727,7 +727,7 @@ func NewConnTrackTransformer(
 	ctx context.Context,
 	iface *PcapIface,
 	ephemerals *PcapEmphemeralPorts,
-	filters *PcapFilters,
+	filters PcapFilters,
 	writers []io.Writer,
 	format *string,
 	debug, compat bool,
@@ -739,7 +739,7 @@ func NewDebugTransformer(
 	ctx context.Context,
 	iface *PcapIface,
 	ephemerals *PcapEmphemeralPorts,
-	filters *PcapFilters,
+	filters PcapFilters,
 	writers []io.Writer,
 	format *string,
 	compat bool,
@@ -751,7 +751,7 @@ func NewTransformer(
 	ctx context.Context,
 	iface *PcapIface,
 	ephemerals *PcapEmphemeralPorts,
-	filters *PcapFilters,
+	filters PcapFilters,
 	writers []io.Writer,
 	format *string,
 	debug, compat bool,

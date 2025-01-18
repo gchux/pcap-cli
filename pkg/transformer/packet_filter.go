@@ -31,23 +31,50 @@ type (
 
 	L4Proto uint8
 
-	PcapL3Filters struct {
+	pcapL3Filters struct {
 		// filter IPs in O(log N)
 		networks4 *btree.BTreeG[netip.Prefix]
 		networks6 *btree.BTreeG[netip.Prefix]
 		protos    mapset.Set[uint8]
 	}
 
-	PcapL4Filters struct {
+	pcapL4Filters struct {
 		// filter ports and flags in O(1)
 		ports  mapset.Set[uint16]
 		flags  uint8
 		protos mapset.Set[uint8]
 	}
 
-	PcapFilters struct {
-		l3 *PcapL3Filters
-		l4 *PcapL4Filters
+	pcapFilters struct {
+		l3 *pcapL3Filters
+		l4 *pcapL4Filters
+	}
+
+	PcapFilters interface {
+		HasL3Protos() bool
+		HasIPs() bool
+		HasIPv4s() bool
+		HasIPv6s() bool
+
+		HasL4Protos() bool
+		HasTCPflags() bool
+		HasL4Addrs() bool
+
+		AllowsL3Proto(proto *uint8)
+		AllowsIP(*netip.Addr) bool
+		AllowsIPv4() bool
+		AllowsIPv4Addr(*netip.Addr) bool
+		AllowsIPv4Bytes([4]byte) bool
+		AllowsIPv6() bool
+		AllowsIPv6Addr(*netip.Addr) bool
+		AllowsIPv6Bytes([16]byte) bool
+
+		AllowsL4Proto(*uint8) bool
+		AllowsTCP() bool
+		AllowsUDP() bool
+		AllowsL4Addr(*uint16) bool
+		AllowsAnyL4Addr(...uint16) bool
+		AllowsAnyTCPflags(*uint8) bool
 	}
 )
 
@@ -71,7 +98,7 @@ func mergeTCPFlags(flags ...TCPFlag) uint8 {
 	return mergedFlags
 }
 
-func (f *PcapFilters) addNetwork(
+func (f *pcapFilters) addNetwork(
 	networks *btree.BTreeG[netip.Prefix],
 	isIPv6 bool, ipRange string,
 ) {
@@ -83,7 +110,7 @@ func (f *PcapFilters) addNetwork(
 	}
 }
 
-func (f *PcapFilters) addNetworks(
+func (f *pcapFilters) addNetworks(
 	networks *btree.BTreeG[netip.Prefix],
 	isIPv6 bool, ipRanges ...string,
 ) {
@@ -92,41 +119,41 @@ func (f *PcapFilters) addNetworks(
 	}
 }
 
-func (f *PcapFilters) AddIPv4s(IPv4s ...string) {
+func (f *pcapFilters) AddIPv4s(IPv4s ...string) {
 	for _, IPv4 := range IPv4s {
 		f.addNetwork(f.l3.networks4, false /* isIPv6 */, stringFormatter.Format("{0}/32", IPv4))
 	}
 }
 
-func (f *PcapFilters) AddIPv6s(IPv6s ...string) {
+func (f *pcapFilters) AddIPv6s(IPv6s ...string) {
 	for _, IPv6 := range IPv6s {
 		f.addNetwork(f.l3.networks4, false /* isIPv6 */, stringFormatter.Format("{0}/128", IPv6))
 	}
 }
 
-func (f *PcapFilters) AddIPv4Ranges(IPv4Ranges ...string) {
+func (f *pcapFilters) AddIPv4Ranges(IPv4Ranges ...string) {
 	f.addNetworks(f.l3.networks4, false /* isIPv6 */, IPv4Ranges...)
 }
 
-func (f *PcapFilters) AddIPv6Ranges(IPv6Ranges ...string) {
+func (f *pcapFilters) AddIPv6Ranges(IPv6Ranges ...string) {
 	f.addNetworks(f.l3.networks6, true /* isIPv6 */, IPv6Ranges...)
 }
 
-func (f *PcapFilters) AddPorts(ports ...uint16) {
+func (f *pcapFilters) AddPorts(ports ...uint16) {
 	f.l4.ports.Append(ports...)
 }
 
-func (f *PcapFilters) AddTCPFlags(flags ...TCPFlag) {
+func (f *pcapFilters) AddTCPFlags(flags ...TCPFlag) {
 	for _, flag := range flags {
 		f.l4.flags |= flag.materialize()
 	}
 }
 
-func (f *PcapFilters) CombineAndAddTCPFlags(flag ...TCPFlag) {
+func (f *pcapFilters) CombineAndAddTCPFlags(flag ...TCPFlag) {
 	f.l4.flags |= mergeTCPFlags(flag...)
 }
 
-func (f *PcapFilters) AddProtos(
+func (f *pcapFilters) AddProtos(
 	protosSet mapset.Set[uint8],
 	protos ...uint8,
 ) {
@@ -135,14 +162,118 @@ func (f *PcapFilters) AddProtos(
 	}
 }
 
-func (f *PcapFilters) AddL3Protos(protos ...uint8) {
-	f.AddProtos(f.l3.protos, protos...)
+func (f *pcapFilters) AddL3Proto(proto L3Proto) {
+	f.l3.protos.Add(uint8(proto))
 }
 
-func (f *PcapFilters) AddL4Protos(protos ...L4Proto) {
-	for _, l4Proto := range protos {
-		f.l4.protos.Add(uint8(l4Proto))
+func (f *pcapFilters) AddL3Protos(protos ...L3Proto) {
+	for _, proto := range protos {
+		f.AddL3Proto(proto)
 	}
+}
+
+func (f *pcapFilters) AddL4Proto(proto L4Proto) {
+	f.l4.protos.Add(uint8(proto))
+}
+
+func (f *pcapFilters) AddL4Protos(protos ...L4Proto) {
+	for _, proto := range protos {
+		f.AddL4Proto(proto)
+	}
+}
+
+func (f *pcapFilters) HasL3Protos() bool {
+	return !f.l3.protos.IsEmpty()
+}
+
+func (f *pcapFilters) HasIPv4s() bool {
+	return f.l3.networks4.Len() > 0
+}
+
+func (f *pcapFilters) HasIPv6s() bool {
+	return f.l3.networks6.Len() > 0
+}
+
+func (f *pcapFilters) HasIPs() bool {
+	return f.HasIPv4s() || f.HasIPv6s()
+}
+
+func (f *pcapFilters) AllowsIPv4() bool {
+	return f.l3.protos.Contains(0x04)
+}
+
+func (f *pcapFilters) AllowsIPv6() bool {
+	return f.l3.protos.Contains(0x29)
+}
+
+func (f *pcapFilters) allowsIP(
+	networks *btree.BTreeG[netip.Prefix],
+	network *netip.Prefix,
+) bool {
+	return networks.Has(*network)
+}
+
+func (f *pcapFilters) AllowsIPv4Addr(ip4 *netip.Addr) bool {
+	prefix := netip.PrefixFrom(*ip4, 32)
+	return f.allowsIP(f.l3.networks4, &prefix)
+}
+
+func (f *pcapFilters) AllowsIPv4Bytes(ip4 [4]byte) bool {
+	IPv4 := netip.AddrFrom4(ip4)
+	return f.AllowsIPv4Addr(&IPv4)
+}
+
+func (f *pcapFilters) AllowsIPv6Addr(ip6 *netip.Addr) bool {
+	prefix := netip.PrefixFrom(*ip6, 128)
+	return f.allowsIP(f.l3.networks6, &prefix)
+}
+
+func (f *pcapFilters) AllowsIPv6Bytes(ip6 [16]byte) bool {
+	IPv6 := netip.AddrFrom16(ip6)
+	return f.AllowsIPv4Addr(&IPv6)
+}
+
+func (f *pcapFilters) AllowsIP(ip *netip.Addr) bool {
+	if ip.Is4() {
+		return f.AllowsIPv4Addr(ip)
+	}
+	return f.AllowsIPv6Addr(ip)
+}
+
+func (f *pcapFilters) HasL4Protos() bool {
+	return !f.l4.protos.IsEmpty()
+}
+
+func (f *pcapFilters) AllowsL4Proto(proto *uint8) bool {
+	return f.l4.protos.Contains(*proto)
+}
+
+func (f *pcapFilters) AllowsTCP() bool {
+	return f.l4.protos.Contains(0x06)
+}
+
+func (f *pcapFilters) AllowsUDP() bool {
+	return f.l4.protos.Contains(0x11)
+}
+
+func (f *pcapFilters) HasL4Addrs() bool {
+	return !f.l4.ports.IsEmpty()
+}
+
+func (f *pcapFilters) AllowsL4Addr(port *uint16) bool {
+	return f.l4.ports.Contains(*port)
+}
+
+func (f *pcapFilters) AllowsAnyL4Addr(ports ...uint16) bool {
+	return f.l4.ports.ContainsAny(ports...)
+}
+
+func (f *pcapFilters) HasTCPflags() bool {
+	return f.l4.flags > 0b00000000
+}
+
+func (f *pcapFilters) AllowAnysTCPflags(flags *uint8) bool {
+	return (*flags & f.l4.flags) > 0
 }
 
 func ipLessThanFunc(a, b netip.Prefix) bool {
@@ -152,14 +283,14 @@ func ipLessThanFunc(a, b netip.Prefix) bool {
 	return bytes.Compare(a.Addr().AsSlice(), b.Addr().AsSlice()) < 0
 }
 
-func NewPcapFilters() *PcapFilters {
-	return &PcapFilters{
-		l3: &PcapL3Filters{
+func NewPcapFilters() *pcapFilters {
+	return &pcapFilters{
+		l3: &pcapL3Filters{
 			networks4: btree.NewG[netip.Prefix](2, ipLessThanFunc),
 			networks6: btree.NewG[netip.Prefix](2, ipLessThanFunc),
 			protos:    mapset.NewSet[uint8](),
 		},
-		l4: &PcapL4Filters{
+		l4: &pcapL4Filters{
 			ports:  mapset.NewSet[uint16](),
 			flags:  uint8(tcpFlagNil),
 			protos: mapset.NewSet[uint8](),

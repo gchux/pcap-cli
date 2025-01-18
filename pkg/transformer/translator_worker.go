@@ -17,7 +17,6 @@ package transformer
 import (
 	"context"
 	"fmt"
-	"net/netip"
 	"runtime/debug"
 	"sync"
 	"time"
@@ -31,7 +30,7 @@ type (
 	pcapTranslatorWorker struct {
 		ifaces     netIfaceIndex
 		iface      *PcapIface
-		filters    *PcapFilters
+		filters    PcapFilters
 		serial     *uint64
 		packet     *gopacket.Packet
 		translator PcapTranslator
@@ -301,62 +300,55 @@ func (w *pcapTranslatorWorker) isIPv4Allowed(
 	ctx context.Context,
 	ip4 *layers.IPv4,
 ) bool {
-	if !w.filters.l3.protos.IsEmpty() &&
-		!w.filters.l3.protos.Contains(0x04) {
+	if w.filters.HasL3Protos() && !w.filters.AllowsIPv4() {
 		return false
 	}
 
-	var ipBytes [4]byte
-
-	copy(ipBytes[:], ip4.SrcIP.To4())
-	ipv4 := netip.AddrFrom4(ipBytes)
-	prefix := netip.PrefixFrom(ipv4, 32)
-
-	if w.filters.l3.networks4.Has(prefix) {
+	if !w.filters.HasIPv4s() {
+		// fail open: ALL IPv4s are allowed
 		return true
 	}
 
-	copy(ipBytes[:], ip4.DstIP.To4())
-	ipv4 = netip.AddrFrom4(ipBytes)
-	prefix = netip.PrefixFrom(ipv4, 32)
+	var ip4Bytes [4]byte
 
-	return w.filters.l3.networks4.Has(prefix)
+	copy(ip4Bytes[:], ip4.SrcIP.To4())
+	if w.filters.AllowsIPv4Bytes(ip4Bytes) {
+		return true
+	}
+
+	copy(ip4Bytes[:], ip4.DstIP.To4())
+	return w.filters.AllowsIPv4Bytes(ip4Bytes)
 }
 
 func (w *pcapTranslatorWorker) isIPv6Allowed(
 	ctx context.Context,
 	ip6 *layers.IPv6,
 ) bool {
-	if !w.filters.l3.protos.IsEmpty() &&
-		!w.filters.l3.protos.Contains(0x29) {
+	if w.filters.HasL3Protos() && !w.filters.AllowsIPv6() {
 		return false
 	}
 
-	var ipBytes [16]byte
-
-	copy(ipBytes[:], ip6.SrcIP.To16())
-	ipv4 := netip.AddrFrom16(ipBytes)
-	prefix := netip.PrefixFrom(ipv4, 128)
-
-	if w.filters.l3.networks6.Has(prefix) {
+	if !w.filters.HasIPv6s() {
+		// fail open: ALL IPv6s are allowed
 		return true
 	}
 
-	copy(ipBytes[:], ip6.DstIP.To16())
-	ipv4 = netip.AddrFrom16(ipBytes)
-	prefix = netip.PrefixFrom(ipv4, 128)
+	var ip6Bytes [16]byte
 
-	return w.filters.l3.networks6.Has(prefix)
+	copy(ip6Bytes[:], ip6.SrcIP.To16())
+	if !w.filters.AllowsIPv6Bytes(ip6Bytes) {
+		return false
+	}
+
+	copy(ip6Bytes[:], ip6.DstIP.To16())
+	return w.filters.AllowsIPv6Bytes(ip6Bytes)
 }
 
 func (w *pcapTranslatorWorker) isL3Allowed(
 	ctx context.Context,
 ) bool {
-	if w.filters.l3.networks4.Len() == 0 &&
-		w.filters.l3.networks6.Len() == 0 &&
-		w.filters.l3.protos.IsEmpty() {
+	if !w.filters.HasL3Protos() && !w.filters.HasIPs() {
 		// nothing to verify...
-		// no IP filters available
 		// fail open and fail fast
 		return true
 	}
@@ -367,9 +359,8 @@ func (w *pcapTranslatorWorker) isL3Allowed(
 		if layer = w.asLayer(ctx, layers.LayerTypeIPv6); layer == nil {
 			// the packet does not contain IP layer information
 			return true
-		} else {
-			isIPv6 = true
 		}
+		isIPv6 = true
 	}
 
 	if isIPv6 {
@@ -384,13 +375,13 @@ func (w *pcapTranslatorWorker) isL3Allowed(
 func (w *pcapTranslatorWorker) isL4Allowed(
 	ctx context.Context,
 ) bool {
-	isProtosFilterAvailable := !w.filters.l4.protos.IsEmpty()
-	isTCPflagsFilterAvailable := w.filters.l4.flags > 0b00000000
-	isPortsFilterAvailable := !w.filters.l4.ports.IsEmpty()
+	isProtosFilterAvailable := !w.filters.HasL4Protos()
+	isTCPflagsFilterAvailable := w.filters.HasTCPflags()
+	isL4AddrsFilterAvailable := !w.filters.HasL4Addrs()
 
 	if !isProtosFilterAvailable &&
 		!isTCPflagsFilterAvailable &&
-		!isPortsFilterAvailable {
+		!isL4AddrsFilterAvailable {
 		// nothing to verify...
 		// fail open and fail fast
 		return true
@@ -398,8 +389,7 @@ func (w *pcapTranslatorWorker) isL4Allowed(
 
 	layer := w.asLayer(ctx, layers.LayerTypeTCP)
 	if layer != nil {
-		if isProtosFilterAvailable &&
-			!w.filters.l4.protos.Contains(0x06) {
+		if isProtosFilterAvailable && !w.filters.AllowsTCP() {
 			return false
 		}
 
@@ -407,14 +397,14 @@ func (w *pcapTranslatorWorker) isL4Allowed(
 
 		if isTCPflagsFilterAvailable {
 			// fail fast & open: if this it TCP, then flags cannot be 0; some flag must be set
-			if flags := parseTCPflags(tcp); (flags & w.filters.l4.flags) == 0 {
+			if flags := parseTCPflags(tcp); !w.filters.AllowsAnyTCPflags(&flags) {
 				return false
 			}
 		}
 
 		// fail open
-		return !isPortsFilterAvailable ||
-			w.filters.l4.ports.ContainsAny(uint16(tcp.SrcPort), uint16(tcp.DstPort))
+		return !isL4AddrsFilterAvailable ||
+			w.filters.AllowsAnyL4Addr(uint16(tcp.SrcPort), uint16(tcp.DstPort))
 	}
 
 	layer = w.asLayer(ctx, layers.LayerTypeUDP)
@@ -423,15 +413,14 @@ func (w *pcapTranslatorWorker) isL4Allowed(
 		return true
 	}
 
-	if isProtosFilterAvailable &&
-		!w.filters.l4.protos.Contains(0x11) {
+	if isProtosFilterAvailable && !w.filters.AllowsUDP() {
 		return false
 	}
 
 	udp := layer.(*layers.UDP)
 	// fail open
-	return !isPortsFilterAvailable ||
-		w.filters.l4.ports.ContainsAny(uint16(udp.SrcPort), uint16(udp.DstPort))
+	return !isL4AddrsFilterAvailable ||
+		w.filters.AllowsAnyL4Addr(uint16(udp.SrcPort), uint16(udp.DstPort))
 }
 
 func (w *pcapTranslatorWorker) shouldTranslate(ctx context.Context) bool {
@@ -559,7 +548,7 @@ func (w *pcapTranslatorWorker) Run(ctx context.Context) (buffer interface{}) {
 func newPcapTranslatorWorker(
 	ifaces netIfaceIndex,
 	iface *PcapIface,
-	filters *PcapFilters,
+	filters PcapFilters,
 	serial *uint64,
 	packet *gopacket.Packet,
 	translator PcapTranslator,

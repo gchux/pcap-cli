@@ -33,6 +33,8 @@ type (
 	TCPFlag  = transformer.TCPFlag
 	TCPFlags = transformer.TCPFlags
 
+	L3Proto = transformer.L3Proto
+
 	L4Proto = transformer.L4Proto
 
 	PcapEmphemeralPorts = transformer.PcapEmphemeralPorts
@@ -52,7 +54,9 @@ type (
 		AddPorts(...uint16)
 		AddTCPFlags(...TCPFlag)
 		CombineAndAddTCPFlags(...TCPFlag)
-		AddL3Protos(...uint8)
+		AddL3Proto(L3Proto)
+		AddL3Protos(...L3Proto)
+		AddL4Proto(L4Proto)
 		AddL4Protos(...L4Proto)
 	}
 
@@ -143,9 +147,15 @@ const (
 	TCP_FLAG_ECE = TCPFlag("ECE")
 	TCP_FLAG_CWR = TCPFlag("CWR")
 
+	L3_PROTO_IPv4 = L3Proto(0x04)
+	L3_PROTO_IP4  = L3_PROTO_IPv4
+	L3_PROTO_IPv6 = L3Proto(0x29)
+	L3_PROTO_IP6  = L3_PROTO_IPv6
+
 	L4_PROTO_TCP   = L4Proto(0x06)
 	L4_PROTO_UDP   = L4Proto(0x11)
 	L4_PROTO_ICMP  = L4Proto(0x01)
+	L4_PROTO_ICMP4 = L4_PROTO_ICMP
 	L4_PROTO_ICMP6 = L4Proto(0x3A)
 )
 

@@ -17,7 +17,7 @@ package transformer
 import "github.com/google/gopacket/layers"
 
 func parseTCPflags(tcp *layers.TCP) uint8 {
-	var setFlags uint8 = 0
+	var setFlags uint8 = 0b00000000
 
 	if tcp.SYN {
 		setFlags = setFlags | tcpSyn
