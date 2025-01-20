@@ -808,16 +808,21 @@ func (t *JSONPcapTranslator) finalize(
 	// handle cases where there is L3 is not available
 	if l3Src == nil && l3Dst == nil {
 		if json.Exists("ARP") {
-			l3Src, _ := json.S("ARP", "src", "IP").Data().(string)
-			data["L3Src"] = l3Src
+			arpSrcIP, _ := json.S("ARP", "src", "IP").Data().(string)
+			l3Src = net.ParseIP(arpSrcIP)
+			data["L3Src"] = arpSrcIP
 
-			l3Dst, _ := json.S("ARP", "dst", "IP").Data().(string)
-			data["L3Dst"] = l3Dst
+			arpDstIP, _ := json.S("ARP", "dst", "IP").Data().(string)
+			l3Dst = net.ParseIP(arpDstIP)
+			data["L3Dst"] = arpDstIP
+
+			t.checkL3Address(ctx, json, data, ifaces, iface, l3Src, l3Dst)
 
 			if arpFlowIDstr, arpOK := json.S("ASP", "flow").Data().(string); arpOK {
 				arpFlowID, _ := strconv.ParseUint(arpFlowIDstr, 10, 64)
 				flowID = fnv1a.AddUint64(flowID, arpFlowID)
 				flowIDstr = strconv.FormatUint(flowID, 10)
+
 				data["flowID"] = flowIDstr
 				json.Set(flowIDstr, "flow")
 			}
@@ -838,7 +843,7 @@ func (t *JSONPcapTranslator) finalize(
 	data["L3Dst"] = l3Dst
 
 	// report complete interface details when capturing for `any` interface
-	t.checkL3Address(ctx, json, ifaces, iface, l3Src, l3Dst)
+	t.checkL3Address(ctx, json, data, ifaces, iface, l3Src, l3Dst)
 
 	isSrcLocal := iface.Addrs.Contains(l3Src.String())
 
@@ -974,6 +979,7 @@ func (t *JSONPcapTranslator) finalize(
 func (t *JSONPcapTranslator) checkL3Address(
 	ctx context.Context,
 	json *gabs.Container,
+	data map[string]any,
 	ifaces netIfaceIndex,
 	iface *PcapIface,
 	srcIP, dstIP net.IP,
@@ -993,7 +999,11 @@ func (t *JSONPcapTranslator) checkL3Address(
 		return
 	}
 
+	data["ifaceIndex"] = _iface.Index
+	data["ifaceName"] = _iface.Name
+
 	ifaceJSON := json.S("iface")
+
 	ifaceJSON.Set(_iface.Index, "index")
 	ifaceJSON.Set(_iface.Name, "name")
 
