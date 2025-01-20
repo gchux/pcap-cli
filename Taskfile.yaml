@@ -37,7 +37,15 @@ tasks:
 
   go-gen:
     cmds:
+      - task: clean
+      - task: go-fmt
+      - task: proto-gen
+      - task: go-gen
       - go generate ./...
+
+  go-test:
+    cmds:
+      - go test -v ./pkg/...
 
   build:
     dotenv: [".env"]
@@ -46,6 +54,7 @@ tasks:
       - task: go-fmt
       - task: proto-gen
       - task: go-gen
+      - task: go-test
       - >-
         go build
         -o bin/$PCAP_BIN_NAME

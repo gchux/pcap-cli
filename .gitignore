@@ -1,5 +1,7 @@
 local-only/
+_local-only/
 local_only/
+_local_only/
 release/
 bin/
 tmp/

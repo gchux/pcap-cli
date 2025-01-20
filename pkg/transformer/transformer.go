@@ -171,7 +171,7 @@ var (
 		tcpEceStr: 0b01000000,
 		tcpCwrStr: 0b10000000,
 	}
-	tcpFlagNil = 0b00000000
+	tcpFlagNil = uint8(0b00000000)
 
 	tcpSynAckStr    = tcpSynStr + "|" + tcpAckStr
 	tcpSynRstStr    = tcpSynStr + "|" + tcpRstStr

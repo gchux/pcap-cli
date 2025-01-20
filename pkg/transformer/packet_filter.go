@@ -60,7 +60,7 @@ type (
 		HasTCPflags() bool
 		HasL4Addrs() bool
 
-		AllowsL3Proto(proto *uint8)
+		AllowsL3Proto(*uint8) bool
 		AllowsIP(*netip.Addr) bool
 		AllowsIPv4() bool
 		AllowsIPv4Addr(*netip.Addr) bool
@@ -119,24 +119,44 @@ func (f *pcapFilters) addNetworks(
 	}
 }
 
+func (f *pcapFilters) AddIPv4(IPv4 string) {
+	f.addNetwork(f.l3.networks4, false /* isIPv6 */, stringFormatter.Format("{0}/32", IPv4))
+}
+
 func (f *pcapFilters) AddIPv4s(IPv4s ...string) {
 	for _, IPv4 := range IPv4s {
-		f.addNetwork(f.l3.networks4, false /* isIPv6 */, stringFormatter.Format("{0}/32", IPv4))
+		f.AddIPv4(IPv4)
 	}
+}
+
+func (f *pcapFilters) AddIPv4Range(IPv4Range string) {
+	f.addNetwork(f.l3.networks4, false /* isIPv6 */, IPv4Range)
+}
+
+func (f *pcapFilters) AddIPv4Ranges(IPv4Ranges ...string) {
+	for _, IPv4Range := range IPv4Ranges {
+		f.AddIPv4Range(IPv4Range)
+	}
+}
+
+func (f *pcapFilters) AddIPv6(IPv6 string) {
+	f.addNetwork(f.l3.networks6, true /* isIPv6 */, stringFormatter.Format("{0}/128", IPv6))
 }
 
 func (f *pcapFilters) AddIPv6s(IPv6s ...string) {
 	for _, IPv6 := range IPv6s {
-		f.addNetwork(f.l3.networks4, false /* isIPv6 */, stringFormatter.Format("{0}/128", IPv6))
+		f.AddIPv6(IPv6)
 	}
 }
 
-func (f *pcapFilters) AddIPv4Ranges(IPv4Ranges ...string) {
-	f.addNetworks(f.l3.networks4, false /* isIPv6 */, IPv4Ranges...)
+func (f *pcapFilters) AddIPv6Range(IPv6Range string) {
+	f.addNetwork(f.l3.networks6, true /* isIPv6 */, IPv6Range)
 }
 
 func (f *pcapFilters) AddIPv6Ranges(IPv6Ranges ...string) {
-	f.addNetworks(f.l3.networks6, true /* isIPv6 */, IPv6Ranges...)
+	for _, IPv6Range := range IPv6Ranges {
+		f.AddIPv6Range(IPv6Range)
+	}
 }
 
 func (f *pcapFilters) AddPorts(ports ...uint16) {
@@ -198,6 +218,10 @@ func (f *pcapFilters) HasIPs() bool {
 	return f.HasIPv4s() || f.HasIPv6s()
 }
 
+func (f *pcapFilters) AllowsL3Proto(proto *uint8) bool {
+	return f.l3.protos.Contains(*proto)
+}
+
 func (f *pcapFilters) AllowsIPv4() bool {
 	return f.l3.protos.Contains(0x04)
 }
@@ -206,7 +230,7 @@ func (f *pcapFilters) AllowsIPv6() bool {
 	return f.l3.protos.Contains(0x29)
 }
 
-func (f *pcapFilters) allowsIP(
+func (f *pcapFilters) allowsIPaddr(
 	networks *btree.BTreeG[netip.Prefix],
 	network *netip.Prefix,
 ) bool {
@@ -215,7 +239,7 @@ func (f *pcapFilters) allowsIP(
 
 func (f *pcapFilters) AllowsIPv4Addr(ip4 *netip.Addr) bool {
 	prefix := netip.PrefixFrom(*ip4, 32)
-	return f.allowsIP(f.l3.networks4, &prefix)
+	return f.allowsIPaddr(f.l3.networks4, &prefix)
 }
 
 func (f *pcapFilters) AllowsIPv4Bytes(ip4 [4]byte) bool {
@@ -225,7 +249,7 @@ func (f *pcapFilters) AllowsIPv4Bytes(ip4 [4]byte) bool {
 
 func (f *pcapFilters) AllowsIPv6Addr(ip6 *netip.Addr) bool {
 	prefix := netip.PrefixFrom(*ip6, 128)
-	return f.allowsIP(f.l3.networks6, &prefix)
+	return f.allowsIPaddr(f.l3.networks6, &prefix)
 }
 
 func (f *pcapFilters) AllowsIPv6Bytes(ip6 [16]byte) bool {
@@ -269,10 +293,10 @@ func (f *pcapFilters) AllowsAnyL4Addr(ports ...uint16) bool {
 }
 
 func (f *pcapFilters) HasTCPflags() bool {
-	return f.l4.flags > 0b00000000
+	return f.l4.flags > tcpFlagNil
 }
 
-func (f *pcapFilters) AllowAnysTCPflags(flags *uint8) bool {
+func (f *pcapFilters) AllowsAnyTCPflags(flags *uint8) bool {
 	return (*flags & f.l4.flags) > 0
 }
 
