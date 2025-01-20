@@ -154,6 +154,7 @@ var (
 	}
 
 	skippedLayersList = []gopacket.LayerType{
+		gopacket.LayerTypePayload,
 		gopacket.LayerTypeDecodeFailure,
 		layers.LayerTypeLinuxSLL,
 	}
