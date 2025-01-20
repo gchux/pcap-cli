@@ -375,9 +375,9 @@ func (w *pcapTranslatorWorker) isL3Allowed(
 func (w *pcapTranslatorWorker) isL4Allowed(
 	ctx context.Context,
 ) bool {
-	isProtosFilterAvailable := !w.filters.HasL4Protos()
+	isProtosFilterAvailable := w.filters.HasL4Protos()
 	isTCPflagsFilterAvailable := w.filters.HasTCPflags()
-	isL4AddrsFilterAvailable := !w.filters.HasL4Addrs()
+	isL4AddrsFilterAvailable := w.filters.HasL4Addrs()
 
 	if !isProtosFilterAvailable &&
 		!isTCPflagsFilterAvailable &&

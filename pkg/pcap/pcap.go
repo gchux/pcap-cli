@@ -47,17 +47,22 @@ type (
 
 	// PCAP owns the behavior that will be exposed to consumers
 	PcapFilters interface {
+		AddL3Proto(L3Proto)
+		AddL3Protos(...L3Proto)
+		AddIPv4(string)
 		AddIPv4s(...string)
+		AddIPv6(string)
 		AddIPv6s(...string)
+		AddIPv4Range(string)
 		AddIPv4Ranges(...string)
+		AddIPv6Range(string)
 		AddIPv6Ranges(...string)
+		AddL4Proto(L4Proto)
+		AddL4Protos(...L4Proto)
+		AddPort(uint16)
 		AddPorts(...uint16)
 		AddTCPFlags(...TCPFlag)
 		CombineAndAddTCPFlags(...TCPFlag)
-		AddL3Proto(L3Proto)
-		AddL3Protos(...L3Proto)
-		AddL4Proto(L4Proto)
-		AddL4Protos(...L4Proto)
 	}
 
 	PcapFilterProvider interface {

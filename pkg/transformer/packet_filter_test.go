@@ -51,9 +51,67 @@ func newPcapFilters() *pcapFilters {
 
 	filters.AddL4Protos(L4_PROTO_TCP, L4_PROTO_UDP, L4_PROTO_ICMP4, L4_PROTO_ICMP6)
 	filters.AddTCPFlags(TCP_FLAG_SYN, TCP_FLAG_FIN, TCP_FLAG_RST)
-	filters.AddPorts(8022)
+	filters.AddPort(8022)
 
 	return filters
+}
+
+func TestRejectTCPfilter(t *testing.T) {
+	filters := newPcapFilters()
+
+	srcPort := uint16(27584)
+	dstPort := uint16(80)
+	tcpFlags := tcpFlagNil | tcpAck | tcpFin
+
+	t.Run("must-reject-TCP", func(t *testing.T) {
+		if isTCPallowed(t, filters, tcpFlags, srcPort, dstPort) {
+			t.Fatalf("must not allow TCP: [flags: 0b%s | ports: %d => %d]",
+				strconv.FormatUint(uint64(tcpFlags), 2), srcPort, dstPort)
+		}
+	})
+}
+
+func TestRejectIPv4Filter(t *testing.T) {
+	filters := newPcapFilters()
+
+	srcIPv6, _ := netip.ParseAddr("169.254.8.1")
+	srcPort := uint16(27584)
+	dstIPv6, _ := netip.ParseAddr("169.254.169.254")
+	dstPort := uint16(80)
+	tcpFlags := tcpFlagNil | tcpAck | tcpFin
+
+	t.Run("must-allow-IPv4", func(t *testing.T) {
+		if !filters.AllowsIP(&srcIPv6) {
+			t.Fatalf("must allow IPv4: %s", srcIPv6.String())
+		}
+
+		if !filters.AllowsIP(&dstIPv6) {
+			t.Fatalf("must allow IPv4: %s", dstIPv6.String())
+		}
+	})
+
+	t.Run("must-allow-TCP", func(t *testing.T) {
+		if !filters.AllowsTCP() {
+			t.Fatalf("must allow TCP")
+		}
+	})
+
+	t.Run("must-reject-TCP-ports", func(t *testing.T) {
+		if filters.AllowsL4Addr(&srcPort) {
+			t.Fatalf("must not allow TCP port: %d", srcPort)
+		}
+
+		if filters.AllowsL4Addr(&dstPort) {
+			t.Fatalf("must not allow TCP port: %d", dstPort)
+		}
+	})
+
+	t.Run("must-allow-FIN+ACK-TCP-flag", func(t *testing.T) {
+		if !filters.AllowsAnyTCPflags(&tcpFlags) {
+			t.Fatalf("must allow TCP flag: 0b%s",
+				strconv.FormatUint(uint64(tcpFlags), 2))
+		}
+	})
 }
 
 func TestAllowIPv6Filter(t *testing.T) {
@@ -65,19 +123,25 @@ func TestAllowIPv6Filter(t *testing.T) {
 
 	t.Run("must-allow-IPv6", func(t *testing.T) {
 		if !filters.AllowsIP(&srcIPv6) {
-			t.Fatalf("must not allow: %s", srcIPv6.String())
+			t.Fatalf("must allow IPv6: %s", srcIPv6.String())
+		}
+	})
+
+	t.Run("must-allow-TCP", func(t *testing.T) {
+		if !filters.AllowsTCP() {
+			t.Fatalf("must allow TCP")
 		}
 	})
 
 	t.Run("must-allow-TCP-port", func(t *testing.T) {
 		if !filters.AllowsL4Addr(&srcPort) {
-			t.Fatalf("must not allow TCP ports: %d", srcPort)
+			t.Fatalf("must allow TCP port: %d", srcPort)
 		}
 	})
 
 	t.Run("must-allow-RST-TCP-flag", func(t *testing.T) {
 		if !filters.AllowsAnyTCPflags(&tcpFlags) {
-			t.Fatalf("must not allow TCP flag: 0b%s",
+			t.Fatalf("must allow TCP flags: 0b%s",
 				strconv.FormatUint(uint64(tcpFlags), 2))
 		}
 	})
@@ -102,6 +166,12 @@ func TestRejectIPv6Filter(t *testing.T) {
 		}
 	})
 
+	t.Run("must-allow-TCP", func(t *testing.T) {
+		if !filters.AllowsTCP() {
+			t.Fatalf("must allow TCP")
+		}
+	})
+
 	t.Run("must-reject-TCP-ports", func(t *testing.T) {
 		if filters.AllowsL4Addr(&srcPort) {
 			t.Fatalf("must not allow TCP ports: %d", srcPort)
@@ -118,4 +188,39 @@ func TestRejectIPv6Filter(t *testing.T) {
 				strconv.FormatUint(uint64(tcpFlags), 2))
 		}
 	})
+}
+
+func isTCPallowed(
+	t *testing.T,
+	filters *pcapFilters,
+	tcpFlags uint8,
+	srcPort, dstPort uint16,
+) bool {
+	isProtosFilterAvailable := filters.HasL4Protos()
+	isTCPflagsFilterAvailable := filters.HasTCPflags()
+	isL4AddrsFilterAvailable := filters.HasL4Addrs()
+
+	if !isProtosFilterAvailable &&
+		!isTCPflagsFilterAvailable &&
+		!isL4AddrsFilterAvailable {
+		t.Logf("nothing to veify")
+		return true
+	}
+
+	if isProtosFilterAvailable && !filters.AllowsTCP() {
+		return false
+	}
+
+	if isTCPflagsFilterAvailable {
+		t.Logf("checking TCP flags: ob%s",
+			strconv.FormatUint(uint64(tcpFlags), 2))
+		if !filters.AllowsAnyTCPflags(&tcpFlags) {
+			return false
+		}
+	}
+
+	t.Logf("checking ports: (%t) %d => %d", isL4AddrsFilterAvailable, srcPort, dstPort)
+
+	return !isL4AddrsFilterAvailable ||
+		filters.AllowsAnyL4Addr(srcPort, dstPort)
 }

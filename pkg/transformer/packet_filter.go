@@ -159,8 +159,14 @@ func (f *pcapFilters) AddIPv6Ranges(IPv6Ranges ...string) {
 	}
 }
 
+func (f *pcapFilters) AddPort(port uint16) {
+	f.l4.ports.Add(port)
+}
+
 func (f *pcapFilters) AddPorts(ports ...uint16) {
-	f.l4.ports.Append(ports...)
+	for _, port := range ports {
+		f.AddPort(port)
+	}
 }
 
 func (f *pcapFilters) AddTCPFlags(flags ...TCPFlag) {
@@ -173,7 +179,7 @@ func (f *pcapFilters) CombineAndAddTCPFlags(flag ...TCPFlag) {
 	f.l4.flags |= mergeTCPFlags(flag...)
 }
 
-func (f *pcapFilters) AddProtos(
+func (f *pcapFilters) addProtos(
 	protosSet mapset.Set[uint8],
 	protos ...uint8,
 ) {
@@ -297,7 +303,7 @@ func (f *pcapFilters) HasTCPflags() bool {
 }
 
 func (f *pcapFilters) AllowsAnyTCPflags(flags *uint8) bool {
-	return (*flags & f.l4.flags) > 0
+	return (*flags & f.l4.flags) > tcpFlagNil
 }
 
 func ipLessThanFunc(a, b netip.Prefix) bool {
