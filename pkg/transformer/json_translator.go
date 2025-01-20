@@ -800,16 +800,42 @@ func (t *JSONPcapTranslator) finalize(
 	data["serial"] = *serial
 
 	flowIDstr, _ := json.S("meta", "flow").Data().(string) // this is always available
+	flowID, _ := strconv.ParseUint(flowIDstr, 10, 64)
 
 	l3Src, _ := json.S("L3", "src").Data().(net.IP)
-	data["L3Src"] = l3Src
 	l3Dst, _ := json.S("L3", "dst").Data().(net.IP)
-	data["L3Dst"] = l3Dst
 
+	// handle cases where there is L3 is not available
 	if l3Src == nil && l3Dst == nil {
-		operation.Set(stringFormatter.Format(jsonTranslationFlowTemplate, id, t.iface.Name, "x", flowIDstr), "id")
+		if json.Exists("ARP") {
+			l3Src, _ := json.S("ARP", "src", "IP").Data().(string)
+			data["L3Src"] = l3Src
+
+			l3Dst, _ := json.S("ARP", "dst", "IP").Data().(string)
+			data["L3Dst"] = l3Dst
+
+			if arpFlowIDstr, arpOK := json.S("ASP", "flow").Data().(string); arpOK {
+				arpFlowID, _ := strconv.ParseUint(arpFlowIDstr, 10, 64)
+				flowID = fnv1a.AddUint64(flowID, arpFlowID)
+				flowIDstr = strconv.FormatUint(flowID, 10)
+				data["flowID"] = flowIDstr
+				json.Set(flowIDstr, "flow")
+			}
+
+			operation.Set(stringFormatter.Format(jsonTranslationFlowTemplate, id, t.iface.Name, "arp", flowIDstr), "id")
+			json.Set(stringFormatter.FormatComplex(jsonTranslationSummaryWithoutL4, data), "message")
+
+			return json, nil
+		}
+
+		operation.Set(stringFormatter.Format(jsonTranslationFlowTemplate, id, t.iface.Name, "l2", flowIDstr), "id")
+		json.Set(stringFormatter.FormatComplex(jsonTranslationSummary, data), "message")
+
 		return json, nil
 	}
+
+	data["L3Src"] = l3Src
+	data["L3Dst"] = l3Dst
 
 	// report complete interface details when capturing for `any` interface
 	t.checkL3Address(ctx, json, ifaces, iface, l3Src, l3Dst)
@@ -827,7 +853,6 @@ func (t *JSONPcapTranslator) finalize(
 	// Addition is commutative, so after hashing `net.IP` bytes and L4 ports to `uint64`,
 	// the same `uint64`/`flowID` is produced after adding everything up, no matter the order.
 	// Using the same `flowID` will produce grouped logs in Cloud Logging.
-	flowID, _ := strconv.ParseUint(flowIDstr, 10, 64)
 	if l3FlowIDstr, l3OK := json.S("L3", "flow").Data().(string); l3OK {
 		l3FlowID, _ := strconv.ParseUint(l3FlowIDstr, 10, 64)
 		flowID = fnv1a.AddUint64(flowID, l3FlowID)
@@ -851,13 +876,17 @@ func (t *JSONPcapTranslator) finalize(
 				data["icmpVersion"] = 4
 			}
 			data["icmpMessage"] = json.S("ICMP", "msg").Data().(string)
+
 			operation.Set(stringFormatter.Format(jsonTranslationFlowTemplate, id, t.iface.Name, "icmp", flowIDstr), "id")
 			json.Set(stringFormatter.FormatComplex(jsonTranslationSummaryICMP, data), "message")
+
 			return json, nil
 		}
 
-		operation.Set(stringFormatter.Format(jsonTranslationFlowTemplate, id, t.iface.Name, "x", flowIDstr), "id")
+		// unhandled L3 protocol
+		operation.Set(stringFormatter.Format(jsonTranslationFlowTemplate, id, t.iface.Name, "l3", flowIDstr), "id")
 		json.Set(stringFormatter.FormatComplex(jsonTranslationSummaryWithoutL4, data), "message")
+
 		return json, nil
 	}
 
